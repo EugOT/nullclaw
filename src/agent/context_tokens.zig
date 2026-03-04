@@ -17,6 +17,8 @@ const ContextWindowEntry = struct {
 
 // Model-specific defaults for high-signal IDs used by onboarding/catalog flows.
 const MODEL_WINDOWS = [_]ContextWindowEntry{
+    .{ .key = "gpt-4", .tokens = 8_192 },
+    .{ .key = "gpt-4-32k", .tokens = 32_768 },
     .{ .key = "claude-opus-4-6", .tokens = 200_000 },
     .{ .key = "claude-opus-4.6", .tokens = 200_000 },
     .{ .key = "claude-sonnet-4-6", .tokens = 200_000 },
@@ -109,6 +111,17 @@ fn splitProviderModel(model_ref: []const u8) struct { provider: ?[]const u8, mod
 }
 
 fn inferFromModelPattern(model_id: []const u8) ?u64 {
+    if (startsWithIgnoreCase(model_id, "gpt-4-32k")) return 32_768;
+
+    // Legacy GPT-4 variants (for example gpt-4, gpt-4-0613) have small windows.
+    if (startsWithIgnoreCase(model_id, "gpt-4") and
+        !startsWithIgnoreCase(model_id, "gpt-4o") and
+        !startsWithIgnoreCase(model_id, "gpt-4.1") and
+        !startsWithIgnoreCase(model_id, "gpt-4.5"))
+    {
+        return 8_192;
+    }
+
     if (std.mem.indexOf(u8, model_id, "32768") != null) return 32_768;
 
     if (startsWithIgnoreCase(model_id, "claude-")) return 200_000;
@@ -180,6 +193,8 @@ test "resolveContextTokens honors explicit override first" {
 }
 
 test "lookupContextTokens resolves known model ids" {
+    try std.testing.expectEqual(@as(?u64, 8_192), lookupContextTokens("openai/gpt-4"));
+    try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("openai/gpt-4-32k"));
     try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("openai/gpt-4.1-mini"));
     try std.testing.expectEqual(@as(?u64, 200_000), lookupContextTokens("claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("mixtral-8x7b-32768"));

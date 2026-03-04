@@ -17,6 +17,8 @@ const MaxTokensEntry = struct {
 
 // High-signal model defaults used in onboarding/catalog flows.
 const MODEL_MAX_TOKENS = [_]MaxTokensEntry{
+    .{ .key = "gpt-4", .tokens = 4_096 },
+    .{ .key = "gpt-4-32k", .tokens = 4_096 },
     .{ .key = "claude-opus-4-6", .tokens = 8192 },
     .{ .key = "claude-opus-4.6", .tokens = 8192 },
     .{ .key = "claude-sonnet-4-6", .tokens = 8192 },
@@ -116,6 +118,17 @@ fn splitProviderModel(model_ref: []const u8) struct { provider: ?[]const u8, mod
 }
 
 fn inferFromModelPattern(model_id: []const u8) ?u32 {
+    if (startsWithIgnoreCase(model_id, "gpt-4-32k")) return 4_096;
+
+    // Legacy GPT-4 variants cap completion tokens much lower than context.
+    if (startsWithIgnoreCase(model_id, "gpt-4") and
+        !startsWithIgnoreCase(model_id, "gpt-4o") and
+        !startsWithIgnoreCase(model_id, "gpt-4.1") and
+        !startsWithIgnoreCase(model_id, "gpt-4.5"))
+    {
+        return 4_096;
+    }
+
     if (std.mem.indexOf(u8, model_id, "k2p5") != null) return 32_768;
 
     if (startsWithIgnoreCase(model_id, "kimi-coding") or startsWithIgnoreCase(model_id, "kimi-k2")) {
@@ -190,6 +203,8 @@ test "resolveMaxTokens honors explicit override first" {
 }
 
 test "lookupModelMaxTokens resolves model and nested provider refs" {
+    try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4"));
+    try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4-32k"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4.1-mini"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openrouter/anthropic/claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u32, 32_768), lookupModelMaxTokens("qianfan/custom-model"));

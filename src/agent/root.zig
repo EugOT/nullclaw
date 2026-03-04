@@ -428,6 +428,45 @@ pub const Agent = struct {
         return compaction.tokenEstimate(self.history.items);
     }
 
+    /// Rough token estimate for provider-ready messages.
+    /// Uses a char-based heuristic (1 token ~= 4 chars) plus structural overhead.
+    fn estimatePromptTokens(messages: []const ChatMessage) u64 {
+        var total_chars: u64 = 0;
+        for (messages) |msg| {
+            total_chars +|= msg.content.len;
+            if (msg.name) |name| total_chars +|= name.len;
+            if (msg.tool_call_id) |tool_call_id| total_chars +|= tool_call_id.len;
+            if (msg.content_parts) |parts| {
+                for (parts) |part| switch (part) {
+                    .text => |text| total_chars +|= text.len,
+                    .image_url => |img| total_chars +|= img.url.len + 32,
+                    .image_base64 => |_| total_chars +|= 1024,
+                };
+            }
+        }
+
+        const structural_chars: u64 = @as(u64, @intCast(messages.len)) * 32;
+        return (total_chars + structural_chars + 3) / 4;
+    }
+
+    /// Clamp completion tokens to fit within the configured context budget.
+    /// Keeps a safety headroom to reduce ContextLengthExceeded errors on strict providers.
+    fn effectiveMaxTokensForMessages(self: *const Agent, messages: []const ChatMessage) u32 {
+        if (self.token_limit == 0) return self.max_tokens;
+
+        const prompt_estimate = estimatePromptTokens(messages);
+        if (prompt_estimate >= self.token_limit) return 1;
+
+        const available = self.token_limit - prompt_estimate;
+        const reserve = @min(@as(u64, 256), available / 4);
+        if (available <= reserve) return 1;
+
+        const completion_budget = available - reserve;
+        const completion_budget_u32: u32 = @intCast(@min(completion_budget, @as(u64, std.math.maxInt(u32))));
+        if (completion_budget_u32 == 0) return 1;
+        return @max(@as(u32, 1), @min(self.max_tokens, completion_budget_u32));
+    }
+
     /// Auto-compact history when it exceeds thresholds.
     pub fn autoCompactHistory(self: *Agent) !bool {
         return compaction.autoCompactHistory(self.allocator, &self.history, self.provider, self.model_name, .{
@@ -815,6 +854,7 @@ pub const Agent = struct {
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
             const messages = try self.buildProviderMessages(arena);
+            const request_max_tokens = self.effectiveMaxTokensForMessages(messages);
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
@@ -831,7 +871,7 @@ pub const Agent = struct {
                         .messages = messages,
                         .model = self.model_name,
                         .temperature = self.temperature,
-                        .max_tokens = self.max_tokens,
+                        .max_tokens = request_max_tokens,
                         .tools = null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
@@ -867,7 +907,7 @@ pub const Agent = struct {
                         .messages = messages,
                         .model = self.model_name,
                         .temperature = self.temperature,
-                        .max_tokens = self.max_tokens,
+                        .max_tokens = request_max_tokens,
                         .tools = if (native_tools_enabled) self.tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
@@ -894,6 +934,7 @@ pub const Agent = struct {
                     {
                         self.context_was_compacted = true;
                         const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                        const recovery_max_tokens = self.effectiveMaxTokensForMessages(recovery_msgs);
                         response_attempt = 2;
                         self.logLlmRequest(iteration + 1, 2, recovery_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
@@ -902,7 +943,7 @@ pub const Agent = struct {
                                 .messages = recovery_msgs,
                                 .model = self.model_name,
                                 .temperature = self.temperature,
-                                .max_tokens = self.max_tokens,
+                                .max_tokens = recovery_max_tokens,
                                 .tools = if (native_tools_enabled) self.tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
@@ -925,7 +966,7 @@ pub const Agent = struct {
                             .messages = messages,
                             .model = self.model_name,
                             .temperature = self.temperature,
-                            .max_tokens = self.max_tokens,
+                            .max_tokens = request_max_tokens,
                             .tools = if (native_tools_enabled) self.tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
@@ -938,6 +979,7 @@ pub const Agent = struct {
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
                             const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                            const recovery_max_tokens = self.effectiveMaxTokensForMessages(recovery_msgs);
                             response_attempt = 3;
                             self.logLlmRequest(iteration + 1, 3, recovery_msgs, native_tools_enabled, false);
                             break :retry_blk self.provider.chat(
@@ -946,7 +988,7 @@ pub const Agent = struct {
                                     .messages = recovery_msgs,
                                     .model = self.model_name,
                                     .temperature = self.temperature,
-                                    .max_tokens = self.max_tokens,
+                                    .max_tokens = recovery_max_tokens,
                                     .tools = if (native_tools_enabled) self.tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
@@ -1271,6 +1313,7 @@ pub const Agent = struct {
             return fallback;
         };
         defer self.allocator.free(summary_messages);
+        const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages);
 
         self.logLlmRequest(self.max_tool_iterations + 1, 1, summary_messages, false, false);
         var summary_response = self.provider.chat(
@@ -1279,7 +1322,7 @@ pub const Agent = struct {
                 .messages = summary_messages,
                 .model = self.model_name,
                 .temperature = self.temperature,
-                .max_tokens = self.max_tokens,
+                .max_tokens = summary_max_tokens,
                 .tools = null, // force text-only
                 .timeout_secs = self.message_timeout_secs,
                 .reasoning_effort = self.reasoning_effort,
@@ -2512,6 +2555,64 @@ test "Agent.fromConfig resolves max_tokens from provider lookup when unset" {
 
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
     try std.testing.expect(agent.max_tokens_override == null);
+}
+
+test "Agent.fromConfig resolves conservative limits for legacy gpt-4" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4",
+        .allocator = allocator,
+    };
+    cfg.max_tokens = null;
+    cfg.agent.token_limit = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
+    cfg.agent.token_limit_explicit = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(u64, 8_192), agent.token_limit);
+    try std.testing.expectEqual(@as(u32, 4_096), agent.max_tokens);
+}
+
+test "Agent effective max_tokens reserves prompt headroom" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 8_192,
+        .max_tokens = 4_096,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const large_system = try allocator.alloc(u8, 28_000);
+    defer allocator.free(large_system);
+    @memset(large_system, 'a');
+
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = large_system },
+        .{ .role = .user, .content = "how are you?" },
+    };
+    const capped = agent.effectiveMaxTokensForMessages(&messages);
+    try std.testing.expect(capped < agent.max_tokens);
+    try std.testing.expect(capped > 0);
 }
 
 test "Agent.fromConfig keeps explicit max_tokens override" {
