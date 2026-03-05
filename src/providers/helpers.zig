@@ -412,7 +412,7 @@ fn appendThinkingConfigForTarget(
 ) !void {
     const profile = geminiThinkingProfile(model, reasoning_effort) orelse return;
 
-    try buf.appendSlice(allocator, ",\"thinkingConfig\":{");
+    try buf.appendSlice(allocator, ",\"thinkingConfig\":{\"includeThoughts\":true,");
     switch (profile) {
         .level => |level| {
             try buf.appendSlice(allocator, "\"thinkingLevel\":");
@@ -864,6 +864,7 @@ test "appendGeminiThinkingConfig uses thinkingLevel for gemini-3 flash" {
     const cfg = parsed.value.object.get("generationConfig").?.object;
     const thinking = cfg.get("thinkingConfig").?.object;
     try std.testing.expectEqualStrings("medium", thinking.get("thinkingLevel").?.string);
+    try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
 }
 
 test "appendGeminiThinkingConfig maps unsupported gemini-3 pro medium to low level" {
@@ -896,6 +897,7 @@ test "appendGeminiThinkingConfig uses thinkingBudget for gemini-2.5 flash" {
     const cfg = parsed.value.object.get("generationConfig").?.object;
     const thinking = cfg.get("thinkingConfig").?.object;
     try std.testing.expectEqual(@as(i64, 24576), thinking.get("thinkingBudget").?.integer);
+    try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
 }
 
 test "appendGeminiThinkingConfig omits none budget for gemini-2.5 pro" {
@@ -927,4 +929,5 @@ test "appendVertexThinkingConfig uses uppercase thinkingLevel for gemini-3 flash
     const cfg = parsed.value.object.get("generationConfig").?.object;
     const thinking = cfg.get("thinkingConfig").?.object;
     try std.testing.expectEqualStrings("MEDIUM", thinking.get("thinkingLevel").?.string);
+    try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
 }
