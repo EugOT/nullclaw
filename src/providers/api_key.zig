@@ -63,6 +63,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "anthropic", .{ "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "" } },
         .{ "openrouter", .{ "OPENROUTER_API_KEY", "", "" } },
         .{ "openai", .{ "OPENAI_API_KEY", "", "" } },
+        .{ "azure", .{ "AZURE_OPENAI_API_KEY", "", "" } },
         .{ "gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
         .{ "google", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
         .{ "google-gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
