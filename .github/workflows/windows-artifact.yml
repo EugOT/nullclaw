@@ -1,0 +1,52 @@
+name: Windows Artifact
+
+on:
+  push:
+    branches:
+      - codex/openai-responses-design
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows x64 artifact
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Cache Zig build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~\AppData\Local\zig
+          key: zig-windows-artifact-${{ hashFiles('src/**/*.zig', 'build.zig', 'build.zig.zon', '.github/workflows/windows-artifact.yml') }}
+          restore-keys: zig-windows-artifact-
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build ReleaseSmall
+        run: zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSmall
+
+      - name: Prepare artifact bundle
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/nullclaw.exe dist/nullclaw-windows-x86_64.exe
+          cp OPENAI_RESPONSES_PROVIDER_使用说明_ZH.md dist/
+          cp OPENAI_RESPONSES_PROVIDER_DESIGN_ZH.md dist/
+          cp OPENAI_RESPONSES_PROVIDER_TASKS_ZH.md dist/
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nullclaw-windows-x86_64-responses
+          path: dist/*
