@@ -2119,6 +2119,7 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
     const reply = try buildTelegramBindingStatusReply(allocator, &cfg, "main", "-100123#topic:77", true);
     defer allocator.free(reply);
 
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Effective agent: coder") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Exact binding: coder") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Inherited peer binding: reviewer") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: peer") != null);

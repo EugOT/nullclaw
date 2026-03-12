@@ -279,8 +279,9 @@ pub fn applyBindingUpdate(
             }
         }
 
-        const desired = try buildManagedBinding(allocator, target, normalized_agent_id);
-        errdefer freeBinding(allocator, &desired);
+        var desired = try buildManagedBinding(allocator, target, normalized_agent_id);
+        var desired_owned = true;
+        errdefer if (desired_owned) freeBinding(allocator, &desired);
 
         var next: std.ArrayListUnmanaged(agent_routing.AgentBinding) = .empty;
         errdefer freeBindingList(allocator, &next);
@@ -289,12 +290,14 @@ pub fn applyBindingUpdate(
         for (cfg.agent_bindings, 0..) |binding, idx| {
             if (existing != null and idx == existing.?.index) {
                 try next.append(allocator, desired);
+                desired_owned = false;
                 continue;
             }
             try next.append(allocator, try dupBinding(allocator, binding));
         }
         if (existing == null) {
             try next.append(allocator, desired);
+            desired_owned = false;
         }
 
         replaceOwnedBindings(allocator, cfg, try next.toOwnedSlice(allocator));
@@ -347,7 +350,9 @@ pub fn persistBindingUpdate(
 
     var cfg = try loadConfigFromPath(arena, config_path);
     const result = try applyBindingUpdate(arena, &cfg, target, requested_agent);
-    try cfg.save();
+    if (result.status != .unchanged) {
+        try cfg.save();
+    }
     return result;
 }
 
@@ -517,4 +522,70 @@ test "applyBindingUpdate clear keeps inherited unscoped peer binding" {
     try std.testing.expectEqual(@as(usize, 1), cfg.agent_bindings.len);
     try std.testing.expectEqualStrings("coder-agent", cfg.agent_bindings[0].agent_id);
     try std.testing.expect(!cfg.agent_bindings_runtime_owned);
+}
+
+test "persistBindingUpdate skips rewriting config when binding is unchanged" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    const initial_content =
+        \\{
+        \\  "agents": {
+        \\    "defaults": {
+        \\      "model": {
+        \\        "primary": "ollama/qwen2.5-coder:14b"
+        \\      }
+        \\    },
+        \\    "list": [
+        \\      {
+        \\        "id": "Coder Agent",
+        \\        "provider": "ollama",
+        \\        "model": "qwen2.5-coder:14b"
+        \\      }
+        \\    ]
+        \\  },
+        \\  "bindings": [
+        \\    {
+        \\      "agent_id": "coder-agent",
+        \\      "comment": "Managed by Telegram /bind",
+        \\      "match": {
+        \\        "channel": "telegram",
+        \\        "account_id": "main",
+        \\        "peer": {
+        \\          "kind": "group",
+        \\          "id": "-100123:thread:42"
+        \\        }
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    {
+        const file = try std.fs.createFileAbsolute(config_path, .{});
+        defer file.close();
+        try file.writeAll(initial_content);
+    }
+
+    const result = try persistBindingUpdate(allocator, config_path, .{
+        .channel = "telegram",
+        .account_id = "main",
+        .peer = .{ .kind = .group, .id = "-100123:thread:42" },
+        .comment = "Managed by Telegram /bind",
+    }, "Coder Agent");
+
+    try std.testing.expect(result.status == .unchanged);
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const persisted = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(persisted);
+
+    try std.testing.expectEqualStrings(initial_content, persisted);
 }
