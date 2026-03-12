@@ -15,6 +15,7 @@ const streaming = @import("streaming.zig");
 
 /// Maximum number of tasks kept in the registry before eviction.
 const MAX_TASKS: usize = 1000;
+const A2A_PROTOCOL_VERSION = "0.2.5";
 
 // ── Task State ──────────────────────────────────────────────────
 
@@ -33,7 +34,7 @@ pub const TaskState = enum {
             .completed => "completed",
             .failed => "failed",
             .canceled => "canceled",
-            .input_required => "input_required",
+            .input_required => "input-required",
         };
     }
 };
@@ -42,6 +43,7 @@ pub const TaskState = enum {
 
 pub const TaskRecord = struct {
     id: []u8,
+    context_id: []u8,
     session_key: []u8,
     state: TaskState,
     created_at: i64,
@@ -68,17 +70,12 @@ pub const TaskRegistry = struct {
 
         var iter = self.tasks.iterator();
         while (iter.next()) |entry| {
-            const task = entry.value_ptr.*;
-            self.allocator.free(task.id);
-            self.allocator.free(task.session_key);
-            self.allocator.free(task.user_text);
-            self.allocator.free(task.agent_text);
-            self.allocator.destroy(task);
+            self.freeTask(entry.value_ptr.*);
         }
         self.tasks.deinit(self.allocator);
     }
 
-    pub fn createTask(self: *TaskRegistry, user_text: []const u8) !*TaskRecord {
+    pub fn createTask(self: *TaskRegistry, user_text: []const u8, context_id: ?[]const u8) !*TaskRecord {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -93,7 +90,13 @@ pub const TaskRegistry = struct {
         const task_id = try std.fmt.allocPrint(self.allocator, "task-{d}", .{id_num});
         errdefer self.allocator.free(task_id);
 
-        const session_key = try std.fmt.allocPrint(self.allocator, "a2a:{s}", .{task_id});
+        const owned_context_id = if (context_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            try std.fmt.allocPrint(self.allocator, "ctx-{d}", .{id_num});
+        errdefer self.allocator.free(owned_context_id);
+
+        const session_key = try std.fmt.allocPrint(self.allocator, "a2a:{s}", .{owned_context_id});
         errdefer self.allocator.free(session_key);
 
         const owned_text = try self.allocator.dupe(u8, user_text);
@@ -109,6 +112,7 @@ pub const TaskRegistry = struct {
 
         task.* = .{
             .id = task_id,
+            .context_id = owned_context_id,
             .session_key = session_key,
             .state = .submitted,
             .created_at = now,
@@ -156,7 +160,7 @@ pub const TaskRegistry = struct {
                 if (task.state != s) continue;
             }
             if (filter_context_id) |ctx| {
-                if (!std.mem.eql(u8, task.session_key, ctx)) continue;
+                if (!std.mem.eql(u8, task.context_id, ctx)) continue;
             }
             try result.append(allocator, task);
             if (result.items.len >= max_results) break;
@@ -184,14 +188,18 @@ pub const TaskRegistry = struct {
 
         if (oldest_key) |key| {
             if (self.tasks.fetchRemove(key)) |kv| {
-                const task = kv.value;
-                self.allocator.free(task.id);
-                self.allocator.free(task.session_key);
-                self.allocator.free(task.user_text);
-                self.allocator.free(task.agent_text);
-                self.allocator.destroy(task);
+                self.freeTask(kv.value);
             }
         }
+    }
+
+    fn freeTask(self: *TaskRegistry, task: *TaskRecord) void {
+        self.allocator.free(task.id);
+        self.allocator.free(task.context_id);
+        self.allocator.free(task.session_key);
+        self.allocator.free(task.user_text);
+        self.allocator.free(task.agent_text);
+        self.allocator.destroy(task);
     }
 };
 
@@ -210,21 +218,27 @@ pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config) A2aResp
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
+    const endpoint_url = buildEndpointUrl(allocator, cfg.a2a.url) catch return errorResponse();
+    defer allocator.free(endpoint_url);
+
     const w = buf.writer(allocator);
     w.writeAll("{\"name\":\"") catch return errorResponse();
     gateway.jsonEscapeInto(w, cfg.a2a.name) catch return errorResponse();
     w.writeAll("\",\"description\":\"") catch return errorResponse();
     gateway.jsonEscapeInto(w, cfg.a2a.description) catch return errorResponse();
+    w.writeAll("\",\"protocolVersion\":\"") catch return errorResponse();
+    w.writeAll(A2A_PROTOCOL_VERSION) catch return errorResponse();
     w.writeAll("\",\"version\":\"") catch return errorResponse();
     gateway.jsonEscapeInto(w, cfg.a2a.version) catch return errorResponse();
     // url field for backward compatibility with older A2A clients.
     w.writeAll("\",\"url\":\"") catch return errorResponse();
-    gateway.jsonEscapeInto(w, cfg.a2a.url) catch return errorResponse();
-    w.writeAll("/a2a") catch return errorResponse();
+    gateway.jsonEscapeInto(w, endpoint_url) catch return errorResponse();
     // supported_interfaces per latest spec (required).
     w.writeAll("\",\"supportedInterfaces\":[{\"url\":\"") catch return errorResponse();
-    gateway.jsonEscapeInto(w, cfg.a2a.url) catch return errorResponse();
-    w.writeAll("/a2a\",\"protocolBinding\":\"JSONRPC\",\"protocolVersion\":\"0.2\"}]") catch return errorResponse();
+    gateway.jsonEscapeInto(w, endpoint_url) catch return errorResponse();
+    w.writeAll("\",\"protocolBinding\":\"JSONRPC\",\"protocolVersion\":\"") catch return errorResponse();
+    w.writeAll(A2A_PROTOCOL_VERSION) catch return errorResponse();
+    w.writeAll("\"}],\"preferredTransport\":\"JSONRPC\"") catch return errorResponse();
     w.writeAll(",\"provider\":{\"organization\":\"") catch return errorResponse();
     gateway.jsonEscapeInto(w, cfg.a2a.name) catch return errorResponse();
     w.writeAll("\",\"url\":\"") catch return errorResponse();
@@ -235,6 +249,8 @@ pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config) A2aResp
     }
     w.writeAll("\"}") catch return errorResponse();
     w.writeAll(",\"capabilities\":{\"streaming\":true}") catch return errorResponse();
+    w.writeAll(",\"securitySchemes\":{\"bearerAuth\":{\"type\":\"http\",\"scheme\":\"bearer\",\"description\":\"Use a pairing token from /pair as the bearer token.\"}}") catch return errorResponse();
+    w.writeAll(",\"security\":[{\"bearerAuth\":[]}]") catch return errorResponse();
     w.writeAll(",\"defaultInputModes\":[\"text/plain\"],\"defaultOutputModes\":[\"text/plain\"]") catch return errorResponse();
     w.writeAll(",\"skills\":[{\"id\":\"chat\",\"name\":\"General Chat\",\"description\":\"General-purpose AI assistant\",\"tags\":[\"chat\",\"general\"]}]") catch return errorResponse();
     w.writeAll("}") catch return errorResponse();
@@ -293,6 +309,7 @@ pub const SseStreamCtx = struct {
     allocator: std.mem.Allocator,
     request_id: []const u8,
     task_id: []const u8,
+    context_id: []const u8,
     filter: streaming.TagFilter = undefined,
 
     /// Write an SSE "data:" line with the given JSON payload.
@@ -304,21 +321,7 @@ pub const SseStreamCtx = struct {
 
     /// Build and emit an SSE event with a working status and text delta.
     fn emitChunkEvent(self: *SseStreamCtx, text: []const u8) void {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
-
-        w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":") catch return;
-        w.writeAll(self.request_id) catch return;
-        w.writeAll(",\"result\":{\"id\":\"") catch return;
-        gateway.jsonEscapeInto(w, self.task_id) catch return;
-        w.writeAll("\",\"status\":{\"state\":\"working\"},\"artifacts\":[{\"artifactId\":\"artifact-") catch return;
-        gateway.jsonEscapeInto(w, self.task_id) catch return;
-        w.writeAll("\",\"parts\":[{\"kind\":\"text\",\"text\":\"") catch return;
-        gateway.jsonEscapeInto(w, text) catch return;
-        w.writeAll("\"}],\"append\":true}]}}") catch return;
-
-        const data = buf.toOwnedSlice(self.allocator) catch return;
+        const data = buildArtifactUpdateEvent(self.allocator, self.request_id, self.task_id, self.context_id, text, false) catch return;
         defer self.allocator.free(data);
         self.writeSseEvent(data);
     }
@@ -359,13 +362,25 @@ pub fn handleStreamingRpc(
         writeSseError(allocator, stream, request_id, -32602, "Missing message text");
         return;
     };
+    const context_id = extractMessageContextId(body);
 
-    const task = registry.createTask(text) catch {
+    const task = registry.createTask(text, context_id) catch {
         writeSseError(allocator, stream, request_id, -32603, "Failed to create task");
         return;
     };
 
-    // Mark as working.
+    // Write SSE headers.
+    stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch return;
+
+    const initial_task_json = buildTaskJson(allocator, task) catch return;
+    defer allocator.free(initial_task_json);
+    const initial_event = buildJsonRpcResult(allocator, request_id, initial_task_json) catch return;
+    defer allocator.free(initial_event);
+    stream.writeAll("data: ") catch return;
+    stream.writeAll(initial_event) catch return;
+    stream.writeAll("\n\n") catch return;
+
+    // Mark as working after emitting the initial submitted task.
     {
         registry.mutex.lock();
         defer registry.mutex.unlock();
@@ -373,15 +388,13 @@ pub fn handleStreamingRpc(
         task.updated_at = std.time.timestamp();
     }
 
-    // Write SSE headers.
-    stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch return;
-
     // Create SSE sink context.
     var sse_ctx = SseStreamCtx{
         .stream = stream,
         .allocator = allocator,
         .request_id = request_id,
         .task_id = task.id,
+        .context_id = task.context_id,
     };
     const sink = sse_ctx.makeSink();
 
@@ -396,6 +409,7 @@ pub fn handleStreamingRpc(
         writeSseErrorEvent(allocator, &sse_ctx, -32603, "Agent processing failed");
         return;
     };
+    defer freeSessionResponse(session_mgr, response);
 
     // Update task with final response.
     {
@@ -404,26 +418,12 @@ pub fn handleStreamingRpc(
         task.state = .completed;
         task.updated_at = std.time.timestamp();
         registry.allocator.free(task.agent_text);
-        task.agent_text = registry.allocator.dupe(u8, response) catch "";
+        task.agent_text = registry.allocator.dupe(u8, response) catch return;
     }
 
-    // Send final completed event with full task JSON.
-    const task_json = buildTaskJson(allocator, task) catch return;
-    defer allocator.free(task_json);
-
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":") catch return;
-    w.writeAll(request_id) catch return;
-    w.writeAll(",\"result\":") catch return;
-    w.writeAll(task_json) catch return;
-    w.writeByte('}') catch return;
-
-    const final_data = buf.toOwnedSlice(allocator) catch return;
-    defer allocator.free(final_data);
-
-    sse_ctx.writeSseEvent(final_data);
+    const final_event = buildStatusUpdateEvent(allocator, request_id, task.id, task.context_id, task.state, task.updated_at, true) catch return;
+    defer allocator.free(final_event);
+    sse_ctx.writeSseEvent(final_event);
 }
 
 /// Write an SSE error event to the stream context.
@@ -457,8 +457,9 @@ fn handleSendMessage(
             return errorResponse();
         return .{ .body = err_body };
     };
+    const context_id = extractMessageContextId(body);
 
-    const task = registry.createTask(text) catch {
+    const task = registry.createTask(text, context_id) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Failed to create task") catch
             return errorResponse();
         return .{ .body = err_body };
@@ -484,6 +485,7 @@ fn handleSendMessage(
             return errorResponse();
         return .{ .body = err_body };
     };
+    defer freeSessionResponse(session_mgr, response);
 
     // Update task with response using the registry's long-lived allocator,
     // not the per-request allocator which is freed after the response is sent.
@@ -717,13 +719,13 @@ fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskRecord) ![]u8 {
 
     try w.writeAll("{\"id\":\"");
     try gateway.jsonEscapeInto(w, task.id);
-    try w.writeAll("\",\"contextId\":\"");
-    try gateway.jsonEscapeInto(w, task.session_key);
+    try w.writeAll("\",\"kind\":\"task\",\"contextId\":\"");
+    try gateway.jsonEscapeInto(w, task.context_id);
     try w.writeAll("\",\"status\":{\"state\":\"");
     try w.writeAll(task.state.jsonName());
     try w.writeAll("\",\"timestamp\":\"");
     try w.writeAll(timestamp);
-    try w.writeAll("\"}");
+    try w.writeAll("\"},\"metadata\":{}");
 
     // Include artifacts and history when agent_text is non-empty.
     if (task.agent_text.len > 0) {
@@ -735,10 +737,18 @@ fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskRecord) ![]u8 {
 
         try w.writeAll(",\"history\":[{\"role\":\"user\",\"messageId\":\"msg-user-");
         try gateway.jsonEscapeInto(w, task.id);
+        try w.writeAll("\",\"taskId\":\"");
+        try gateway.jsonEscapeInto(w, task.id);
+        try w.writeAll("\",\"contextId\":\"");
+        try gateway.jsonEscapeInto(w, task.context_id);
         try w.writeAll("\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
         try gateway.jsonEscapeInto(w, task.user_text);
         try w.writeAll("\"}]},{\"role\":\"agent\",\"messageId\":\"msg-agent-");
         try gateway.jsonEscapeInto(w, task.id);
+        try w.writeAll("\",\"taskId\":\"");
+        try gateway.jsonEscapeInto(w, task.id);
+        try w.writeAll("\",\"contextId\":\"");
+        try gateway.jsonEscapeInto(w, task.context_id);
         try w.writeAll("\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
         try gateway.jsonEscapeInto(w, task.agent_text);
         try w.writeAll("\"}]}]");
@@ -775,6 +785,19 @@ fn formatTimestamp(buf: *[32]u8, epoch_secs: i64) []const u8 {
     return result;
 }
 
+fn buildEndpointUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
+    if (base_url.len == 0) {
+        return allocator.dupe(u8, "/a2a");
+    }
+    if (std.mem.endsWith(u8, base_url, "/a2a")) {
+        return allocator.dupe(u8, base_url);
+    }
+    if (base_url.len > 0 and base_url[base_url.len - 1] == '/') {
+        return std.fmt.allocPrint(allocator, "{s}a2a", .{base_url});
+    }
+    return std.fmt.allocPrint(allocator, "{s}/a2a", .{base_url});
+}
+
 // ── Text Extraction Helpers ─────────────────────────────────────
 
 /// Extract the user's message text from A2A params.message.parts[0].text.
@@ -802,6 +825,13 @@ fn extractMessageText(body: []const u8) ?[]const u8 {
         remaining = remaining[pos + key_needle.len ..];
     }
     return null;
+}
+
+fn extractMessageContextId(body: []const u8) ?[]const u8 {
+    const message_needle = "\"message\"";
+    const message_pos = std.mem.indexOf(u8, body, message_needle) orelse return null;
+    const message_section = body[message_pos + message_needle.len ..];
+    return gateway.jsonStringField(message_section, "contextId");
 }
 
 /// Extract the JSON-RPC "id" field as a raw JSON token (string including quotes, or number).
@@ -855,6 +885,74 @@ fn extractParamsId(body: []const u8) ?[]const u8 {
     return gateway.jsonStringField(after_params, "id");
 }
 
+fn buildArtifactUpdateEvent(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    task_id: []const u8,
+    context_id: []const u8,
+    text: []const u8,
+    last_chunk: bool,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try w.writeAll(request_id);
+    try w.writeAll(",\"result\":{\"kind\":\"artifact-update\",\"taskId\":\"");
+    try gateway.jsonEscapeInto(w, task_id);
+    try w.writeAll("\",\"contextId\":\"");
+    try gateway.jsonEscapeInto(w, context_id);
+    try w.writeAll("\",\"artifact\":{\"artifactId\":\"artifact-");
+    try gateway.jsonEscapeInto(w, task_id);
+    try w.writeAll("\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
+    try gateway.jsonEscapeInto(w, text);
+    try w.writeAll("\"}]},\"append\":true,\"lastChunk\":");
+    try w.writeAll(if (last_chunk) "true" else "false");
+    try w.writeAll("}}");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn buildStatusUpdateEvent(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    task_id: []const u8,
+    context_id: []const u8,
+    state: TaskState,
+    updated_at: i64,
+    final: bool,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    var ts_buf: [32]u8 = undefined;
+    const timestamp = formatTimestamp(&ts_buf, updated_at);
+
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try w.writeAll(request_id);
+    try w.writeAll(",\"result\":{\"kind\":\"status-update\",\"taskId\":\"");
+    try gateway.jsonEscapeInto(w, task_id);
+    try w.writeAll("\",\"contextId\":\"");
+    try gateway.jsonEscapeInto(w, context_id);
+    try w.writeAll("\",\"status\":{\"state\":\"");
+    try w.writeAll(state.jsonName());
+    try w.writeAll("\",\"timestamp\":\"");
+    try w.writeAll(timestamp);
+    try w.writeAll("\"},\"final\":");
+    try w.writeAll(if (final) "true" else "false");
+    try w.writeAll("}}");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn freeSessionResponse(session_mgr: anytype, response: []const u8) void {
+    const session_mgr_type = @TypeOf(session_mgr.*);
+    if (comptime @hasField(session_mgr_type, "allocator")) {
+        session_mgr.allocator.free(response);
+    }
+}
+
 // ── Fallback Error Response ─────────────────────────────────────
 
 fn errorResponse() A2aResponse {
@@ -873,9 +971,10 @@ const testing = std.testing;
 
 const MockSessionManager = struct {
     response: []const u8 = "mock response",
+    allocator: std.mem.Allocator = testing.allocator,
 
     pub fn processMessage(self: *MockSessionManager, _: []const u8, _: []const u8, _: anytype) ![]const u8 {
-        return self.response;
+        return self.allocator.dupe(u8, self.response);
     }
 
     pub fn processMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink) ![]const u8 {
@@ -921,16 +1020,17 @@ test "TaskState jsonName returns correct strings" {
     try testing.expectEqualStrings("completed", TaskState.completed.jsonName());
     try testing.expectEqualStrings("failed", TaskState.failed.jsonName());
     try testing.expectEqualStrings("canceled", TaskState.canceled.jsonName());
-    try testing.expectEqualStrings("input_required", TaskState.input_required.jsonName());
+    try testing.expectEqualStrings("input-required", TaskState.input_required.jsonName());
 }
 
 test "TaskRegistry createTask and getTask" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("hello world");
+    const task = try registry.createTask("hello world", null);
     try testing.expectEqualStrings("task-1", task.id);
-    try testing.expectEqualStrings("a2a:task-1", task.session_key);
+    try testing.expectEqualStrings("ctx-1", task.context_id);
+    try testing.expectEqualStrings("a2a:ctx-1", task.session_key);
     try testing.expectEqualStrings("hello world", task.user_text);
     try testing.expect(task.state == .submitted);
     try testing.expectEqual(@as(usize, 0), task.agent_text.len);
@@ -952,7 +1052,7 @@ test "TaskRegistry evicts oldest completed tasks" {
     // Fill registry to MAX_TASKS with completed tasks.
     var i: usize = 0;
     while (i < MAX_TASKS) : (i += 1) {
-        const task = try registry.createTask("filler");
+        const task = try registry.createTask("filler", null);
         registry.mutex.lock();
         task.state = .completed;
         task.created_at = @as(i64, @intCast(i)); // ascending created_at
@@ -961,7 +1061,7 @@ test "TaskRegistry evicts oldest completed tasks" {
     try testing.expectEqual(MAX_TASKS, registry.taskCount());
 
     // Creating one more should evict the oldest (task-1 with created_at=0).
-    _ = try registry.createTask("new task");
+    _ = try registry.createTask("new task", null);
     try testing.expectEqual(MAX_TASKS, registry.taskCount());
 
     // task-1 should be evicted (it had the oldest created_at).
@@ -984,10 +1084,12 @@ test "handleAgentCard returns valid JSON" {
     // Verify key fields are present.
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"name\":\"TestAgent\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"description\":\"A test agent\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"protocolVersion\":\"0.2.5\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"version\":\"1.0.0\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"url\":\"http://localhost:3000/a2a\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"supportedInterfaces\":[") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"protocolBinding\":\"JSONRPC\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"securitySchemes\":{\"bearerAuth\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"provider\":{\"organization\":\"TestAgent\",\"url\":\"http://localhost:3000\"}") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"streaming\":true") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"defaultInputModes\":[\"text/plain\"]") != null);
@@ -1038,7 +1140,7 @@ test "handleJsonRpc dispatches tasks/get" {
     defer registry.deinit();
 
     // Create a task first.
-    const task = try registry.createTask("test input");
+    const task = try registry.createTask("test input", null);
     {
         registry.mutex.lock();
         defer registry.mutex.unlock();
@@ -1097,7 +1199,7 @@ test "buildTaskJson escapes special characters" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("hello \"world\"");
+    const task = try registry.createTask("hello \"world\"", null);
     {
         registry.mutex.lock();
         defer registry.mutex.unlock();
@@ -1137,7 +1239,7 @@ test "handleJsonRpc dispatches tasks/cancel" {
     defer registry.deinit();
 
     // Create a working task.
-    const task = try registry.createTask("cancel me");
+    const task = try registry.createTask("cancel me", null);
     {
         registry.mutex.lock();
         defer registry.mutex.unlock();
@@ -1160,7 +1262,7 @@ test "handleJsonRpc cancel returns error for completed task" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("done");
+    const task = try registry.createTask("done", null);
     {
         registry.mutex.lock();
         defer registry.mutex.unlock();
@@ -1216,7 +1318,7 @@ test "buildTaskJson omits artifacts and history when agent_text is empty" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("test input");
+    const task = try registry.createTask("test input", null);
 
     const json = try buildTaskJson(testing.allocator, task);
     defer testing.allocator.free(json);
@@ -1225,13 +1327,15 @@ test "buildTaskJson omits artifacts and history when agent_text is empty" {
     try testing.expect(std.mem.indexOf(u8, json, "\"history\"") == null);
     try testing.expect(std.mem.indexOf(u8, json, "\"status\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"contextId\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"task\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"metadata\":{}") != null);
 }
 
 test "buildTaskJson includes contextId artifactId and messageId" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const task = try registry.createTask("test");
+    const task = try registry.createTask("test", "conversation-1");
     {
         registry.mutex.lock();
         defer registry.mutex.unlock();
@@ -1243,10 +1347,11 @@ test "buildTaskJson includes contextId artifactId and messageId" {
     const json = try buildTaskJson(testing.allocator, task);
     defer testing.allocator.free(json);
 
-    try testing.expect(std.mem.indexOf(u8, json, "\"contextId\":\"a2a:task-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"contextId\":\"conversation-1\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"artifactId\":\"artifact-task-1\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"messageId\":\"msg-user-task-1\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"messageId\":\"msg-agent-task-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"taskId\":\"task-1\"") != null);
 }
 
 test "extractJsonRpcId handles string id" {
@@ -1284,13 +1389,22 @@ test "extractParamsId finds id in params" {
     try testing.expectEqualStrings("task-42", id.?);
 }
 
+test "extractMessageContextId finds context id in message" {
+    const body =
+        \\{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"contextId":"chat-42","role":"user","parts":[{"type":"text","text":"hello"}]}}}
+    ;
+    const context_id = extractMessageContextId(body);
+    try testing.expect(context_id != null);
+    try testing.expectEqualStrings("chat-42", context_id.?);
+}
+
 test "multiple tasks get unique IDs" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const t1 = try registry.createTask("first");
-    const t2 = try registry.createTask("second");
-    const t3 = try registry.createTask("third");
+    const t1 = try registry.createTask("first", null);
+    const t2 = try registry.createTask("second", null);
+    const t3 = try registry.createTask("third", null);
 
     try testing.expectEqualStrings("task-1", t1.id);
     try testing.expectEqualStrings("task-2", t2.id);
@@ -1303,8 +1417,8 @@ test "handleJsonRpc dispatches tasks/list" {
     defer registry.deinit();
 
     // Create some tasks with different states.
-    const t1 = try registry.createTask("first");
-    const t2 = try registry.createTask("second");
+    const t1 = try registry.createTask("first", null);
+    const t2 = try registry.createTask("second", "shared-context");
     {
         registry.mutex.lock();
         defer registry.mutex.unlock();
@@ -1332,8 +1446,8 @@ test "handleListTasks filters by state" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const t1 = try registry.createTask("first");
-    _ = try registry.createTask("second");
+    const t1 = try registry.createTask("first", null);
+    _ = try registry.createTask("second", null);
     {
         registry.mutex.lock();
         defer registry.mutex.unlock();
@@ -1359,7 +1473,7 @@ test "listTasks returns empty slice when no tasks match" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    _ = try registry.createTask("hello");
+    _ = try registry.createTask("hello", null);
 
     const tasks = try registry.listTasks(testing.allocator, .canceled, null, 50);
     defer testing.allocator.free(tasks);
@@ -1399,12 +1513,42 @@ test "listTasks respects max_results" {
     var registry = TaskRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    _ = try registry.createTask("a");
-    _ = try registry.createTask("b");
-    _ = try registry.createTask("c");
+    _ = try registry.createTask("a", null);
+    _ = try registry.createTask("b", null);
+    _ = try registry.createTask("c", null);
 
     const tasks = try registry.listTasks(testing.allocator, null, null, 2);
     defer testing.allocator.free(tasks);
 
     try testing.expectEqual(@as(usize, 2), tasks.len);
+}
+
+test "handleJsonRpc reuses provided contextId for follow-up turns" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{};
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-ctx","method":"message/send","params":{"message":{"contextId":"conversation-9","role":"user","parts":[{"type":"text","text":"Hello via context"}]}}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    const task = registry.getTask("task-1") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("conversation-9", task.context_id);
+    try testing.expectEqualStrings("a2a:conversation-9", task.session_key);
+}
+
+test "listTasks filters by provided context id" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    _ = try registry.createTask("first", "conversation-a");
+    _ = try registry.createTask("second", "conversation-b");
+
+    const tasks = try registry.listTasks(testing.allocator, null, "conversation-b", 10);
+    defer testing.allocator.free(tasks);
+
+    try testing.expectEqual(@as(usize, 1), tasks.len);
+    try testing.expectEqualStrings("conversation-b", tasks[0].context_id);
 }
