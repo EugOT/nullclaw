@@ -418,7 +418,7 @@ fn parseFrontmatterStringArray(allocator: std.mem.Allocator, meta: []const u8, k
 
         var parts = std.mem.splitScalar(u8, inner, ',');
         while (parts.next()) |part_raw| {
-            const part = std.mem.trim(u8, part_raw, " \t");
+            const part = std.mem.trim(u8, stripFrontmatterInlineComment(part_raw), " \t");
             if (part.len == 0) continue;
 
             // Strip quotes if present
@@ -436,10 +436,11 @@ fn parseFrontmatterStringArray(allocator: std.mem.Allocator, meta: []const u8, k
 
         // Check if line is indented and starts with "- "
         const trimmed = std.mem.trimLeft(u8, line, " \t");
+        if (trimmed.len > 0 and trimmed[0] == '#') continue;
         if (trimmed.len < 2 or trimmed[0] != '-') break; // end of block sequence
         if (trimmed[1] != ' ' and trimmed[1] != '\t') break;
 
-        const val_raw = std.mem.trim(u8, trimmed[2..], " \t");
+        const val_raw = std.mem.trim(u8, stripFrontmatterInlineComment(trimmed[2..]), " \t");
         const val = stripYamlQuotes(val_raw);
         if (val.len == 0) continue;
         try items.append(allocator, try allocator.dupe(u8, val));
@@ -4340,6 +4341,22 @@ test "parseFrontmatterStringArray block sequence with quoted items" {
     try std.testing.expectEqualStrings("item-two", arr[1]);
 }
 
+test "parseFrontmatterStringArray block sequence ignores comments" {
+    const allocator = std.testing.allocator;
+    const meta =
+        \\requires_bins:
+        \\  - docker # primary runtime
+        \\  # keep git for repo access
+        \\  - git
+    ;
+    const arr = try parseFrontmatterStringArray(allocator, meta, "requires_bins");
+    defer freeStringArray(allocator, arr);
+
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("docker", arr[0]);
+    try std.testing.expectEqualStrings("git", arr[1]);
+}
+
 test "parseFrontmatterSkill full frontmatter" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4575,4 +4592,39 @@ test "loadSkill SKILL.md frontmatter with requires_bins" {
     try std.testing.expectEqualStrings("docker", skill.requires_bins[0]);
     try std.testing.expectEqualStrings("git", skill.requires_bins[1]);
     try std.testing.expectEqualStrings("Instructions.", skill.instructions);
+}
+
+test "loadSkill SKILL.md frontmatter requires_bins ignores comments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/commented-bins");
+    {
+        const f = try tmp.dir.createFile("skills/commented-bins/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll(
+            "---\n" ++
+                "name: commented-bins\n" ++
+                "requires_bins:\n" ++
+                "  - docker # primary runtime\n" ++
+                "  # keep git for repo access\n" ++
+                "  - git\n" ++
+                "---\n" ++
+                "Instructions.\n",
+        );
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "commented-bins" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("commented-bins", skill.name);
+    try std.testing.expectEqual(@as(usize, 2), skill.requires_bins.len);
+    try std.testing.expectEqualStrings("docker", skill.requires_bins[0]);
+    try std.testing.expectEqualStrings("git", skill.requires_bins[1]);
 }
