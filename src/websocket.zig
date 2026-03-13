@@ -241,7 +241,7 @@ pub const WsClient = struct {
         return result;
     }
 
-    /// Read exactly buf.len bytes from TLS.
+    /// Read exactly buf.len bytes from the transport (TLS or plain socket).
     fn readExact(self: *WsClient, buf: []u8) !void {
         var total: usize = 0;
         while (total < buf.len) {
@@ -251,8 +251,11 @@ pub const WsClient = struct {
                     error.EndOfStream => return error.ConnectionClosed,
                     else => |e| return e,
                 };
-            } else self.stream.read(buf[total..]) catch |e| return e;
-            if (n == 0) return error.ConnectionClosed;
+            } else blk: {
+                const bytes = self.stream.read(buf[total..]) catch |e| return e;
+                if (bytes == 0) return error.ConnectionClosed;
+                break :blk bytes;
+            };
             total += n;
         }
     }
@@ -888,4 +891,93 @@ test "ws buildFrame zero-len payload close" {
     try std.testing.expectEqual(@as(usize, 6), n); // 2 header + 4 mask
     try std.testing.expectEqual(@as(u8, 0x88), buf[0]); // close
     try std.testing.expectEqual(@as(u8, 0x80), buf[1]); // MASK=1, len=0
+}
+
+// Regression: v2026.3.12 applied a blanket `n == 0 → ConnectionClosed` check
+// to both TLS and plain socket paths. TLS readVec may return 0 while it
+// refills its internal buffer or processes post-handshake records, so only
+// plain sockets should treat a zero-byte read as EOF.
+
+fn fake_tls_test_stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    return error.EndOfStream;
+}
+
+fn fake_tls_read_vec_zero_then_byte(reader: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+    if (reader.seek == 0 and reader.end == 0) {
+        // Mimic std.crypto.tls.Client.readVec buffering internal TLS records
+        // before returning any application bytes to the caller.
+        reader.seek = 1;
+        reader.end = 1;
+        return 0;
+    }
+    data[0][0] = 'Z';
+    return 1;
+}
+
+test "ws readExact TLS tolerates transient zero readVec return" {
+    var tls_reader_storage = [_]u8{0};
+    var tls_state: TlsState = undefined;
+    tls_state.tls_client = undefined;
+    tls_state.tls_client.reader = .{
+        .buffer = &tls_reader_storage,
+        .seek = 0,
+        .end = 0,
+        .vtable = &.{
+            .stream = fake_tls_test_stream,
+            .readVec = fake_tls_read_vec_zero_then_byte,
+        },
+    };
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = undefined,
+        .tls = &tls_state,
+        .write_mu = .{},
+    };
+
+    var buf: [1]u8 = undefined;
+    try client.readExact(&buf);
+    try std.testing.expectEqual(@as(u8, 'Z'), buf[0]);
+}
+
+test "ws readExact plain returns ConnectionClosed on immediate EOF" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const fds = try std.posix.pipe();
+    std.posix.close(fds[1]); // close write end → read returns 0
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = .{ .handle = fds[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+    defer std.posix.close(fds[0]);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectError(error.ConnectionClosed, client.readExact(&buf));
+}
+
+test "ws readExact plain reads data then ConnectionClosed on EOF" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const fds = try std.posix.pipe();
+
+    _ = try std.posix.write(fds[1], "OK");
+    std.posix.close(fds[1]);
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = .{ .handle = fds[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+    defer std.posix.close(fds[0]);
+
+    // First read succeeds
+    var buf: [2]u8 = undefined;
+    try client.readExact(&buf);
+    try std.testing.expectEqualStrings("OK", &buf);
+
+    // Next read hits EOF
+    var buf2: [1]u8 = undefined;
+    try std.testing.expectError(error.ConnectionClosed, client.readExact(&buf2));
 }
