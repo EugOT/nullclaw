@@ -1,5 +1,6 @@
 const std = @import("std");
 const search_base_url = @import("search_base_url.zig");
+const tunnel_mod = @import("tunnel.zig");
 
 /// Default context token budget used by agent compaction/context management.
 /// Runtime fallback (`DEFAULT_CONTEXT_TOKENS`).
@@ -1121,19 +1122,13 @@ pub const MemorySummarizerConfig = struct {
 
 // ── Tunnel config ───────────────────────────────────────────────
 
-// Re-export tunnel config types from tunnel.zig
-pub const CloudflareTunnelConfig = @import("tunnel.zig").CloudflareTunnelConfig;
-pub const TailscaleTunnelConfig = @import("tunnel.zig").TailscaleTunnelConfig;
-pub const NgrokTunnelConfig = @import("tunnel.zig").NgrokTunnelConfig;
-pub const CustomTunnelConfig = @import("tunnel.zig").CustomTunnelConfig;
-
-pub const TunnelConfig = struct {
-    provider: []const u8 = "none",
-    cloudflare: ?CloudflareTunnelConfig = null,
-    tailscale: ?TailscaleTunnelConfig = null,
-    ngrok: ?NgrokTunnelConfig = null,
-    custom: ?CustomTunnelConfig = null,
-};
+// Re-export tunnel config types from tunnel.zig so config parsing stays
+// aligned with the runtime tunnel factory shape.
+pub const CloudflareTunnelConfig = tunnel_mod.CloudflareTunnelConfig;
+pub const TailscaleTunnelConfig = tunnel_mod.TailscaleTunnelConfig;
+pub const NgrokTunnelConfig = tunnel_mod.NgrokTunnelConfig;
+pub const CustomTunnelConfig = tunnel_mod.CustomTunnelConfig;
+pub const TunnelConfig = tunnel_mod.TunnelFullConfig;
 
 // ── Gateway config ──────────────────────────────────────────────
 

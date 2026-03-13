@@ -894,6 +894,46 @@ fn inboundDispatcherThread(
     }
 }
 
+fn startConfiguredTunnel(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    host: []const u8,
+    port: u16,
+    state: *DaemonState,
+) ?tunnel_mod.Tunnel {
+    if (config.tunnel.provider.len == 0 or std.mem.eql(u8, config.tunnel.provider, "none")) {
+        health.markComponentOk("tunnel");
+        return null;
+    }
+
+    state.addComponent("tunnel");
+
+    var tunnel = tunnel_mod.createTunnel(config.tunnel) catch |err| {
+        state.markError("tunnel", @errorName(err));
+        health.markComponentError("tunnel", @errorName(err));
+        log.warn("Failed to create tunnel: {s}", .{@errorName(err)});
+        return null;
+    } orelse {
+        health.markComponentOk("tunnel");
+        return null;
+    };
+
+    tunnel.allocator = allocator;
+    if (tunnel.start(host, port)) |url| {
+        state.tunnel_provider = config.tunnel.provider;
+        state.tunnel_url = url;
+        state.markRunning("tunnel");
+        health.markComponentOk("tunnel");
+        return tunnel;
+    } else |err| {
+        state.markError("tunnel", @errorName(err));
+        health.markComponentError("tunnel", @errorName(err));
+        log.warn("Failed to start tunnel: {s}", .{@errorName(err)});
+        tunnel.stop();
+        return null;
+    }
+}
+
 /// Run the long-lived runtime. This is the main entry point for `nullclaw gateway`.
 /// Spawns threads for gateway, heartbeat, and channels, then loops until
 /// shutdown is requested (Ctrl+C signal or explicit request).
@@ -927,34 +967,8 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     state.addComponent("scheduler");
 
-    // Start tunnel if configured (before gateway so URL is available for webhooks)
-    state.addComponent("tunnel");
-    var tunnel: ?tunnel_mod.Tunnel = null;
-    if (!std.mem.eql(u8, config.tunnel.provider, "none")) {
-        const tunnel_cfg = tunnel_mod.TunnelFullConfig{
-            .provider = config.tunnel.provider,
-            .cloudflare = config.tunnel.cloudflare,
-            .ngrok = config.tunnel.ngrok,
-            .tailscale = config.tunnel.tailscale,
-            .custom = config.tunnel.custom,
-        };
-        tunnel = tunnel_mod.createTunnel(tunnel_cfg) catch |err| blk: {
-            log.warn("Failed to create tunnel: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        if (tunnel) |*t| {
-            t.allocator = allocator;
-            if (t.start(host, port)) |url| {
-                state.tunnel_provider = config.tunnel.provider;
-                state.tunnel_url = url;
-                health.markComponentOk("tunnel");
-            } else |err| {
-                log.warn("Failed to start tunnel: {s}", .{@errorName(err)});
-                t.stop();
-                tunnel = null;
-            }
-        }
-    }
+    // Start tunnel before gateway so any public URL is available immediately.
+    var tunnel = startConfiguredTunnel(allocator, config, host, port, &state);
 
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
@@ -2281,4 +2295,40 @@ test "writeStateFile handles null tunnel_url" {
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_provider\": \"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"tunnel_url\": null") != null);
+}
+
+test "startConfiguredTunnel skips none provider" {
+    var config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var state = DaemonState{};
+
+    const tunnel = startConfiguredTunnel(std.testing.allocator, &config, "127.0.0.1", 3000, &state);
+
+    try std.testing.expect(tunnel == null);
+    try std.testing.expectEqual(@as(usize, 0), state.component_count);
+    try std.testing.expectEqualStrings("none", state.tunnel_provider);
+    try std.testing.expect(state.tunnel_url == null);
+}
+
+test "startConfiguredTunnel records create failure" {
+    var config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    config.tunnel.provider = "ngrok";
+
+    var state = DaemonState{};
+    const tunnel = startConfiguredTunnel(std.testing.allocator, &config, "127.0.0.1", 3000, &state);
+
+    try std.testing.expect(tunnel == null);
+    try std.testing.expectEqual(@as(usize, 1), state.component_count);
+    try std.testing.expectEqualStrings("tunnel", state.components[0].?.name);
+    try std.testing.expect(!state.components[0].?.running);
+    try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
+    try std.testing.expectEqualStrings("MissingNgrokConfig", state.components[0].?.last_error.?);
+    try std.testing.expect(state.tunnel_url == null);
 }
