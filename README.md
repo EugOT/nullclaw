@@ -418,7 +418,19 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
   },
 
   "mcp_servers": {
-    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"] }
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://mcp.example.com/rpc",
+      "timeout_ms": 10000,
+      "headers": {
+        "Authorization": "Bearer ${MCP_TOKEN}"
+      }
+    }
   },
 
   "memory": {
