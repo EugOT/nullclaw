@@ -22,6 +22,7 @@ const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
 const interaction_choices = @import("interactions/choices.zig");
 const memory_mod = @import("memory/root.zig");
+const outbound = @import("outbound.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
@@ -575,6 +576,9 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("message_id")) |v| {
             if (v == .string and v.string.len > 0) parsed.fields.message_id = v.string;
         }
+        if (pm.value.object.get("replace_message")) |v| {
+            if (v == .bool) parsed.fields.replace_message = v.bool;
+        }
         if (pm.value.object.get("guild_id")) |v| {
             if (v == .string) parsed.fields.guild_id = v.string;
         }
@@ -951,6 +955,62 @@ fn makeAssistantReplyOutbound(
     return msg;
 }
 
+const AssistantReplyPayload = struct {
+    text: []u8,
+    choices: []outbound.Choice,
+
+    fn deinit(self: *AssistantReplyPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        for (self.choices) |choice| choice.deinit(allocator);
+        allocator.free(self.choices);
+    }
+
+    fn payload(self: *const AssistantReplyPayload) outbound.Payload {
+        return .{
+            .text = self.text,
+            .choices = self.choices,
+        };
+    }
+};
+
+fn makeAssistantReplyPayload(allocator: std.mem.Allocator, reply: []const u8) !AssistantReplyPayload {
+    if (std.mem.indexOf(u8, reply, interaction_choices.START_TAG) == null) {
+        return .{
+            .text = try allocator.dupe(u8, reply),
+            .choices = try allocator.alloc(outbound.Choice, 0),
+        };
+    }
+
+    var parsed = try interaction_choices.parseAssistantChoices(allocator, reply);
+    defer parsed.deinit(allocator);
+
+    const choices = if (parsed.choices) |choices| blk: {
+        const duped = try allocator.alloc(outbound.Choice, choices.options.len);
+        var i: usize = 0;
+        errdefer {
+            for (duped[0..i]) |choice| choice.deinit(allocator);
+            allocator.free(duped);
+        }
+        while (i < choices.options.len) : (i += 1) {
+            duped[i] = .{
+                .id = try allocator.dupe(u8, choices.options[i].id),
+                .label = try allocator.dupe(u8, choices.options[i].label),
+                .submit_text = try allocator.dupe(u8, choices.options[i].submit_text),
+            };
+        }
+        break :blk duped;
+    } else try allocator.alloc(outbound.Choice, 0);
+    errdefer {
+        for (choices) |choice| choice.deinit(allocator);
+        allocator.free(choices);
+    }
+
+    return .{
+        .text = try allocator.dupe(u8, parsed.visible_text),
+        .choices = choices,
+    };
+}
+
 fn makeStreamingSinkForChannel(
     streaming_supported: bool,
     raw_sink: streaming.Sink,
@@ -1072,6 +1132,38 @@ fn inboundDispatcherThread(
             continue;
         };
         defer allocator.free(reply);
+
+        if ((parsed_meta.fields.replace_message orelse false) and parsed_meta.fields.message_id != null) {
+            if (outbound_channel) |channel| {
+                var payload = makeAssistantReplyPayload(allocator, reply) catch |err| {
+                    log.warn("failed to build edit payload: {}", .{err});
+                    const out = makeAssistantReplyOutbound(
+                        allocator,
+                        msg.channel,
+                        outbound_account_id,
+                        msg.chat_id,
+                        reply,
+                        outbound_draft_id,
+                    ) catch continue;
+                    event_bus.publishOutbound(out) catch |publish_err| {
+                        out.deinit(allocator);
+                        log.err("inbound dispatch publishOutbound failed: {}", .{publish_err});
+                    };
+                    continue;
+                };
+                defer payload.deinit(allocator);
+
+                if (channel.editMessage(.{
+                    .target = msg.chat_id,
+                    .message_id = parsed_meta.fields.message_id.?,
+                    .payload = payload.payload(),
+                })) |_| {
+                    continue;
+                } else |err| {
+                    log.warn("editMessage failed; falling back to normal outbound: {}", .{err});
+                }
+            }
+        }
 
         const out = makeAssistantReplyOutbound(
             allocator,
