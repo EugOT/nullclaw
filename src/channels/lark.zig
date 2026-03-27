@@ -101,7 +101,44 @@ pub const LarkChannel = struct {
     token_expires_at: i64 = 0,
     typing_mutex: std.Thread.Mutex = .{},
     typing_placeholders: std.StringHashMapUnmanaged(root.Channel.MessageRef) = .empty,
-    test_message_seq: u64 = 0,
+    test_message_seq: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    test_deleted_message_count: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    test_typing_hook: if (builtin.is_test) ?*TypingPlaceholderTestHook else void = if (builtin.is_test) null else {},
+
+    const TypingPlaceholderTestHook = struct {
+        mutex: std.Thread.Mutex = .{},
+        cond: std.Thread.Condition = .{},
+        armed: bool = true,
+        paused: bool = false,
+        released: bool = false,
+
+        fn maybePause(self: *TypingPlaceholderTestHook) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (!self.armed) return;
+            self.armed = false;
+            self.paused = true;
+            self.cond.broadcast();
+            while (!self.released) {
+                self.cond.wait(&self.mutex);
+            }
+        }
+
+        fn waitUntilPaused(self: *TypingPlaceholderTestHook) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (!self.paused) {
+                self.cond.wait(&self.mutex);
+            }
+        }
+
+        fn releaseWaiters(self: *TypingPlaceholderTestHook) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.released = true;
+            self.cond.broadcast();
+        }
+    };
 
     pub const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
     pub const LARK_BASE_URL = "https://open.larksuite.com/open-apis";
@@ -355,12 +392,18 @@ pub const LarkChannel = struct {
     }
 
     fn deinitTypingPlaceholders(self: *LarkChannel) void {
-        var it = self.typing_placeholders.iterator();
+        self.typing_mutex.lock();
+        var placeholders = self.typing_placeholders;
+        self.typing_placeholders = .empty;
+        self.typing_mutex.unlock();
+
+        var it = placeholders.iterator();
         while (it.next()) |entry| {
+            self.deleteTrackedMessage(entry.value_ptr.*) catch {};
             self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit(self.allocator);
         }
-        self.typing_placeholders.deinit(self.allocator);
+        placeholders.deinit(self.allocator);
     }
 
     fn buildMessageCollectionUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
@@ -406,6 +449,18 @@ pub const LarkChannel = struct {
         const message_id_val = data_val.object.get("message_id") orelse return error.LarkApiError;
         if (message_id_val != .string or message_id_val.string.len == 0) return error.LarkApiError;
         return allocator.dupe(u8, message_id_val.string);
+    }
+
+    fn dupeResponseBodyAndFree(allocator: std.mem.Allocator, stdout: []u8, resp_body: []const u8) ![]u8 {
+        defer allocator.free(stdout);
+        return allocator.dupe(u8, resp_body);
+    }
+
+    fn maybePauseBeforeTypingSend(self: *LarkChannel) void {
+        if (!builtin.is_test) return;
+        if (self.test_typing_hook) |hook| {
+            hook.maybePause();
+        }
     }
 
     fn extractCardActionOpenId(event: std.json.Value) ?[]const u8 {
@@ -824,7 +879,7 @@ pub const LarkChannel = struct {
 
         if (!statusCodeIsSuccess(status_code)) return error.LarkApiError;
         try validateBusinessResponse(self.allocator, op, resp_body);
-        return self.allocator.dupe(u8, resp_body);
+        return dupeResponseBodyAndFree(self.allocator, stdout, resp_body);
     }
 
     fn buildRichCardContent(buf: []u8, payload: root.Channel.OutboundPayload) ![]const u8 {
@@ -928,7 +983,10 @@ pub const LarkChannel = struct {
     }
 
     fn deleteTrackedMessage(self: *LarkChannel, message_ref: root.Channel.MessageRef) !void {
-        if (builtin.is_test) return;
+        if (builtin.is_test) {
+            self.test_deleted_message_count += 1;
+            return;
+        }
 
         var url_buf: [256]u8 = undefined;
         const url = try self.buildMessageItemUrl(&url_buf, message_ref.message_id);
@@ -959,6 +1017,7 @@ pub const LarkChannel = struct {
             return;
         }
         self.typing_mutex.unlock();
+        self.maybePauseBeforeTypingSend();
 
         const message_ref = (try self.sendTextTracked(recipient, LARK_TYPING_PLACEHOLDER)) orelse return error.InvalidMessageRef;
         errdefer message_ref.deinit(self.allocator);
@@ -971,6 +1030,7 @@ pub const LarkChannel = struct {
         const gop = try self.typing_placeholders.getOrPut(self.allocator, recipient_key);
         if (gop.found_existing) {
             self.allocator.free(recipient_key);
+            self.deleteTrackedMessage(message_ref) catch {};
             message_ref.deinit(self.allocator);
             return;
         }
@@ -2832,6 +2892,19 @@ test "lark parseMessageId extracts message id from send response" {
     try std.testing.expectEqualStrings("om_test_123", message_id);
 }
 
+test "lark dupeResponseBodyAndFree releases temporary curl output on success" {
+    const allocator = std.testing.allocator;
+    const stdout = try allocator.dupe(u8, "{\"code\":0,\"msg\":\"success\"}\n200");
+    const nl = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse unreachable;
+
+    // Regression: requestWithBearerRetry must free curl stdout after duplicating
+    // the response body for callers.
+    const body = try LarkChannel.dupeResponseBodyAndFree(allocator, stdout, stdout[0..nl]);
+    defer allocator.free(body);
+
+    try std.testing.expectEqualStrings("{\"code\":0,\"msg\":\"success\"}", body);
+}
+
 test "lark typing placeholder start and stop are best-effort in tests" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
@@ -2858,6 +2931,52 @@ test "lark sendMessage clears typing placeholder before final send" {
 
     try ch.sendMessage("oc_chat_2", "final reply");
     try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+}
+
+test "lark stop deletes active typing placeholders in tests" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    // Regression: stopping the channel must delete visible placeholder messages,
+    // not just free the local tracking map.
+    try ch.startTypingPlaceholder("oc_chat_3");
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+
+    ch.channel().stop();
+
+    try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+    try std.testing.expectEqual(@as(usize, 1), ch.test_deleted_message_count);
+}
+
+test "lark typing placeholder deletes duplicate send after race" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    defer ch.deinitTypingPlaceholders();
+
+    var hook = LarkChannel.TypingPlaceholderTestHook{};
+    ch.test_typing_hook = &hook;
+
+    const ThreadCtx = struct {
+        channel: *LarkChannel,
+
+        fn run(ctx: *@This()) void {
+            ctx.channel.startTypingPlaceholder("oc_chat_4") catch unreachable;
+        }
+    };
+
+    var ctx = ThreadCtx{ .channel = &ch };
+    const worker = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx});
+    hook.waitUntilPaused();
+
+    try ch.startTypingPlaceholder("oc_chat_4");
+    hook.releaseWaiters();
+    worker.join();
+
+    try std.testing.expectEqual(@as(u64, 2), ch.test_message_seq);
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+    try std.testing.expectEqual(@as(usize, 1), ch.test_deleted_message_count);
 }
 
 test "lark parseEventPayload handles websocket message format" {
