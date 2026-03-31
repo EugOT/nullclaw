@@ -2235,7 +2235,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     }
 
     // ── Step 8: Workspace path ──
-    const default_workspace = try getDefaultWorkspace(allocator);
+    const default_workspace = cfg.workspace_dir;
     try out.print("  Step 8/8: Workspace path [{s}]: ", .{default_workspace});
     const ws_input = prompt(out, &input_buf, "", default_workspace) orelse {
         try out.writeAll("\n  Aborted.\n");
@@ -3007,19 +3007,86 @@ pub fn defaultBackendKey() []const u8 {
 
 // ── Path helpers ─────────────────────────────────────────────────
 
-fn getDefaultWorkspace(allocator: std.mem.Allocator) ![]const u8 {
+fn getDefaultConfigDir(allocator: std.mem.Allocator) ![]const u8 {
+    if (std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME")) |config_dir| {
+        return config_dir;
+    } else |err| switch (err) {
+        error.EnvironmentVariableNotFound => {},
+        else => return err,
+    }
+
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "workspace" });
+    return std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+}
+
+fn getDefaultWorkspace(allocator: std.mem.Allocator) ![]const u8 {
+    if (std.process.getEnvVarOwned(allocator, "NULLCLAW_WORKSPACE")) |workspace_dir| {
+        return workspace_dir;
+    } else |err| switch (err) {
+        error.EnvironmentVariableNotFound => {},
+        else => return err,
+    }
+
+    const config_dir = try getDefaultConfigDir(allocator);
+    defer allocator.free(config_dir);
+    return std.fs.path.join(allocator, &.{ config_dir, "workspace" });
 }
 
 fn getDefaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "config.json" });
+    const config_dir = try getDefaultConfigDir(allocator);
+    defer allocator.free(config_dir);
+    return std.fs.path.join(allocator, &.{ config_dir, "config.json" });
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+test "getDefaultWorkspace prefers NULLCLAW_WORKSPACE override" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const key_z = try std.testing.allocator.dupeZ(u8, "NULLCLAW_WORKSPACE");
+    defer std.testing.allocator.free(key_z);
+    const value_z = try std.testing.allocator.dupeZ(u8, "/tmp/nullclaw-test-workspace");
+    defer std.testing.allocator.free(value_z);
+
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, value_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    const workspace = try getDefaultWorkspace(std.testing.allocator);
+    defer std.testing.allocator.free(workspace);
+
+    try std.testing.expectEqualStrings("/tmp/nullclaw-test-workspace", workspace);
+}
+
+test "initFreshConfig honors NULLCLAW_HOME and NULLCLAW_WORKSPACE overrides" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const home_key_z = try std.testing.allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer std.testing.allocator.free(home_key_z);
+    const home_value_z = try std.testing.allocator.dupeZ(u8, "/tmp/nullclaw-home");
+    defer std.testing.allocator.free(home_value_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(home_key_z.ptr, home_value_z.ptr, 1));
+    defer _ = c.unsetenv(home_key_z.ptr);
+
+    const workspace_key_z = try std.testing.allocator.dupeZ(u8, "NULLCLAW_WORKSPACE");
+    defer std.testing.allocator.free(workspace_key_z);
+    const workspace_value_z = try std.testing.allocator.dupeZ(u8, "/tmp/nullclaw-home/workspace-custom");
+    defer std.testing.allocator.free(workspace_value_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(workspace_key_z.ptr, workspace_value_z.ptr, 1));
+    defer _ = c.unsetenv(workspace_key_z.ptr);
+
+    var cfg = try initFreshConfig(std.testing.allocator);
+    defer cfg.deinit();
+
+    try std.testing.expectEqualStrings("/tmp/nullclaw-home/workspace-custom", cfg.workspace_dir);
+    try std.testing.expectEqualStrings("/tmp/nullclaw-home/config.json", cfg.config_path);
+}
 
 test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("xai", canonicalProviderName("grok"));
