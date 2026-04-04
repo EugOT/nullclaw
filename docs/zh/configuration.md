@@ -229,6 +229,27 @@ nullclaw onboard --interactive
 - 两个命名 agent 即使使用相同的 provider/model，也可以保持各自独立的持久笔记和工作区。
 - `workspace_path` 本身不会决定聊天路由；路由仍然由 `bindings`、`/bind` 或显式 `--agent` / `/subagents spawn --agent` 决定。
 
+### `messages.inbound`
+
+- `debounce_ms` 用来延迟处理连续快速到达的纯文本入站消息，把短时间内的多条碎片合并成一次 turn。
+- 默认值：`3000`。
+- 作用范围包括 daemon 路由的入站文本和 Agent CLI REPL。
+- 设为 `0` 可关闭。
+- slash 命令和带媒体的入站消息会跳过 debounce。
+- Telegram 仍保留自己的长消息分段合并逻辑；这里的值会作为那条逻辑的基础 debounce 窗口。
+
+示例：
+
+```json
+{
+  "messages": {
+    "inbound": {
+      "debounce_ms": 1500
+    }
+  }
+}
+```
+
 ### `reliability`
 
 - 配置 LLM 提供者的全局重试和故障转移行为。
@@ -260,7 +281,6 @@ nullclaw onboard --interactive
 - 裸模型名的故障转移顺序：先尝试主要提供方，再依次尝试每个列出的 `fallback_provider`。
 - 像 `openai/gpt-4o` 这样的显式 `provider/model` 备用项会直接路由到对应 provider，不会再走通用 provider 扇出链路。
 - `api_keys`: (可选) 用于在速率限制 (429) 错误时轮换的额外 API 密钥列表。
-
 ### `identity`（AIEOS v1.1）
 
 如果你希望运行时身份来自 AIEOS 文档，可以使用这一节。配置后，nullclaw 会把解析后的 AIEOS 内容连同 `AGENTS.md`、`IDENTITY.md` 等工作区身份文件一起注入 system prompt：

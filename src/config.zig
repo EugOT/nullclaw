@@ -168,6 +168,7 @@ pub const Config = struct {
     runtime: RuntimeConfig = .{},
     reliability: ReliabilityConfig = .{},
     scheduler: SchedulerConfig = .{},
+    messages: config_types.MessagesConfig = .{},
     agent: AgentConfig = .{},
     heartbeat: HeartbeatConfig = .{},
     cron: CronConfig = .{},
@@ -1093,6 +1094,7 @@ pub const Config = struct {
         // Reliability
         try self.writeReliabilitySection(w, &store);
         try w.print("  \"scheduler\": {f},\n", .{std.json.fmt(self.scheduler, .{})});
+        try w.print("  \"messages\": {f},\n", .{std.json.fmt(self.messages, .{})});
         try w.print("  \"agent\": {f},\n", .{std.json.fmt(.{
             .compact_context = self.agent.compact_context,
             .max_tool_iterations = self.agent.max_tool_iterations,
@@ -2270,6 +2272,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.scheduler.max_tasks = 32;
     cfg.scheduler.max_concurrent = 2;
     cfg.scheduler.agent_timeout_secs = 123;
+    cfg.messages.inbound.debounce_ms = 1500;
 
     cfg.agent.compact_context = true;
     cfg.agent.max_tool_iterations = 7;
@@ -2403,6 +2406,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
+    try std.testing.expectEqual(@as(u32, 1500), loaded.messages.inbound.debounce_ms);
     try std.testing.expect(loaded.agent.parallel_tools);
     try std.testing.expect(!loaded.agent.status_show_emojis);
     try std.testing.expectEqualStrings("UTC+08:00", loaded.agent.timezone);
@@ -3327,6 +3331,16 @@ test "json parse scheduler section" {
     try std.testing.expectEqual(@as(u32, 128), cfg.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u32, 8), cfg.scheduler.max_concurrent);
     try std.testing.expectEqual(@as(u64, 600), cfg.scheduler.agent_timeout_secs);
+}
+
+test "json parse messages section reads inbound debounce config" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"messages": {"inbound": {"debounce_ms": 1500}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u32, 1500), cfg.messages.inbound.debounce_ms);
 }
 
 test "json parse agent section" {
