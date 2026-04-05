@@ -849,6 +849,7 @@ pub const OpenAiCompatibleProvider = struct {
         message: []const u8,
         model: []const u8,
         temperature: f64,
+        extra_body_params: ?[]const u8,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -871,6 +872,7 @@ pub const OpenAiCompatibleProvider = struct {
 
         try buf.append(allocator, ']');
         try root.appendGenerationFields(&buf, allocator, model, temperature, null, null);
+        try appendExtraParams(&buf, allocator, null, extra_body_params);
         try buf.appendSlice(allocator, ",\"stream\":false}");
 
         return try buf.toOwnedSlice(allocator);
@@ -1437,7 +1439,14 @@ pub const OpenAiCompatibleProvider = struct {
             }
         }
 
-        const body = try buildRequestBody(allocator, eff_system, merged_msg orelse message, effective_model, temperature);
+        const body = try buildRequestBody(
+            allocator,
+            eff_system,
+            merged_msg orelse message,
+            effective_model,
+            temperature,
+            self.extra_body_params,
+        );
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -1864,11 +1873,28 @@ test "buildRequestBody with system" {
         "hello",
         "llama-3.3-70b",
         0.4,
+        null,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "llama-3.3-70b") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "system") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "user") != null);
+}
+
+test "buildRequestBody appends extra_body_params" {
+    // Regression: chatWithSystem used this builder and previously dropped
+    // extra_body_params on the chat-completions path.
+    const body = try OpenAiCompatibleProvider.buildRequestBody(
+        std.testing.allocator,
+        "You are helpful",
+        "hello",
+        "llama-3.3-70b",
+        0.4,
+        "{\"seed\":123,\"metadata\":{\"tier\":\"team\"}}",
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"seed\":123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"metadata\":{\"tier\":\"team\"}") != null);
 }
 
 test "parseTextResponse extracts content" {
@@ -2291,6 +2317,7 @@ test "buildRequestBody without system" {
         "hello",
         "model",
         0.7,
+        null,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "system") == null);
@@ -2970,7 +2997,7 @@ test "buildChatRequestBody with high detail image_url" {
 }
 
 test "buildRequestBody reasoning model omits temperature" {
-    const body = try OpenAiCompatibleProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-5", 0.5);
+    const body = try OpenAiCompatibleProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-5", 0.5, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":false") != null);

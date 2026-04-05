@@ -389,7 +389,7 @@ pub const ProviderHolder = union(enum) {
                 else
                     base_url,
             ) },
-            .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent) },
+            .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent, extra_body_params) },
             .azure_openai_provider => blk: {
                 const azure_url = normalizeAzureBaseUrlOwned(allocator, base_url) catch null;
                 var prov = compatible.OpenAiCompatibleProvider.init(
@@ -953,6 +953,14 @@ test "fromConfig threads extra_body_params to compatible provider" {
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expectEqualStrings("{\"seed\":7}", h.compatible.extra_body_params.?);
+}
+
+test "fromConfig threads extra_body_params to openai provider" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null, null, false, "{\"seed\":11}");
+    defer h.deinit();
+    try std.testing.expect(h == .openai);
+    try std.testing.expectEqualStrings("{\"seed\":11}", h.openai.extra_body_params.?);
 }
 
 test "detectProviderByApiKey openrouter" {
