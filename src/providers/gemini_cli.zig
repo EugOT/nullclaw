@@ -383,10 +383,8 @@ pub const GeminiCliProvider = struct {
 
                 // Record detailed error message if available
                 if (err_val == .object) {
-                    if (err_val.object.get("message")) |err_msg_val| {
-                        if (err_msg_val == .string) {
-                            root.setLastApiErrorDetail("gemini-cli", err_msg_val.string);
-                        }
+                    if (lookupErrorMessage(err_val.object)) |err_msg| {
+                        root.setLastApiErrorDetail("gemini-cli", err_msg);
                     }
                 }
 
@@ -398,6 +396,16 @@ pub const GeminiCliProvider = struct {
 
         if (result_buf.items.len == 0) return error.NoResultInOutput;
         return try result_buf.toOwnedSlice(allocator);
+    }
+
+    fn lookupErrorMessage(obj: std.json.ObjectMap) ?[]const u8 {
+        if (obj.get("message")) |value| {
+            if (value == .string) return value.string;
+        }
+        if (obj.get("msg")) |value| {
+            if (value == .string) return value.string;
+        }
+        return null;
     }
 
     fn readLine(self: *GeminiCliProvider, allocator: std.mem.Allocator) ![]const u8 {
@@ -540,16 +548,20 @@ fn floatResponseIdMatches(resp_id: f64, id: u32) bool {
 
 fn recordJsonRpcError(prefix: []const u8, line: []const u8, err_val: ?std.json.Value) void {
     if (err_val) |err_obj| {
-        log.err("{s} failed with error: {any}", .{ prefix, err_obj });
+        // Tests assert detail propagation on this path; skip stderr side effects
+        // there because Zig treats unexpected test logs as failures.
+        if (!builtin.is_test) {
+            log.err("{s} failed with error: {any}", .{ prefix, err_obj });
+        }
         if (err_obj == .object) {
-            if (err_obj.object.get("message")) |msg| {
-                if (msg == .string) {
-                    root.setLastApiErrorDetail("gemini-cli", msg.string);
-                }
+            if (GeminiCliProvider.lookupErrorMessage(err_obj.object)) |message| {
+                root.setLastApiErrorDetail("gemini-cli", message);
             }
         }
     } else {
-        log.err("{s} failed: no result or error field. Response: {s}", .{ prefix, line });
+        if (!builtin.is_test) {
+            log.err("{s} failed: no result or error field. Response: {s}", .{ prefix, line });
+        }
     }
 }
 
@@ -673,6 +685,45 @@ test "extractLastUserMessage returns null for no user" {
 test "extractLastUserMessage empty messages" {
     const msgs = [_]ChatMessage{};
     try std.testing.expect(extractLastUserMessage(&msgs) == null);
+}
+
+test "GeminiCliProvider.lookupErrorMessage handles message and msg fields" {
+    const message_body = "{\"message\":\"request failed\"}";
+    const parsed_message = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, message_body, .{});
+    defer parsed_message.deinit();
+    try std.testing.expectEqualStrings("request failed", GeminiCliProvider.lookupErrorMessage(parsed_message.value.object).?);
+
+    const msg_body = "{\"msg\":\"request failed\"}";
+    const parsed_msg = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, msg_body, .{});
+    defer parsed_msg.deinit();
+    try std.testing.expectEqualStrings("request failed", GeminiCliProvider.lookupErrorMessage(parsed_msg.value.object).?);
+}
+
+test "recordJsonRpcError stores message and msg detail" {
+    root.clearLastApiErrorDetail();
+    defer root.clearLastApiErrorDetail();
+
+    const message_body = "{\"error\":{\"message\":\"request failed\"}}";
+    const parsed_message = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, message_body, .{});
+    defer parsed_message.deinit();
+
+    recordJsonRpcError("Gemini ACP initialize", message_body, parsed_message.value.object.get("error"));
+
+    const message_snapshot = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(message_snapshot);
+    try std.testing.expectEqualStrings("gemini-cli: request failed", message_snapshot);
+
+    root.clearLastApiErrorDetail();
+
+    const msg_body = "{\"error\":{\"msg\":\"handshake failed\"}}";
+    const parsed_msg = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, msg_body, .{});
+    defer parsed_msg.deinit();
+
+    recordJsonRpcError("Gemini ACP initialize", msg_body, parsed_msg.value.object.get("error"));
+
+    const msg_snapshot = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(msg_snapshot);
+    try std.testing.expectEqualStrings("gemini-cli: handshake failed", msg_snapshot);
 }
 
 test "checkCliVersion returns CliNotFound for missing binary" {

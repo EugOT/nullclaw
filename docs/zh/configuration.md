@@ -117,6 +117,15 @@ nullclaw onboard --interactive
 }
 ```
 
+常见的 provider 级字段：
+
+- `api_key`：该 provider 条目的凭据。
+- `base_url`：用于自定义或自托管 OpenAI 兼容端点的地址覆盖。
+- `api_mode`：为兼容 provider 选择 `chat_completions` 或 `responses`。
+- `user_agent`：可选的 `User-Agent` 请求头覆盖。
+- `max_streaming_prompt_bytes`：当估算 prompt 大小超过该阈值时跳过流式请求。
+- `chat_template_enable_thinking_param`：针对自定义 OpenAI 兼容的 vLLM/Qwen 端点，把 `reasoning_effort` 映射到 `chat_template_kwargs.enable_thinking`。
+
 ### `agents.defaults.model.primary`
 
 - 设置默认模型路由，格式通常为：`provider/vendor/model`。
@@ -220,6 +229,58 @@ nullclaw onboard --interactive
 - 两个命名 agent 即使使用相同的 provider/model，也可以保持各自独立的持久笔记和工作区。
 - `workspace_path` 本身不会决定聊天路由；路由仍然由 `bindings`、`/bind` 或显式 `--agent` / `/subagents spawn --agent` 决定。
 
+### `messages.inbound`
+
+- `debounce_ms` 用来延迟处理连续快速到达的纯文本入站消息，把短时间内的多条碎片合并成一次 turn。
+- 默认值：`3000`。
+- 作用范围包括 daemon 路由的入站文本和 Agent CLI REPL。
+- 设为 `0` 可关闭。
+- slash 命令和带媒体的入站消息会跳过 debounce。
+- Telegram 仍保留自己的长消息分段合并逻辑；这里的值会作为那条逻辑的基础 debounce 窗口。
+
+示例：
+
+```json
+{
+  "messages": {
+    "inbound": {
+      "debounce_ms": 1500
+    }
+  }
+}
+```
+
+### `reliability`
+
+- 配置 LLM 提供者的全局重试和故障转移行为。
+- `provider_retries`: 重试失败的 LLM 请求的次数（默认值：2）。
+- `provider_backoff_ms`: 重试之间的初始指数退避延迟（默认值：500 毫秒）。
+- `fallback_providers`: 当未显式指定 provider 的模型需要在主要提供方之外继续尝试时，可使用的备用提供方名称列表。
+- `model_fallbacks`: 模型到有序备用模型列表的映射。每个备用项既可以是裸模型名，也可以是显式的 `provider/model` 引用。
+
+示例：
+
+```json
+{
+  "reliability": {
+    "provider_retries": 2,
+    "provider_backoff_ms": 500,
+    "fallback_providers": ["groq", "openai"],
+    "model_fallbacks": [
+      {
+        "model": "anthropic/claude-sonnet-4",
+        "fallbacks": ["openai/gpt-4o", "groq/llama-3.3-70b"]
+      }
+    ]
+  }
+}
+```
+
+备注：
+
+- 裸模型名的故障转移顺序：先尝试主要提供方，再依次尝试每个列出的 `fallback_provider`。
+- 像 `openai/gpt-4o` 这样的显式 `provider/model` 备用项会直接路由到对应 provider，不会再走通用 provider 扇出链路。
+- `api_keys`: (可选) 用于在速率限制 (429) 错误时轮换的额外 API 密钥列表。
 ### `identity`（AIEOS v1.1）
 
 如果你希望运行时身份来自 AIEOS 文档，可以使用这一节。配置后，nullclaw 会把解析后的 AIEOS 内容连同 `AGENTS.md`、`IDENTITY.md` 等工作区身份文件一起注入 system prompt：
@@ -460,6 +521,68 @@ Telegram forum topics：
 - 如果省略 `match.account_id`，该 binding 可匹配该 channel 下的任意 Telegram 账号。
 - 只有同一个 nullclaw 实例运行多个 Telegram bot 账号/token 时，不同 account id 才有意义。
 
+### Web UI / Browser Relay
+
+`channels.web` 用于浏览器 UI / 扩展通过 WebSocket 接入，默认路径是 `/ws`。
+
+示例：
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "127.0.0.1",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "pairing",
+          "allowed_origins": ["http://localhost:5173"]
+        }
+      }
+    }
+  }
+}
+```
+
+实用规则：
+
+- 想使用“先连上再配对”的本地体验，保持 `listen = "127.0.0.1"`。
+- 在 local transport 下，只有 loopback 才允许未鉴权的 WebSocket upgrade；这样 UI 才能先连上，再发送 `pairing_request`。
+- 如果把 `listen` 改成 `0.0.0.0` 或其他非 loopback 地址，那么 WebSocket upgrade 一开始就必须带上 channel token：
+  - `ws://host:32123/ws?token=<auth_token>`
+  - 或 `Authorization: Bearer <auth_token>`
+- 非 loopback bind 下，不要假设 local `pairing_request` 还能在未鉴权连接上工作；这个 pairing-first 流程本来就是只给 loopback 用的。
+- `message_auth_mode = "pairing"` 表示每条 `user_message` 都要带上 pairing 流程返回的 UI `access_token`。
+- `message_auth_mode = "token"` 只支持 local transport，并且要求使用配置或环境变量中的稳定 token。此模式下，UI 每条 `user_message` 发送 `auth_token`，而不是 pairing JWT。
+- `auth_token` 既可以加固 WebSocket upgrade，在非 loopback bind 时也会变成必需项。
+- WebSocket 端点用的是 `/ws`。`/pair` 属于 HTTP gateway API，不是 web channel 的 WebSocket 配对入口。
+- 对于 headless/LAN 场景，更稳妥的运维路径仍然是 SSH 隧道，或者在 loopback 绑定前面加反向代理。
+
+远程 / 无头设备示例：
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "local",
+          "listen": "0.0.0.0",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "token",
+          "allowed_origins": ["https://chat-ui.example.com"]
+        }
+      }
+    }
+  }
+}
+```
+
 Max 示例：
 
 ```json
@@ -504,12 +627,26 @@ Max 说明：
 - `auto_save`: 开启后会自动持久化会话记忆。
 - 可扩展 hybrid 检索与 embedding 配置（见根目录 `config.example.json`）。
 
+**注意**：`markdown_only` 内存配置文件会自动启用混合检索和时间衰减（半衰期 30 天），以实现最佳的相关性评分。这确保了对纯 markdown 文件的时间感知能力。
+
 ### `gateway`
 
 - 默认推荐：
   - `host = "127.0.0.1"`
   - `require_pairing = true`
 - 不建议直接公网监听；如需外网访问，优先使用 tunnel。
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `host` | `"127.0.0.1"` | 监听地址 |
+| `port` | `3000` | 监听端口 |
+| `require_pairing` | `true` | 所有 API 请求均需 bearer token |
+| `allow_public_bind` | `false` | 允许绑定非回环地址 |
+| `pair_rate_limit_per_minute` | `10` | 每 IP 每分钟最大 `/pair` 请求数 |
+| `webhook_rate_limit_per_minute` | `60` | 每 IP 每分钟最大 webhook 请求数 |
+| `idempotency_ttl_secs` | `300` | 幂等请求结果缓存时长（秒） |
+| `max_body_size_bytes` | `65536` | HTTP 请求体最大字节数（64 KB）。接受图片或文件负载时需调高（如 `20971520` 表示 20 MB）。 |
+| `request_timeout_secs` | `30` | 入站 HTTP 请求的 socket 读取超时（秒）。在慢速或高延迟连接下接受大体积负载时需调高。 |
 
 ### `tunnel`
 
