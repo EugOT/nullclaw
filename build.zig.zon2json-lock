@@ -8,7 +8,7 @@
   "wasm3-0.5.1-hrMdNS09BQAWSU0TI6mVS8KfW4hxexjFvyOQINgphwKu": {
     "name": "wasm3",
     "url": "git+https://github.com/nullclaw/wasm3#8a29b0080f1f65dbbe8b8f8c4d8148480feff377",
-    "hash": "sha256-np4DFGYqKd+IHbZnZzPfZdlKlvVJ9HMJGVUJp8PQ+C4=",
+    "hash": "sha256-3GFMnAqfNk6lDClNpgz1BqGCEJ2hJlhdecfunsgipPo=",
     "rev": "8a29b0080f1f65dbbe8b8f8c4d8148480feff377"
   }
 }
