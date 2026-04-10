@@ -386,7 +386,7 @@ test "getCredentials reads token and user_key from .env file" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=test-token-abc
         \\PUSHOVER_USER_KEY=test-user-key-xyz
     });
@@ -410,7 +410,7 @@ test "getCredentials reads exported and quoted values" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\export PUSHOVER_TOKEN="quoted-token"
         \\export PUSHOVER_USER_KEY='single-quoted-key'
     });

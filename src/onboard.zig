@@ -4829,6 +4829,38 @@ test "CACHE_TTL_SECS is 12 hours" {
 }
 
 test "fetchModels returns models for anthropic (no network)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const env_name = try std.testing.allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer std.testing.allocator.free(env_name);
+    const previous_home = std.process.getEnvVarOwned(std.testing.allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer std.testing.allocator.free(value);
+            const value_z = std.testing.allocator.dupeZ(u8, value) catch unreachable;
+            defer std.testing.allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const test_home = try std.fs.path.join(std.testing.allocator, &.{ base, "nullclaw-home" });
+    defer std.testing.allocator.free(test_home);
+    const test_home_z = try std.testing.allocator.dupeZ(u8, test_home);
+    defer std.testing.allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
     const models = try fetchModels(std.testing.allocator, "anthropic", null);
     // Anthropic uses hardcoded fallback (allocated copies via fetchModelsFromApi)
     defer {

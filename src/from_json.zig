@@ -7,6 +7,7 @@ const std = @import("std");
 const onboard = @import("onboard.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const config_mod = @import("config.zig");
+const config_paths = @import("config_paths.zig");
 const Config = config_mod.Config;
 
 const WizardAnswers = struct {
@@ -99,7 +100,7 @@ fn initConfigWithCustomHome(backing_allocator: std.mem.Allocator, home_dir: []co
     };
 
     const config_path = try std.fs.path.join(allocator, &.{ home_dir, "config.json" });
-    const workspace_dir = try std.fs.path.join(allocator, &.{ home_dir, "workspace" });
+    const workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, home_dir);
     cfg.config_path = config_path;
     cfg.workspace_dir = workspace_dir;
     cfg.workspace_dir_override = workspace_dir;
