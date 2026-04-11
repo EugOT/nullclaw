@@ -148,6 +148,15 @@ fn shouldFallbackToResponses(allocator: std.mem.Allocator, body: []const u8) boo
     return isResponsesFallbackMessage(message);
 }
 
+fn shouldFallbackChatCompletionsError(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+    body: []const u8,
+) bool {
+    if (err != error.SyntaxError) return false;
+    return shouldFallbackToResponses(allocator, body);
+}
+
 /// How the provider expects the API key to be sent.
 pub const AuthStyle = enum {
     /// `Authorization: Bearer <key>`
@@ -1480,7 +1489,7 @@ pub const OpenAiCompatibleProvider = struct {
 
         return parseTextResponse(allocator, resp_body) catch |err| {
             // Only switch protocols when chat-completions explicitly reports endpoint absence.
-            if (self.supports_responses_fallback and shouldFallbackToResponses(allocator, resp_body)) {
+            if (self.supports_responses_fallback and shouldFallbackChatCompletionsError(allocator, err, resp_body)) {
                 const fallback_messages = try buildSingleTurnMessages(allocator, eff_system, merged_msg orelse message, false);
                 defer freeSingleTurnMessages(allocator, fallback_messages);
                 const fallback_request = ChatRequest{
@@ -1571,6 +1580,17 @@ pub const OpenAiCompatibleProvider = struct {
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body) catch |err| {
+            if (self.supports_responses_fallback and shouldFallbackChatCompletionsError(allocator, err, resp_body)) {
+                return self.chatViaResponses(
+                    allocator,
+                    capped_request,
+                    effective_model,
+                    temperature,
+                    capped_request.timeout_secs,
+                ) catch |fallback_err| {
+                    return returnLoggedCompatibleApiError(ChatResponse, allocator, self.name, fallback_err, url, resp_body);
+                };
+            }
             logCompatibleApiError(allocator, self.name, err, url, resp_body);
             return err;
         };
@@ -2524,6 +2544,26 @@ test "shouldFallbackToResponses accepts msg fallback fields" {
     try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"msg\":\"Not found\",\"code\":404}}"));
     try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"status\":404,\"msg\":\"unknown endpoint\"}"));
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"msg\":\"No endpoints found that support image input\",\"code\":404}}"));
+}
+
+test "shouldFallbackChatCompletionsError only accepts syntax 404 endpoint errors" {
+    // Regression: #766 — the normal chatImpl path must fall back to Responses
+    // when chat/completions returns an endpoint-level 404 payload.
+    try std.testing.expect(shouldFallbackChatCompletionsError(
+        std.testing.allocator,
+        error.SyntaxError,
+        "{\"error\":{\"message\":\"https://integrate.api.nvidia.com/v1/chat/completions 404 page not found\",\"code\":404}}",
+    ));
+    try std.testing.expect(!shouldFallbackChatCompletionsError(
+        std.testing.allocator,
+        error.NoResponseContent,
+        "{\"error\":{\"message\":\"https://integrate.api.nvidia.com/v1/chat/completions 404 page not found\",\"code\":404}}",
+    ));
+    try std.testing.expect(!shouldFallbackChatCompletionsError(
+        std.testing.allocator,
+        error.SyntaxError,
+        "{\"error\":{\"message\":\"temporary overload\",\"code\":503}}",
+    ));
 }
 
 test "returnLoggedCompatibleApiError preserves fallback error" {
