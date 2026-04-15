@@ -14,8 +14,10 @@ pub const websocket = @import("websocket.zig");
 // Phase 1: Core
 pub const bus = @import("bus.zig");
 pub const config = @import("config.zig");
+pub const config_paths = @import("config_paths.zig");
 pub const util = @import("util.zig");
 pub const platform = @import("platform.zig");
+pub const codex_support = @import("codex_support.zig");
 pub const version = @import("version.zig");
 pub const state = @import("state.zig");
 pub const status = @import("status.zig");
@@ -25,6 +27,7 @@ pub const capabilities = @import("capabilities.zig");
 pub const config_mutator = @import("config_mutator.zig");
 pub const service = @import("service.zig");
 pub const daemon = @import("daemon.zig");
+pub const control_plane = @import("control_plane.zig");
 pub const channel_loop = @import("channel_loop.zig");
 pub const channel_manager = @import("channel_manager.zig");
 pub const channel_catalog = @import("channel_catalog.zig");
@@ -36,6 +39,7 @@ pub const list_models = @import("list_models.zig");
 pub const provider_probe = @import("provider_probe.zig");
 pub const channel_probe = @import("channel_probe.zig");
 pub const from_json = @import("from_json.zig");
+pub const inbound_debounce = @import("inbound_debounce.zig");
 
 // Phase 2: Agent core
 pub const agent = @import("agent.zig");
@@ -47,6 +51,7 @@ pub const bootstrap = @import("bootstrap/root.zig");
 // Phase 3: Networking
 pub const gateway = @import("gateway.zig");
 pub const channels = @import("channels/root.zig");
+pub const a2a = @import("a2a.zig");
 
 // Phase 4: Extensions
 pub const security = @import("security/root.zig");

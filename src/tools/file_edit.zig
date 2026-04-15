@@ -1,12 +1,16 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
-const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const file_common = @import("file_common.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const memory_root = @import("../memory/root.zig");
+const bootstrapRootFilename = file_common.bootstrapRootFilename;
+const prepareWorkspacePath = file_common.prepareWorkspacePath;
+const resolveNearestExistingAncestor = file_common.resolveNearestExistingAncestor;
 
 /// Default maximum file size to read for editing (10MB).
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
@@ -45,22 +49,16 @@ pub const FileEditTool = struct {
             return ToolResult.fail("Missing 'new_text' parameter");
 
         // Build full path — absolute or relative
-        const full_path = if (std.fs.path.isAbsolute(path)) blk: {
-            if (self.allowed_paths.len == 0)
-                return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
-            if (std.mem.indexOfScalar(u8, path, 0) != null)
-                return ToolResult.fail("Path contains null bytes");
-            break :blk try allocator.dupe(u8, path);
-        } else blk: {
-            if (!isPathSafe(path))
-                return ToolResult.fail("Path not allowed: contains traversal or absolute path");
-            break :blk try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        const path_info = prepareWorkspacePath(allocator, self.workspace_dir, path, self.allowed_paths.len > 0) catch |err| switch (err) {
+            error.AbsolutePathsNotAllowed => return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)"),
+            error.PathContainsNullBytes => return ToolResult.fail("Path contains null bytes"),
+            error.UnsafePath => return ToolResult.fail("Path not allowed: contains traversal or absolute path"),
+            else => return err,
         };
-        defer allocator.free(full_path);
+        defer path_info.deinit(allocator);
 
-        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
-        defer if (ws_resolved) |wr| allocator.free(wr);
-        const ws_path = ws_resolved orelse "";
+        const full_path = path_info.full_path;
+        const ws_path = path_info.workspacePath();
         const bootstrap_filename = bootstrapRootFilename(path);
 
         // Intercept bootstrap file edits for non-file backends.
@@ -158,25 +156,6 @@ pub const FileEditTool = struct {
     }
 };
 
-fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
-        error.FileNotFound => {
-            const parent = std.fs.path.dirname(path) orelse return err;
-            if (std.mem.eql(u8, parent, path)) return err;
-            return resolveNearestExistingAncestor(allocator, parent);
-        },
-        else => return err,
-    };
-}
-
-fn bootstrapRootFilename(path: []const u8) ?[]const u8 {
-    if (std.fs.path.isAbsolute(path)) return null;
-    const basename = std.fs.path.basename(path);
-    if (!std.mem.eql(u8, basename, path)) return null;
-    if (!bootstrap_mod.isBootstrapFilename(basename)) return null;
-    return basename;
-}
-
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "file_edit tool name" {
@@ -214,7 +193,7 @@ test "file_edit basic replace" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Replaced") != null);
 
     // Verify file contents
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("hello zig", actual);
 }
@@ -296,7 +275,7 @@ test "file_edit replaces only first occurrence" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "dup.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "dup.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("ccc bbb aaa", actual);
 }
@@ -409,7 +388,7 @@ test "file_edit absolute path with allowed_paths works" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "test.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("hello zig", actual);
 }
@@ -471,7 +450,7 @@ test "file_edit does not bypass allowed_paths for bootstrap memory edits" {
     defer std.testing.allocator.free(content);
     try std.testing.expectEqualStrings("alpha", content);
 
-    const outside_after = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "AGENTS.md", 1024);
+    const outside_after = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "AGENTS.md", 1024);
     defer std.testing.allocator.free(outside_after);
     try std.testing.expectEqualStrings("outside-before", outside_after);
 }

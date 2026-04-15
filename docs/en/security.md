@@ -37,9 +37,18 @@ NullClaw follows secure-by-default behavior: local bind by default, pairing auth
 
 ## Channel Allowlists
 
-- `allow_from: []`: deny all inbound messages.
+- `allow_from` behavior is channel-specific; do not assume `[]` is a deny-by-default switch across every runtime.
+- Some channels, including WeChat and Discord, treat an omitted or empty `allow_from` as "no filtering", so set explicit user IDs/OpenIDs when you want a private bot.
 - `allow_from: ["*"]`: allow all sources (high-risk).
-- Otherwise: exact-match allowlist.
+- Otherwise: expect exact-match allowlists or channel-specific fallback/group-policy behavior.
+
+## Pairing and Webhook Auth Boundaries
+
+- `/pair` is POST-only and expects `X-Pairing-Code`.
+- Repeated invalid pairing attempts can trigger rate limiting and a temporary lockout.
+- `/.well-known/agent.json` and `/.well-known/agent-card.json` are public discovery documents when A2A is enabled.
+- Keeping `gateway.require_pairing = true` keeps `/webhook` and `/a2a` behind bearer auth; disabling pairing removes that bearer check.
+- Channel-specific inbound webhooks keep their own auth or signature rules and should not be documented as if they all use gateway bearer auth.
 
 ## Nostr-specific Rules
 
@@ -68,11 +77,42 @@ NullClaw follows secure-by-default behavior: local bind by default, pairing auth
 }
 ```
 
+## Shell Environment Variables
+
+By default, only a minimal set of safe environment variables (`PATH`, `HOME`, `TERM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `USER`, `SHELL`, `TMPDIR`) are passed to shell child processes. This prevents leaking API keys and credentials (CWE-200).
+
+### Path-validated Environment Variables
+
+Some deployments inject tools via volume mounts (e.g., a toolbox init container in Kubernetes). These tools may need environment variables like `LD_LIBRARY_PATH` to find shared libraries, but passing `LD_LIBRARY_PATH` unconditionally is a security risk (library injection).
+
+The `tools.path_env_vars` config allows specifying environment variables whose **values are platform path lists** (`:` on Unix, `;` on Windows). Each path component is validated against the sandbox before the variable is passed to child processes:
+
+1. Every component must be an absolute path
+2. Every component is resolved via `realpath` (canonicalized, symlinks followed)
+3. Every component must be within the workspace or `allowed_paths`
+4. The system blocklist (`/etc`, `/usr/lib`, `/bin`, etc.) always rejects
+
+If **any** component fails validation, the entire variable is dropped.
+
+```json
+{
+  "autonomy": {
+    "allowed_paths": ["/opt/tools"]
+  },
+  "tools": {
+    "path_env_vars": ["LD_LIBRARY_PATH", "PYTHONHOME", "NODE_PATH"]
+  }
+}
+```
+
+With the config above and `LD_LIBRARY_PATH=/opt/tools/usr/lib:/opt/tools/lib` set in the container environment, the shell tool will validate both path components against `/opt/tools` (via `allowed_paths`) and pass the variable through. An attacker-controlled value like `/tmp/evil:/opt/tools/lib` would be rejected because `/tmp/evil` is not within the workspace or allowed paths.
+
 ## High-risk Settings
 
 These settings significantly widen trust boundaries and should be used only in controlled environments:
 
 - `autonomy.level = "full"`
+- `autonomy.level = "yolo"`
 - `allowed_commands = ["*"]`
 - `allowed_paths = ["*"]`
 - `gateway.allow_public_bind = true`

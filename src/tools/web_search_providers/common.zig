@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("../root.zig");
 const http_util = @import("../../http_util.zig");
+const search_base_url = @import("../../search_base_url.zig");
 const url_percent = @import("../../url_percent.zig");
 
 const log = std.log.scoped(.web_search);
@@ -23,6 +24,15 @@ pub const ResultEntry = struct {
     description: []const u8,
 };
 
+pub const ParsedJsonObject = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    object: std.json.ObjectMap,
+
+    pub fn deinit(self: *ParsedJsonObject) void {
+        self.parsed.deinit();
+    }
+};
+
 pub fn logRequestError(provider: []const u8, query: []const u8, err: anytype) void {
     if (builtin.is_test) return;
     log.err("web_search ({s}) request failed for '{s}': {}", .{ provider, query, err });
@@ -38,7 +48,10 @@ pub fn curlGet(
 
     return http_util.curlGet(allocator, url, headers, timeout_secs) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.RequestFailed,
+        else => {
+            log.err("curl GET failed: {s} (timeout={s}s)", .{ @errorName(err), timeout_secs });
+            return error.RequestFailed;
+        },
     };
 }
 
@@ -53,7 +66,10 @@ pub fn curlPostJson(
 
     return http_util.curlPostWithProxy(allocator, url, body, headers, null, timeout_secs) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.RequestFailed,
+        else => {
+            log.err("curl POST failed: {s} (timeout={s}s)", .{ @errorName(err), timeout_secs });
+            return error.RequestFailed;
+        },
     };
 }
 
@@ -63,41 +79,45 @@ pub fn timeoutToString(allocator: std.mem.Allocator, timeout_secs: u64) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d}", .{effective_timeout});
 }
 
+pub fn parseJsonObject(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+) (ProviderSearchError || error{OutOfMemory})!ParsedJsonObject {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
+    const object = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            parsed.deinit();
+            return error.InvalidResponse;
+        },
+    };
+    return .{
+        .parsed = parsed,
+        .object = object,
+    };
+}
+
+pub fn requireArrayField(
+    object: std.json.ObjectMap,
+    key: []const u8,
+) (ProviderSearchError || error{OutOfMemory})![]const std.json.Value {
+    const value = object.get(key) orelse return error.InvalidResponse;
+    return switch (value) {
+        .array => |items| items.items,
+        else => error.InvalidResponse,
+    };
+}
+
 pub fn buildSearxngSearchUrl(
     allocator: std.mem.Allocator,
     base_url: []const u8,
     encoded_query: []const u8,
     count: usize,
 ) ![]u8 {
-    var trimmed = std.mem.trim(u8, base_url, " \t\n\r");
-    if (trimmed.len == 0) return error.InvalidSearchBaseUrl;
-    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
-        trimmed = trimmed[0 .. trimmed.len - 1];
-    }
-    if (!std.mem.startsWith(u8, trimmed, "https://")) return error.InvalidSearchBaseUrl;
-    if (std.mem.indexOfAny(u8, trimmed, "?#") != null) {
-        return error.InvalidSearchBaseUrl;
-    }
-    const after_scheme = trimmed["https://".len..];
-    if (after_scheme.len == 0 or after_scheme[0] == '/') {
-        return error.InvalidSearchBaseUrl;
-    }
-    const authority_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
-    const authority = after_scheme[0..authority_end];
-    if (authority.len == 0 or std.mem.indexOfAny(u8, authority, " \t\r\n") != null) {
-        return error.InvalidSearchBaseUrl;
-    }
-    if (authority_end < after_scheme.len) {
-        const path = after_scheme[authority_end..];
-        if (!std.mem.eql(u8, path, "/search")) {
-            return error.InvalidSearchBaseUrl;
-        }
-    }
-
-    const endpoint = if (std.mem.endsWith(u8, trimmed, "/search"))
-        try allocator.dupe(u8, trimmed)
-    else
-        try std.fmt.allocPrint(allocator, "{s}/search", .{trimmed});
+    const endpoint = search_base_url.normalizeEndpoint(allocator, base_url) catch |err| switch (err) {
+        error.InvalidSearchBaseUrl => return error.InvalidSearchBaseUrl,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     defer allocator.free(endpoint);
 
     return std.fmt.allocPrint(
@@ -219,4 +239,30 @@ pub fn duckduckgoTitleFromText(text: []const u8) []const u8 {
         if (idx > 0) return text[0..idx];
     }
     return text;
+}
+
+test "parseJsonObject returns object root" {
+    var parsed = try parseJsonObject(std.testing.allocator, "{\"results\":[]}");
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.object.get("results") != null);
+}
+
+test "parseJsonObject rejects non-object root" {
+    try std.testing.expectError(error.InvalidResponse, parseJsonObject(std.testing.allocator, "[]"));
+}
+
+test "requireArrayField returns array items" {
+    var parsed = try parseJsonObject(std.testing.allocator, "{\"results\":[{\"title\":\"A\"}]}");
+    defer parsed.deinit();
+
+    const items = try requireArrayField(parsed.object, "results");
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+}
+
+test "requireArrayField rejects missing field" {
+    var parsed = try parseJsonObject(std.testing.allocator, "{\"data\":[]}");
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidResponse, requireArrayField(parsed.object, "results"));
 }

@@ -1,13 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
-const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
+const file_common = @import("file_common.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
 const memory_root = @import("../memory/root.zig");
+const bootstrapRootFilename = file_common.bootstrapRootFilename;
+const isSymlinkPath = file_common.isSymlinkPath;
+const prepareWorkspacePath = file_common.prepareWorkspacePath;
+const resolveNearestExistingAncestor = file_common.resolveNearestExistingAncestor;
 
 /// Write file contents with workspace path scoping.
 pub const FileWriteTool = struct {
@@ -39,23 +44,17 @@ pub const FileWriteTool = struct {
             return ToolResult.fail("Missing 'content' parameter");
 
         // Build full path — absolute or relative
-        const full_path = if (std.fs.path.isAbsolute(path)) blk: {
-            if (self.allowed_paths.len == 0)
-                return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
-            if (std.mem.indexOfScalar(u8, path, 0) != null)
-                return ToolResult.fail("Path contains null bytes");
-            break :blk try allocator.dupe(u8, path);
-        } else blk: {
-            if (!isPathSafe(path))
-                return ToolResult.fail("Path not allowed: contains traversal or absolute path");
-            break :blk try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        const path_info = prepareWorkspacePath(allocator, self.workspace_dir, path, self.allowed_paths.len > 0) catch |err| switch (err) {
+            error.AbsolutePathsNotAllowed => return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)"),
+            error.PathContainsNullBytes => return ToolResult.fail("Path contains null bytes"),
+            error.UnsafePath => return ToolResult.fail("Path not allowed: contains traversal or absolute path"),
+            else => return err,
         };
-        defer allocator.free(full_path);
-        const bootstrap_filename = bootstrapRootFilename(path);
+        defer path_info.deinit(allocator);
 
-        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
-        defer if (ws_resolved) |wr| allocator.free(wr);
-        const ws_path = ws_resolved orelse "";
+        const full_path = path_info.full_path;
+        const bootstrap_filename = bootstrapRootFilename(path);
+        const ws_path = path_info.workspacePath();
 
         // Resolve and validate before any filesystem writes so symlink targets
         // and disallowed absolute destinations are rejected without side effects.
@@ -140,7 +139,7 @@ pub const FileWriteTool = struct {
             std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
-                    std.fs.cwd().makePath(parent) catch |e| {
+                    fs_compat.makePath(parent) catch |e| {
                         const msg = try std.fmt.allocPrint(allocator, "Failed to create directory: {}", .{e});
                         return ToolResult{ .success = false, .output = "", .error_msg = msg };
                     };
@@ -237,43 +236,6 @@ pub const FileWriteTool = struct {
     }
 };
 
-fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
-        error.FileNotFound => {
-            const parent = std.fs.path.dirname(path) orelse return err;
-            if (std.mem.eql(u8, parent, path)) return err;
-            return resolveNearestExistingAncestor(allocator, parent);
-        },
-        else => return err,
-    };
-}
-
-fn bootstrapRootFilename(path: []const u8) ?[]const u8 {
-    if (std.fs.path.isAbsolute(path)) return null;
-    const basename = std.fs.path.basename(path);
-    if (!std.mem.eql(u8, basename, path)) return null;
-    if (!bootstrap_mod.isBootstrapFilename(basename)) return null;
-    return basename;
-}
-
-fn isSymlinkPath(path: []const u8) !bool {
-    const dir_path = std.fs.path.dirname(path) orelse ".";
-    const entry_name = std.fs.path.basename(path);
-    var dir = if (std.fs.path.isAbsolute(dir_path))
-        try std.fs.openDirAbsolute(dir_path, .{})
-    else
-        try std.fs.cwd().openDir(dir_path, .{});
-    defer dir.close();
-
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    _ = dir.readLink(entry_name, &link_buf) catch |err| switch (err) {
-        error.NotLink => return false,
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    return true;
-}
-
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "file_write tool name" {
@@ -308,7 +270,7 @@ test "file_write creates file" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "8 bytes") != null);
 
     // Verify file contents
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "out.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "out.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("written!", actual);
 }
@@ -329,7 +291,7 @@ test "file_write creates parent dirs" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "a/b/c/deep.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "a/b/c/deep.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("deep", actual);
 }
@@ -351,7 +313,7 @@ test "file_write overwrites existing" {
 
     try std.testing.expect(result.success);
 
-    const actual = try tmp_dir.dir.readFileAlloc(std.testing.allocator, "exist.txt", 1024);
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "exist.txt", 1024);
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("new", actual);
 }
@@ -442,7 +404,7 @@ test "file_write blocks symlink target escape outside workspace" {
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
 
-    const outside_actual = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "outside.txt", 1024);
+    const outside_actual = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "outside.txt", 1024);
     defer std.testing.allocator.free(outside_actual);
     try std.testing.expectEqualStrings("safe", outside_actual);
 }
@@ -477,11 +439,11 @@ test "file_write does not mutate outside inode through hard link" {
     try std.testing.expect(result.success);
     try std.testing.expect(result.error_msg == null);
 
-    const workspace_actual = try ws_tmp.dir.readFileAlloc(std.testing.allocator, "hl.txt", 1024);
+    const workspace_actual = try fs_compat.readFileAlloc(ws_tmp.dir, std.testing.allocator, "hl.txt", 1024);
     defer std.testing.allocator.free(workspace_actual);
     try std.testing.expectEqualStrings("PWNED", workspace_actual);
 
-    const outside_actual = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "outside.txt", 1024);
+    const outside_actual = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "outside.txt", 1024);
     defer std.testing.allocator.free(outside_actual);
     try std.testing.expectEqualStrings("SAFE", outside_actual);
 }
@@ -510,7 +472,7 @@ test "file_write keeps symlink and updates target" {
     const link_target = try ws_tmp.dir.readLink("link.txt", &link_buf);
     try std.testing.expectEqualStrings("target.txt", link_target);
 
-    const target_actual = try ws_tmp.dir.readFileAlloc(std.testing.allocator, "target.txt", 1024);
+    const target_actual = try fs_compat.readFileAlloc(ws_tmp.dir, std.testing.allocator, "target.txt", 1024);
     defer std.testing.allocator.free(target_actual);
     try std.testing.expectEqualStrings("new", target_actual);
 }
@@ -638,7 +600,7 @@ test "file_write does not bypass allowed_paths for bootstrap memory writes" {
     defer if (from_mem) |content| std.testing.allocator.free(content);
     try std.testing.expect(from_mem == null);
 
-    const outside_after = try outside_tmp.dir.readFileAlloc(std.testing.allocator, "AGENTS.md", 1024);
+    const outside_after = try fs_compat.readFileAlloc(outside_tmp.dir, std.testing.allocator, "AGENTS.md", 1024);
     defer std.testing.allocator.free(outside_after);
     try std.testing.expectEqualStrings("outside-before", outside_after);
 }

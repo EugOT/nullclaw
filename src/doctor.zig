@@ -14,6 +14,7 @@ const Config = @import("config.zig").Config;
 const channel_catalog = @import("channel_catalog.zig");
 const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
+const fs_compat = @import("fs_compat.zig");
 const builtin = @import("builtin");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
@@ -447,7 +448,7 @@ pub fn checkDaemonState(
     const state_path = try daemon.stateFilePath(allocator, config);
     defer allocator.free(state_path);
 
-    const content = std.fs.cwd().readFileAlloc(allocator, state_path, 1024 * 1024) catch {
+    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, state_path, 1024 * 1024) catch {
         try items.append(allocator, DiagItem.err(cat, try std.fmt.allocPrint(
             allocator,
             "state file not found: {s} -- is the daemon running?",
@@ -644,7 +645,7 @@ pub fn truncateForDisplay(allocator: std.mem.Allocator, s: []const u8, max_len: 
 /// Check sandbox availability.
 fn checkSandbox(allocator: std.mem.Allocator, cfg: *const Config, items: *std.ArrayList(DiagItem)) void {
     const cat = "sandbox";
-    const enabled = cfg.security.sandbox.enabled orelse false;
+    const enabled = cfg.sandboxEnabled();
 
     if (!enabled) {
         items.append(allocator, DiagItem.ok(cat, "sandbox: disabled")) catch {};
@@ -943,8 +944,6 @@ test "DiagResult defaults" {
     try std.testing.expectEqualStrings("test", result.name);
     try std.testing.expect(result.ok);
 }
-
-test "doctor module compiles" {}
 
 // ── Test helper ─────────────────────────────────────────────────
 

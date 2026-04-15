@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const model_refs = @import("../model_refs.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -153,6 +154,12 @@ pub const ModelFallbackEntry = struct {
     fallbacks: []const []const u8,
 };
 
+const ResolvedProviderTarget = struct {
+    provider: Provider,
+    model: []const u8,
+    explicit: bool,
+};
+
 /// Provider wrapper with retry, multi-provider fallback, and model failover.
 ///
 /// Wraps a primary inner provider and optional extra providers as a fallback chain.
@@ -259,6 +266,87 @@ pub const ReliableProvider = struct {
         return chain;
     }
 
+    fn matchesProvider(provider_name: []const u8, requested: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(provider_name, requested);
+    }
+
+    fn resolveProviderTarget(self: *const ReliableProvider, model_ref: []const u8) ResolvedProviderTarget {
+        var best_target: ?ResolvedProviderTarget = null;
+        var best_prefix_len: usize = 0;
+
+        if (model_refs.matchExplicitProviderPrefix(model_ref, self.inner.getName())) |split| {
+            best_target = .{
+                .provider = self.inner,
+                .model = split.model,
+                .explicit = true,
+            };
+            best_prefix_len = self.inner.getName().len;
+        }
+
+        for (self.extras) |entry| {
+            if (model_refs.matchExplicitProviderPrefix(model_ref, entry.name)) |split| {
+                if (entry.name.len > best_prefix_len) {
+                    best_target = .{
+                        .provider = entry.provider,
+                        .model = split.model,
+                        .explicit = true,
+                    };
+                    best_prefix_len = entry.name.len;
+                }
+            }
+            const provider_runtime_name = entry.provider.getName();
+            if (model_refs.matchExplicitProviderPrefix(model_ref, provider_runtime_name)) |split| {
+                if (provider_runtime_name.len > best_prefix_len) {
+                    best_target = .{
+                        .provider = entry.provider,
+                        .model = split.model,
+                        .explicit = true,
+                    };
+                    best_prefix_len = provider_runtime_name.len;
+                }
+            }
+        }
+
+        const split = model_refs.splitProviderModel(model_ref) orelse model_refs.ProviderModelRef{
+            .provider = null,
+            .model = model_ref,
+        };
+        if (best_target) |target| return target;
+        if (std.mem.eql(u8, self.inner.getName(), "router")) {
+            return .{
+                .provider = self.inner,
+                .model = model_ref,
+                .explicit = split.provider != null,
+            };
+        }
+        if (split.provider) |requested_provider| {
+            for (self.extras) |entry| {
+                if (matchesProvider(entry.name, requested_provider) or
+                    matchesProvider(entry.provider.getName(), requested_provider))
+                {
+                    return .{
+                        .provider = entry.provider,
+                        .model = split.model,
+                        .explicit = true,
+                    };
+                }
+            }
+            if (matchesProvider(self.inner.getName(), requested_provider)) {
+                return .{
+                    .provider = self.inner,
+                    .model = split.model,
+                    .explicit = true,
+                };
+            }
+        }
+
+        return .{
+            .provider = self.inner,
+            .model = model_ref,
+            .explicit = false,
+        };
+    }
+
     /// Advance to the next API key (round-robin) and return it.
     pub fn rotateKey(self: *ReliableProvider) ?[]const u8 {
         if (self.api_keys.len == 0) return null;
@@ -302,8 +390,10 @@ pub const ReliableProvider = struct {
 
     fn finalFailureError(self: *const ReliableProvider) anyerror {
         const err_slice = self.lastErrorSlice();
-        if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
+        // Check rate limiting BEFORE context exhaustion — rate limit errors
+        // often contain "token" + "exceed" which false-matches context checks.
         if (isRateLimited(err_slice)) return error.RateLimited;
+        if (isContextExhausted(err_slice)) return error.ContextLengthExceeded;
         if (std.mem.eql(u8, err_slice, "ProviderDoesNotSupportVision")) return error.ProviderDoesNotSupportVision;
         return error.AllProvidersFailed;
     }
@@ -380,7 +470,9 @@ pub const ReliableProvider = struct {
         var attempt: u32 = 0;
         while (attempt <= self.max_retries) : (attempt += 1) {
             root.clearLastApiErrorDetail();
-            if (prov.chat(allocator, request, current_model, request.temperature)) |result| {
+            var resolved_request = request;
+            resolved_request.model = current_model;
+            if (prov.chat(allocator, resolved_request, current_model, request.temperature)) |result| {
                 var annotated = result;
                 if (annotated.provider.len == 0) {
                     annotated.provider = allocator.dupe(u8, prov.getName()) catch "";
@@ -427,6 +519,21 @@ pub const ReliableProvider = struct {
         defer allocator.free(models);
 
         for (models) |current_model| {
+            const target = self.resolveProviderTarget(current_model);
+
+            if (target.explicit) {
+                if (self.tryChatWithSystemProvider(
+                    target.provider,
+                    allocator,
+                    system_prompt,
+                    message,
+                    target.model,
+                )) |result| {
+                    return result;
+                }
+                continue;
+            }
+
             // Try primary provider
             if (self.tryChatWithSystemProvider(
                 self.inner,
@@ -472,6 +579,23 @@ pub const ReliableProvider = struct {
         defer allocator.free(models);
 
         for (models) |current_model| {
+            const target = self.resolveProviderTarget(current_model);
+
+            if (target.explicit) {
+                if (!needs_vision or target.provider.supportsVisionForModel(target.model)) {
+                    if (needs_vision) attempted_vision_provider = true;
+                    if (self.tryChatProvider(
+                        target.provider,
+                        allocator,
+                        request,
+                        target.model,
+                    )) |result| {
+                        return result;
+                    }
+                }
+                continue;
+            }
+
             // Try primary provider (skip if it lacks vision and request needs it)
             if (!needs_vision or self.inner.supportsVisionForModel(current_model)) {
                 if (needs_vision) attempted_vision_provider = true;
@@ -513,7 +637,11 @@ pub const ReliableProvider = struct {
 
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
-        return self.inner.supportsStreaming();
+        if (self.inner.supportsStreaming()) return true;
+        for (self.extras) |entry| {
+            if (entry.provider.supportsStreaming()) return true;
+        }
+        return false;
     }
 
     fn streamChatImpl(
@@ -526,12 +654,23 @@ pub const ReliableProvider = struct {
         callback_ctx: *anyopaque,
     ) anyerror!root.StreamChatResult {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const needs_vision = hasImageParts(request);
+        const target = self.resolveProviderTarget(model);
+
+        if (target.explicit) {
+            if (needs_vision and !target.provider.supportsVisionForModel(target.model)) {
+                return error.ProviderDoesNotSupportVision;
+            }
+            var resolved_request = request;
+            resolved_request.model = target.model;
+            return target.provider.streamChat(allocator, resolved_request, target.model, temperature, callback, callback_ctx);
+        }
+
         // Streaming cannot recover mid-stream (doing so would require buffering the
         // entire response, defeating the purpose of streaming). Provider selection is
         // therefore proactive: pick the first vision-capable provider before starting.
         // Note: model-chain fallback is not supported in the streaming path — this is
         // a pre-existing limitation and is not regressed by this change.
-        const needs_vision = hasImageParts(request);
         if (!needs_vision or self.inner.supportsVisionForModel(model)) {
             return self.inner.streamChat(allocator, request, model, temperature, callback, callback_ctx);
         }
@@ -563,6 +702,8 @@ pub const ReliableProvider = struct {
 
     fn supportsVisionForModelImpl(ptr: *anyopaque, model: []const u8) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const target = self.resolveProviderTarget(model);
+        if (target.explicit) return target.provider.supportsVisionForModel(target.model);
         if (self.inner.supportsVisionForModel(model)) return true;
         for (self.extras) |entry| {
             if (entry.provider.supportsVisionForModel(model)) return true;
@@ -750,6 +891,7 @@ const MockInnerProvider = struct {
     supports_tools: bool,
     supports_vision: bool = true,
     warmed_up: bool = false,
+    name: []const u8 = "MockProvider",
 
     const vtable_mock = Provider.VTable{
         .chatWithSystem = mockChatWithSystem,
@@ -806,8 +948,9 @@ const MockInnerProvider = struct {
         return self.supports_vision;
     }
 
-    fn mockGetName(_: *anyopaque) []const u8 {
-        return "MockProvider";
+    fn mockGetName(ptr: *anyopaque) []const u8 {
+        const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
+        return self.name;
     }
 
     fn mockDeinit(_: *anyopaque) void {}
@@ -1106,6 +1249,52 @@ test "ReliableProvider vtable delegates getName" {
     var mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
     var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 0, 50);
     try std.testing.expectEqualStrings("MockProvider", reliable.provider().getName());
+}
+
+test "ReliableProvider resolves explicit custom url provider refs" {
+    var inner = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    var extra = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    const extras = [_]ProviderEntry{
+        .{ .name = "custom:http://127.0.0.1:8000/v1", .provider = extra.toProvider() },
+    };
+
+    var reliable = ReliableProvider.initWithProvider(inner.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs };
+    const result = try prov.chat(std.testing.allocator, request, "custom:http://127.0.0.1:8000/v1/claude-haiku-4.5", 0.5);
+    defer if (result.content) |c| std.testing.allocator.free(c);
+    defer if (result.provider.len > 0) std.testing.allocator.free(result.provider);
+    defer if (result.model.len > 0) std.testing.allocator.free(result.model);
+
+    try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expectEqualStrings("claude-haiku-4.5", result.model);
+    try std.testing.expectEqual(@as(u32, 1), extra.call_count);
+    try std.testing.expectEqual(@as(u32, 0), inner.call_count);
+}
+
+test "ReliableProvider honors explicit fallback refs before router inner" {
+    var inner = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false, .name = "router" };
+    var extra = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false, .name = "fallback-custom" };
+    const extras = [_]ProviderEntry{
+        .{ .name = "custom:https://fb.example.com/v1", .provider = extra.toProvider() },
+    };
+
+    var reliable = ReliableProvider.initWithProvider(inner.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs };
+    const result = try prov.chat(std.testing.allocator, request, "custom:https://fb.example.com/v1/model-a", 0.5);
+    defer if (result.content) |c| std.testing.allocator.free(c);
+    defer if (result.provider.len > 0) std.testing.allocator.free(result.provider);
+    defer if (result.model.len > 0) std.testing.allocator.free(result.model);
+
+    try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expectEqualStrings("model-a", result.model);
+    try std.testing.expectEqual(@as(u32, 1), extra.call_count);
+    try std.testing.expectEqual(@as(u32, 0), inner.call_count);
 }
 
 test "ReliableProvider vtable zero retries fails immediately" {

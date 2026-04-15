@@ -8,7 +8,11 @@ const JsonObjectMap = root.JsonObjectMap;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const json_miniparse = @import("../json_miniparse.zig");
+const command_summary = @import("../command_summary.zig");
 const UNAVAILABLE_WORKSPACE_SENTINEL = "/__nullclaw_workspace_unavailable__";
+const log = std.log.scoped(.shell);
+const Sandbox = @import("../security/sandbox.zig").Sandbox;
+const SandboxStorage = @import("../security/sandbox.zig").SandboxStorage;
 
 /// Default maximum shell command execution time (nanoseconds).
 const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -53,6 +57,50 @@ fn safeEnvVarAllowed(key: []const u8) bool {
     return false;
 }
 
+/// Validate that a platform path-list value has all components within
+/// the sandbox (workspace + allowed_paths). Uses the same validation as
+/// file access: system blocklist always rejects, then workspace and
+/// allowed_paths are checked via realpath canonicalization.
+/// Platform-aware path-list delimiter: `;` on Windows, `:` elsewhere.
+const path_list_delimiter: u8 = if (@import("builtin").os.tag == .windows) ';' else ':';
+
+fn validatePathEnvValue(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    ws_resolved: []const u8,
+    allowed_paths: []const []const u8,
+) bool {
+    if (value.len == 0) return true;
+    var iter = std.mem.splitScalar(u8, value, path_list_delimiter);
+    while (iter.next()) |component| {
+        if (component.len == 0) continue;
+        // Must be absolute
+        if (!std.fs.path.isAbsolute(component)) return false;
+        // Resolve to canonical path (follows symlinks)
+        const resolved = std.fs.cwd().realpathAlloc(allocator, component) catch
+            return false; // path doesn't exist or can't be resolved
+        defer allocator.free(resolved);
+        if (!isResolvedPathAllowed(allocator, resolved, ws_resolved, allowed_paths))
+            return false;
+    }
+    return true;
+}
+
+fn wrapCommandArgv(sandbox: ?Sandbox, base_argv: []const []const u8, wrap_buf: [][]const u8) ![]const []const u8 {
+    if (sandbox) |sb| {
+        return sb.wrapCommand(base_argv, wrap_buf);
+    }
+    return base_argv;
+}
+
+fn sandboxRestrictsToWorkspace(sandbox: ?Sandbox) bool {
+    if (sandbox) |sb| {
+        return std.mem.eql(u8, sb.name(), "bubblewrap") or
+            std.mem.eql(u8, sb.name(), "docker");
+    }
+    return false;
+}
+
 fn normalizeCommandInput(command: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (unwrapMarkdownFence(trimmed)) |unfenced| {
@@ -85,7 +133,13 @@ pub const ShellTool = struct {
     timeout_ns: u64 = DEFAULT_SHELL_TIMEOUT_NS,
     max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
     policy: ?*const SecurityPolicy = null,
-
+    /// Env var names whose platform path-list values are validated
+    /// against workspace + allowed_paths before passing to child processes.
+    path_env_vars: []const []const u8 = &.{},
+    sandbox: ?Sandbox = null,
+    // Storage for sandbox backends; must outlive the ShellTool.
+    // This is part of the vtable ownership pattern: the tool creator owns the storage.
+    sandbox_storage: SandboxStorage = .{},
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
     pub const tool_params =
@@ -111,7 +165,15 @@ pub const ShellTool = struct {
         if (self.policy) |pol| {
             _ = pol.validateCommandExecution(command, false) catch |err| {
                 return switch (err) {
-                    error.CommandNotAllowed => ToolResult.fail("Command not allowed by security policy"),
+                    error.CommandNotAllowed => blk: {
+                        const summary = command_summary.summarizeBlockedCommand(command);
+                        log.warn("command blocked by security policy: head={s} bytes={d} assignments={d}", .{
+                            summary.head,
+                            summary.byte_len,
+                            summary.assignment_count,
+                        });
+                        break :blk ToolResult.fail("Command not allowed by security policy");
+                    },
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),
                     error.ApprovalRequired => blk: {
                         const msg = try std.fmt.allocPrint(allocator, "Command requires approval (medium/high risk): {s}", .{command});
@@ -144,6 +206,19 @@ pub const ShellTool = struct {
             break :blk cwd;
         } else self.workspace_dir;
 
+        if (sandboxRestrictsToWorkspace(self.sandbox)) {
+            const resolved_cwd = std.fs.cwd().realpathAlloc(allocator, effective_cwd) catch
+                return ToolResult.fail("sandboxed cwd must stay within workspace");
+            defer allocator.free(resolved_cwd);
+            const ws_resolved = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch
+                return ToolResult.fail("sandboxed cwd must stay within workspace");
+            defer allocator.free(ws_resolved);
+
+            if (!isResolvedPathAllowed(allocator, resolved_cwd, ws_resolved, &.{})) {
+                return ToolResult.fail("sandboxed cwd must stay within workspace");
+            }
+        }
+
         // Clear environment to prevent leaking API keys (CWE-200),
         // then re-add only safe, functional variables.
         var env = std.process.EnvMap.init(allocator);
@@ -155,12 +230,66 @@ pub const ShellTool = struct {
             }
         }
 
-        // Execute via platform shell
+        // Add path-validated env vars: each delimiter-separated component
+        // (`:` on Unix, `;` on Windows) must resolve within workspace or allowed_paths.
+        if (self.path_env_vars.len > 0) {
+            const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+            defer if (ws_resolved) |wr| allocator.free(wr);
+            const ws_for_check = ws_resolved orelse UNAVAILABLE_WORKSPACE_SENTINEL;
+            const sandbox_allowed_paths = if (sandboxRestrictsToWorkspace(self.sandbox))
+                &.{}
+            else
+                self.allowed_paths;
+
+            for (self.path_env_vars) |key| {
+                if (platform.getEnvOrNull(allocator, key)) |val| {
+                    defer allocator.free(val);
+                    if (validatePathEnvValue(allocator, val, ws_for_check, sandbox_allowed_paths)) {
+                        try env.put(key, val);
+                    }
+                }
+            }
+        }
+
+        // Execute via platform shell. On Windows, bypass cmd.exe when the user
+        // explicitly invokes PowerShell so pipes stay inside PowerShell instead
+        // of being interpreted by cmd.exe first.
         const proc = @import("process_util.zig");
-        const result = try proc.run(allocator, &.{ platform.getShell(), platform.getShellFlag(), command }, .{
+        // Determine base argv and ownership
+        var base_argv: []const []const u8 = undefined;
+        var maybe_owned_argv: ?[]const []const u8 = null;
+        defer {
+            if (maybe_owned_argv) |owned| {
+                freeOwnedArgv(allocator, owned);
+            }
+        }
+
+        if (builtin.os.tag == .windows) {
+            const parsed = try parseWindowsCommandArgv(allocator, command);
+            maybe_owned_argv = parsed;
+            if (parsed.len > 0 and isPowerShellExecutable(parsed[0])) {
+                base_argv = parsed;
+            } else {
+                const shell_cmd = platform.getShell();
+                const shell_flag = platform.getShellFlag();
+                base_argv = &.{ shell_cmd, shell_flag, command };
+            }
+        } else {
+            const shell_cmd = platform.getShell();
+            const shell_flag = platform.getShellFlag();
+            base_argv = &.{ shell_cmd, shell_flag, command };
+        }
+
+        // Apply sandbox wrapper if configured.
+        var wrap_buf: [512][]const u8 = undefined;
+        const final_argv = try wrapCommandArgv(self.sandbox, base_argv, &wrap_buf);
+
+        // Execute command.
+        const result = try proc.run(allocator, final_argv, .{
             .cwd = effective_cwd,
             .env_map = &env,
             .max_output_bytes = self.max_output_bytes,
+            .timeout_ns = self.timeout_ns,
         });
         defer allocator.free(result.stderr);
 
@@ -172,6 +301,10 @@ pub const ShellTool = struct {
         defer allocator.free(result.stdout);
         if (result.interrupted) {
             return ToolResult{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
+        }
+        if (result.timed_out) {
+            const msg = try std.fmt.allocPrint(allocator, "Command timed out after {d}s", .{self.timeout_ns / std.time.ns_per_s});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
         if (result.exit_code != null) {
             const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "Command failed with non-zero exit code");
@@ -192,12 +325,77 @@ pub fn parseBoolField(json: []const u8, key: []const u8) ?bool {
     return json_miniparse.parseBoolField(json, key);
 }
 
+fn parseWindowsCommandArgv(allocator: std.mem.Allocator, command: []const u8) ![]const []const u8 {
+    const command_line_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, command);
+    defer allocator.free(command_line_w);
+
+    var iter = try std.process.ArgIteratorWindows.init(allocator, command_line_w);
+    defer iter.deinit();
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (argv.items) |arg| allocator.free(arg);
+        argv.deinit(allocator);
+    }
+
+    while (iter.next()) |arg| {
+        try argv.append(allocator, try allocator.dupe(u8, arg));
+    }
+
+    return try argv.toOwnedSlice(allocator);
+}
+
+fn freeOwnedArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    for (argv) |arg| allocator.free(arg);
+    allocator.free(argv);
+}
+
+fn windowsBasename(path: []const u8) []const u8 {
+    const sep_idx = std.mem.lastIndexOfAny(u8, path, "\\/") orelse return path;
+    return path[sep_idx + 1 ..];
+}
+
+fn isPowerShellExecutable(executable: []const u8) bool {
+    const base = windowsBasename(executable);
+    return std.ascii.eqlIgnoreCase(base, "powershell") or
+        std.ascii.eqlIgnoreCase(base, "powershell.exe") or
+        std.ascii.eqlIgnoreCase(base, "pwsh") or
+        std.ascii.eqlIgnoreCase(base, "pwsh.exe");
+}
+
 /// Extract an integer field value from a JSON blob.
 pub fn parseIntField(json: []const u8, key: []const u8) ?i64 {
     return json_miniparse.parseIntField(json, key);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
+
+test "parseWindowsCommandArgv preserves PowerShell flags and quoted script" {
+    const argv = try parseWindowsCommandArgv(
+        std.testing.allocator,
+        "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoProfile -Command \"Get-Process | Select-Object -First 1\"",
+    );
+    defer freeOwnedArgv(std.testing.allocator, argv);
+
+    try std.testing.expectEqual(@as(usize, 4), argv.len);
+    try std.testing.expectEqualStrings("C:\\Program Files\\PowerShell\\7\\pwsh.exe", argv[0]);
+    try std.testing.expectEqualStrings("-NoProfile", argv[1]);
+    try std.testing.expectEqualStrings("-Command", argv[2]);
+    try std.testing.expectEqualStrings("Get-Process | Select-Object -First 1", argv[3]);
+}
+
+test "isPowerShellExecutable requires exact basename match" {
+    try std.testing.expect(isPowerShellExecutable("powershell"));
+    try std.testing.expect(isPowerShellExecutable("powershell.exe"));
+    try std.testing.expect(isPowerShellExecutable("pwsh"));
+    try std.testing.expect(isPowerShellExecutable("pwsh.exe"));
+    try std.testing.expect(isPowerShellExecutable("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+    try std.testing.expect(isPowerShellExecutable("C:/Program Files/PowerShell/7/pwsh.exe"));
+
+    try std.testing.expect(!isPowerShellExecutable("powershell-preview"));
+    try std.testing.expect(!isPowerShellExecutable("powershell_ise.exe"));
+    try std.testing.expect(!isPowerShellExecutable("pwsh-script"));
+}
 
 test "shell tool name" {
     var st = ShellTool{ .workspace_dir = "/tmp" };
@@ -253,6 +451,23 @@ test "shell reports interruption when cancel flag is set" {
     try std.testing.expect(!result.success);
     try std.testing.expect(result.error_msg != null);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Interrupted") != null);
+}
+
+test "shell reports timeout for long-running command" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var st = ShellTool{ .workspace_dir = ".", .timeout_ns = 100 * std.time.ns_per_ms };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"sleep 5\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "timed out") != null);
 }
 
 test "shell missing command param" {
@@ -386,6 +601,40 @@ test "shell cwd with allowed_paths runs in cwd" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, tmp_path) != null);
+}
+
+test "shell sandboxed cwd outside workspace is rejected before spawn" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makeDir("ws");
+    try tmp_dir.dir.makeDir("other");
+    const root_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
+    defer std.testing.allocator.free(ws_path);
+    const other_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
+    defer std.testing.allocator.free(other_path);
+
+    var prefix = PrefixSandbox{};
+    var st = ShellTool{
+        .workspace_dir = ws_path,
+        .allowed_paths = &.{other_path},
+        .sandbox = prefix.restrictedSandbox(),
+    };
+
+    var args_buf: [768]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"command\": \"pwd\", \"cwd\": \"{s}\"}}", .{other_path});
+    const parsed = try root.parseTestArgs(args);
+    defer parsed.deinit();
+
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "sandboxed cwd must stay within workspace") != null);
 }
 
 test "shell ApprovalRequired error includes command name" {
@@ -570,4 +819,316 @@ test "shell without policy executes command" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
+}
+
+test "validatePathEnvValue allows paths within workspace" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("lib");
+    const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
+    defer std.testing.allocator.free(lib_path);
+
+    try std.testing.expect(validatePathEnvValue(
+        std.testing.allocator,
+        lib_path,
+        tmp_path,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue allows delimiter-separated paths within workspace" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("lib");
+    try tmp_dir.dir.makeDir("usr");
+    const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
+    defer std.testing.allocator.free(lib_path);
+    const usr_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "usr" });
+    defer std.testing.allocator.free(usr_path);
+
+    const combined = try std.fmt.allocPrint(std.testing.allocator, "{s}" ++ &[_]u8{path_list_delimiter} ++ "{s}", .{ lib_path, usr_path });
+    defer std.testing.allocator.free(combined);
+
+    try std.testing.expect(validatePathEnvValue(
+        std.testing.allocator,
+        combined,
+        tmp_path,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue rejects paths outside workspace" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("ws");
+    try tmp_dir.dir.makeDir("outside");
+    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "ws" });
+    defer std.testing.allocator.free(ws_path);
+    const outside_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "outside" });
+    defer std.testing.allocator.free(outside_path);
+
+    try std.testing.expect(!validatePathEnvValue(
+        std.testing.allocator,
+        outside_path,
+        ws_path,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue rejects system paths" {
+    const system_path = if (@import("builtin").os.tag == .windows) "C:\\Windows\\System32" else "/usr/lib";
+    const fake_ws = if (@import("builtin").os.tag == .windows) "C:\\Users\\test\\workspace" else "/home/user/workspace";
+    try std.testing.expect(!validatePathEnvValue(
+        std.testing.allocator,
+        system_path,
+        fake_ws,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue allows via allowed_paths" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("tools");
+    const tools_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "tools" });
+    defer std.testing.allocator.free(tools_path);
+
+    try std.testing.expect(validatePathEnvValue(
+        std.testing.allocator,
+        tools_path,
+        "/nonexistent-workspace",
+        &.{tmp_path},
+    ));
+}
+
+test "validatePathEnvValue rejects mixed valid and invalid paths" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("lib");
+    const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
+    defer std.testing.allocator.free(lib_path);
+
+    // Mix a valid path with a system path (blocked)
+    const system_path = if (@import("builtin").os.tag == .windows) "C:\\Windows\\System32" else "/etc";
+    const combined = try std.fmt.allocPrint(std.testing.allocator, "{s}" ++ &[_]u8{path_list_delimiter} ++ "{s}", .{ lib_path, system_path });
+    defer std.testing.allocator.free(combined);
+
+    try std.testing.expect(!validatePathEnvValue(
+        std.testing.allocator,
+        combined,
+        tmp_path,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue rejects relative paths" {
+    const fake_ws = if (@import("builtin").os.tag == .windows) "C:\\Users\\test\\workspace" else "/home/user/workspace";
+    try std.testing.expect(!validatePathEnvValue(
+        std.testing.allocator,
+        "relative/path",
+        fake_ws,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue allows empty value" {
+    const fake_ws = if (@import("builtin").os.tag == .windows) "C:\\Users\\test\\workspace" else "/home/user/workspace";
+    try std.testing.expect(validatePathEnvValue(
+        std.testing.allocator,
+        "",
+        fake_ws,
+        &.{},
+    ));
+}
+
+test "shell path_env_vars passes validated vars to child" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("mylibs");
+    const libs_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mylibs" });
+    defer std.testing.allocator.free(libs_path);
+
+    const key_z = try std.testing.allocator.dupeZ(u8, "TEST_LIB_PATH");
+    defer std.testing.allocator.free(key_z);
+    const value_z = try std.testing.allocator.dupeZ(u8, libs_path);
+    defer std.testing.allocator.free(value_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, value_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    var st = ShellTool{
+        .workspace_dir = tmp_path,
+        .path_env_vars = &.{"TEST_LIB_PATH"},
+    };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"printf '%s' \\\"$TEST_LIB_PATH\\\"\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings(libs_path, result.output);
+}
+
+test "shell sandboxed path_env_vars ignore allowed_paths outside workspace" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makeDir("ws");
+    try tmp_dir.dir.makeDir("other");
+    const root_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
+    defer std.testing.allocator.free(ws_path);
+    const other_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
+    defer std.testing.allocator.free(other_path);
+
+    try std.fs.cwd().makePath(other_path);
+    const libs_path = try std.fs.path.join(std.testing.allocator, &.{ other_path, "mylibs" });
+    defer std.testing.allocator.free(libs_path);
+    try std.fs.cwd().makePath(libs_path);
+
+    const key_z = try std.testing.allocator.dupeZ(u8, "TEST_LIB_PATH");
+    defer std.testing.allocator.free(key_z);
+    const value_z = try std.testing.allocator.dupeZ(u8, libs_path);
+    defer std.testing.allocator.free(value_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, value_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    var prefix = PrefixSandbox{};
+    var st = ShellTool{
+        .workspace_dir = ws_path,
+        .allowed_paths = &.{other_path},
+        .path_env_vars = &.{"TEST_LIB_PATH"},
+        .sandbox = prefix.restrictedSandbox(),
+    };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"printf '%s' \\\"$TEST_LIB_PATH\\\"\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    // Regression: docker/bubblewrap sandboxing only mounts the workspace, so
+    // path-like env vars outside it must be dropped before spawn.
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("(no output)", result.output);
+}
+
+const PrefixSandbox = struct {
+    pub const sandbox_vtable = Sandbox.VTable{
+        .wrapCommand = wrapCommand,
+        .isAvailable = isAvailable,
+        .name = getName,
+        .description = getDescription,
+    };
+
+    pub fn sandbox(self: *PrefixSandbox) Sandbox {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &sandbox_vtable,
+        };
+    }
+
+    fn wrapCommand(_: *anyopaque, argv: []const []const u8, buf: [][]const u8) ![]const []const u8 {
+        if (buf.len < argv.len + 1) return error.BufferTooSmall;
+
+        buf[0] = "env";
+        for (argv, 0..) |arg, i| {
+            buf[i + 1] = arg;
+        }
+        return buf[0 .. argv.len + 1];
+    }
+
+    fn isAvailable(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "prefix";
+    }
+
+    fn getDescription(_: *anyopaque) []const u8 {
+        return "Test prefix sandbox";
+    }
+
+    pub fn restrictedSandbox(self: *PrefixSandbox) Sandbox {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &restricted_vtable,
+        };
+    }
+
+    pub const restricted_vtable = Sandbox.VTable{
+        .wrapCommand = wrapCommand,
+        .isAvailable = isAvailable,
+        .name = getRestrictedName,
+        .description = getDescription,
+    };
+
+    fn getRestrictedName(_: *anyopaque) []const u8 {
+        return "docker";
+    }
+};
+
+test "wrapCommandArgv uses caller-owned buffer for sandbox wrappers" {
+    var prefix = PrefixSandbox{};
+    const base_argv = [_][]const u8{ "sh", "-c", "printf test" };
+    var wrap_buf: [8][]const u8 = undefined;
+
+    // Regression: keep wrapper argv storage alive until the child process is spawned.
+    const final_argv = try wrapCommandArgv(@as(?Sandbox, prefix.sandbox()), &base_argv, &wrap_buf);
+    try std.testing.expectEqual(@as(usize, 4), final_argv.len);
+    try std.testing.expectEqualStrings("env", final_argv[0]);
+    try std.testing.expectEqualStrings("sh", final_argv[1]);
+    try std.testing.expectEqualStrings("-c", final_argv[2]);
+    try std.testing.expectEqualStrings("printf test", final_argv[3]);
+}
+
+test "shell with sandbox wrapper executes command" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // Sandboxes not currently available on Windows in tests
+
+    var prefix = PrefixSandbox{};
+
+    var st = ShellTool{
+        .workspace_dir = "/tmp",
+        .sandbox = prefix.sandbox(),
+    };
+    const t = st.tool();
+
+    const parsed = try root.parseTestArgs("{\"command\": \"printf test\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("test", result.output);
 }
