@@ -40,14 +40,8 @@ fn hashWithCanonicalLineEndings(bytes: []const u8) [std.crypto.hash.sha2.Sha256.
     return digest;
 }
 
-fn readFileAllocCompat(b: *std.Build, allocator: std.mem.Allocator, sub_path: []const u8, max_bytes: usize) ![]u8 {
-    if (@hasDecl(std.fs, "cwd")) {
-        const file = try std.fs.cwd().openFile(sub_path, .{});
-        defer file.close();
-        return try file.readToEndAlloc(allocator, max_bytes);
-    }
-
-    return try std.Io.Dir.cwd().readFileAlloc(b.graph.io, sub_path, allocator, .limited(max_bytes));
+fn readFileAllocCompat(dir: std.Io.Dir, io: std.Io, allocator: std.mem.Allocator, sub_path: []const u8, max_bytes: usize) ![]u8 {
+    return try dir.readFileAlloc(io, sub_path, allocator, .limited(max_bytes));
 }
 
 fn verifyVendoredSqliteHashes(b: *std.Build) !void {
@@ -56,7 +50,7 @@ fn verifyVendoredSqliteHashes(b: *std.Build) !void {
         const file_path = b.pathFromRoot(entry.path);
         defer b.allocator.free(file_path);
 
-        const bytes = readFileAllocCompat(b, b.allocator, file_path, max_vendor_file_size) catch |err| {
+        const bytes = readFileAllocCompat(std.Io.Dir.cwd(), b.graph.io, b.allocator, file_path, max_vendor_file_size) catch |err| {
             std.log.err("failed to read {s}: {s}", .{ file_path, @errorName(err) });
             return err;
         };
@@ -343,11 +337,7 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
 }
 
 fn envExists(b: *std.Build, name: []const u8) bool {
-    const Graph = @TypeOf(b.graph.*);
-    if (@hasField(Graph, "environ_map")) {
-        return b.graph.environ_map.get(name) != null;
-    }
-    return b.graph.env_map.get(name) != null;
+    return b.graph.environ_map.get(name) != null;
 }
 
 fn ensureAndroidBuildEnvironment(b: *std.Build) void {
@@ -367,7 +357,7 @@ fn ensureAndroidBuildEnvironment(b: *std.Build) void {
         std.log.err("Install the Android NDK, generate a libc/sysroot file for the target, and pass it with --libc.", .{});
     }
     std.log.err("For native builds, run the build inside Termux without -Dtarget.", .{});
-    std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.15.2.", .{});
+    std.log.err("If you are seeing a build.zig.zon parse error mentioning '.nullclaw', your Zig version is not 0.16.0.", .{});
     std.process.exit(1);
 }
 
@@ -509,6 +499,11 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_max", enable_channel_max);
     build_options.addOption(bool, "enable_embedded_wasm3", enable_embedded_wasm3);
     const build_options_module = build_options.createModule();
+    const compat_module = b.createModule(.{
+        .root_source_file = b.path("src/compat.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // ---------- library module (importable by consumers) ----------
     const lib_mod: ?*std.Build.Module = if (is_wasi) null else blk: {
@@ -518,6 +513,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         module.addImport("build_options", build_options_module);
+        module.addImport("compat", compat_module);
         if (sqlite3) |lib| {
             module.linkLibrary(lib);
         }
@@ -529,6 +525,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
             });
+            ws_dep.module("websocket").addImport("compat", compat_module);
             module.addImport("websocket", ws_dep.module("websocket"));
         }
         if (enable_embedded_wasm3) {
@@ -539,9 +536,12 @@ pub fn build(b: *std.Build) void {
 
     // ---------- executable ----------
     const exe_imports: []const std.Build.Module.Import = if (is_wasi)
-        &.{}
+        &.{.{ .name = "compat", .module = compat_module }}
     else
-        &.{.{ .name = "nullclaw", .module = lib_mod.? }};
+        &.{
+            .{ .name = "nullclaw", .module = lib_mod.? },
+            .{ .name = "compat", .module = compat_module },
+        };
 
     const exe_root_module = b.createModule(.{
         .root_source_file = if (is_wasi) b.path("src/main_wasi.zig") else b.path("src/main.zig"),
