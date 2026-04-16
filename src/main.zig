@@ -21,6 +21,7 @@ const Command = enum {
     agent,
     gateway,
     service,
+    config,
     status,
     version,
     onboard,
@@ -41,6 +42,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
+const CONFIG_SUBCOMMANDS = "show|get";
 const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
@@ -48,7 +50,7 @@ const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
 const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|forget";
 const HISTORY_SUBCOMMANDS = "list|show";
 const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
-const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
+const MODELS_SUBCOMMANDS = "list|summary|info|benchmark|refresh";
 const AUTH_SUBCOMMANDS = "login|status|logout";
 
 const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
@@ -62,6 +64,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  agent        Start the AI agent loop
     \\  gateway      Start the gateway server (HTTP/WebSocket)
     \\  service      Manage OS service lifecycle
+    \\  config       Inspect resolved config values
     \\  status       Show system status
     \\  version      Show CLI version
     \\  doctor       Run diagnostics
@@ -85,6 +88,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\  gateway [--port PORT] [--host HOST]
     \\  version | --version | -V
     \\  service <{s}>
+    \\  config <{s}> [ARGS]
     \\  cron <{s}> [ARGS]
     \\  channel <{s}> [ARGS]
     \\  skills <{s}> [ARGS]
@@ -101,6 +105,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
 ,
     .{
         SERVICE_SUBCOMMANDS,
+        CONFIG_SUBCOMMANDS,
         CRON_SUBCOMMANDS,
         CHANNEL_SUBCOMMANDS,
         SKILLS_SUBCOMMANDS,
@@ -118,6 +123,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "agent", .agent },
         .{ "gateway", .gateway },
         .{ "service", .service },
+        .{ "config", .config },
         .{ "status", .status },
         .{ "version", .version },
         .{ "--version", .version },
@@ -218,6 +224,7 @@ pub fn main(init: std.process.Init) !void {
         .help => printUsage(),
         .gateway => try runGateway(allocator, sub_args),
         .service => try runService(allocator, sub_args),
+        .config => try runConfig(allocator, sub_args),
         .cron => try runCron(allocator, sub_args),
         .channel => try runChannel(allocator, sub_args),
         .skills => try runSkills(allocator, sub_args),
@@ -2054,6 +2061,214 @@ fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !
     std.debug.print("{s}", .{output});
 }
 
+// ── Config ───────────────────────────────────────────────────────
+
+const ModelProviderSummary = struct {
+    name: []const u8,
+    has_key: bool,
+};
+
+fn printStdoutBytes(text: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var bw = std_compat.fs.File.stdout().writer(&buf);
+    bw.interface.writeAll(text) catch return;
+    bw.interface.flush() catch return;
+}
+
+fn appendJsonEscaped(buf: *std.array_list.Managed(u8), s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try buf.appendSlice("\\\""),
+            '\\' => try buf.appendSlice("\\\\"),
+            '\n' => try buf.appendSlice("\\n"),
+            '\r' => try buf.appendSlice("\\r"),
+            '\t' => try buf.appendSlice("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    var escape_buf: [6]u8 = undefined;
+                    const escape = try std.fmt.bufPrint(&escape_buf, "\\u{x:0>4}", .{ch});
+                    try buf.appendSlice(escape);
+                } else {
+                    try buf.append(ch);
+                }
+            },
+        }
+    }
+}
+
+fn allocDefaultModelRef(allocator: std.mem.Allocator, cfg: *const yc.config.Config) !?[]u8 {
+    const model = cfg.default_model orelse return null;
+    if (cfg.default_provider.len == 0) return try allocator.dupe(u8, model);
+    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.default_provider, model });
+}
+
+fn buildModelsSummaryJson(allocator: std.mem.Allocator, cfg: *const yc.config.Config) ![]u8 {
+    var providers = std.ArrayListUnmanaged(ModelProviderSummary).empty;
+    defer providers.deinit(allocator);
+
+    for (cfg.providers) |provider| {
+        const has_key = if (provider.api_key) |key|
+            std.mem.trim(u8, key, " \t\r\n").len > 0
+        else
+            false;
+        try providers.append(allocator, .{
+            .name = provider.name,
+            .has_key = has_key,
+        });
+    }
+
+    std.mem.sort(ModelProviderSummary, providers.items, {}, struct {
+        fn lessThan(_: void, lhs: ModelProviderSummary, rhs: ModelProviderSummary) bool {
+            return std.mem.order(u8, lhs.name, rhs.name) == .lt;
+        }
+    }.lessThan);
+
+    const default_model_ref = try allocDefaultModelRef(allocator, cfg);
+    defer if (default_model_ref) |value| allocator.free(value);
+
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+
+    try out.appendSlice("{\"default_provider\":");
+    if (cfg.default_provider.len > 0) {
+        try out.append('"');
+        try appendJsonEscaped(&out, cfg.default_provider);
+        try out.append('"');
+    } else {
+        try out.appendSlice("null");
+    }
+
+    try out.appendSlice(",\"default_model\":");
+    if (default_model_ref) |value| {
+        try out.append('"');
+        try appendJsonEscaped(&out, value);
+        try out.append('"');
+    } else {
+        try out.appendSlice("null");
+    }
+
+    try out.appendSlice(",\"providers\":[");
+    for (providers.items, 0..) |provider, idx| {
+        if (idx > 0) try out.append(',');
+        try out.appendSlice("{\"name\":\"");
+        try appendJsonEscaped(&out, provider.name);
+        try out.appendSlice("\",\"has_key\":");
+        try out.appendSlice(if (provider.has_key) "true" else "false");
+        try out.append('}');
+    }
+    try out.appendSlice("]}");
+    return try out.toOwnedSlice();
+}
+
+fn writeConfigValueResult(path: []const u8, value_json: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var bw = std_compat.fs.File.stdout().writer(&buf);
+    const out = &bw.interface;
+
+    out.writeAll("{\"path\":") catch return;
+    writeJsonString(out, path) catch return;
+    out.writeAll(",\"value\":") catch return;
+    out.writeAll(value_json) catch return;
+    out.writeAll("}\n") catch return;
+    out.flush() catch return;
+}
+
+fn printConfigUsage() void {
+    std.debug.print(std.fmt.comptimePrint(
+        \\Usage: nullclaw config <{s}> [args]
+        \\
+        \\Commands:
+        \\  show [--json]                  Print config.json as JSON
+        \\  get <path> [--json]            Read a dotted config path
+        \\
+    , .{CONFIG_SUBCOMMANDS}), .{});
+}
+
+fn runConfig(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        printConfigUsage();
+        std_compat.process.exit(1);
+    }
+
+    const subcmd = sub_args[0];
+
+    if (std.mem.eql(u8, subcmd, "show")) {
+        if (sub_args.len > 2 or (sub_args.len == 2 and !std.mem.eql(u8, sub_args[1], "--json"))) {
+            printConfigUsage();
+            std_compat.process.exit(1);
+        }
+
+        const config_json = yc.config_mutator.getCurrentConfigJson(allocator) catch |err| {
+            switch (err) {
+                error.FileNotFound => {
+                    if (hasJsonFlag(sub_args[1..])) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+                    std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+                },
+                else => {
+                    if (hasJsonFlag(sub_args[1..])) writeJsonError("config_read_failed", "Failed to read config.json", null);
+                    std.debug.print("Failed to read config.json: {s}\n", .{@errorName(err)});
+                },
+            }
+            std_compat.process.exit(1);
+        };
+        defer allocator.free(config_json);
+
+        printStdoutBytes(config_json);
+        if (config_json.len == 0 or config_json[config_json.len - 1] != '\n') {
+            printStdoutBytes("\n");
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "get")) {
+        if (sub_args.len < 2 or sub_args.len > 3 or (sub_args.len == 3 and !std.mem.eql(u8, sub_args[2], "--json"))) {
+            printConfigUsage();
+            std_compat.process.exit(1);
+        }
+
+        const path = sub_args[1];
+        const value_json = yc.config_mutator.findPathValueJson(allocator, path) catch |err| {
+            switch (err) {
+                error.FileNotFound => {
+                    if (hasJsonFlag(sub_args[2..])) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+                    std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+                },
+                error.InvalidJson => {
+                    if (hasJsonFlag(sub_args[2..])) writeJsonError("config_invalid_json", "config.json is not valid JSON", null);
+                    std.debug.print("config.json is not valid JSON\n", .{});
+                },
+                error.InvalidPath => {
+                    if (hasJsonFlag(sub_args[2..])) writeJsonError("config_invalid_path", "Invalid dotted config path", null);
+                    std.debug.print("Invalid dotted config path: {s}\n", .{path});
+                },
+                else => {
+                    if (hasJsonFlag(sub_args[2..])) writeJsonError("config_get_failed", "Failed to read config path", null);
+                    std.debug.print("Failed to read config path {s}: {s}\n", .{ path, @errorName(err) });
+                },
+            }
+            std_compat.process.exit(1);
+        };
+        if (value_json) |value| {
+            defer allocator.free(value);
+            if (hasJsonFlag(sub_args[2..])) {
+                writeConfigValueResult(path, value);
+            } else {
+                printStdoutBytes(value);
+                printStdoutBytes("\n");
+            }
+            return;
+        }
+
+        if (hasJsonFlag(sub_args[2..])) writeJsonError("config_path_not_found", "Config path not found", null);
+        std.debug.print("Config path not found: {s}\n", .{path});
+        std_compat.process.exit(1);
+    }
+
+    std.debug.print("Unknown config command: {s}\n\n", .{subcmd});
+    printConfigUsage();
+    std_compat.process.exit(1);
+}
+
 // ── Models ───────────────────────────────────────────────────────
 
 fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -2063,6 +2278,7 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\
             \\Commands:
             \\  list                          List available models
+            \\  summary [--json]             Show configured provider summary
             \\  info <model>                  Show model details
             \\  benchmark                     Run model latency benchmark
             \\  refresh                       Refresh model catalog
@@ -2091,6 +2307,53 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("  {s:<12} {s:<36} {s}\n", .{ p.key, p.default_model, p.label });
         }
         std.debug.print("\nUse `nullclaw models info <model>` for details.\n", .{});
+    } else if (std.mem.eql(u8, subcmd, "summary")) {
+        if (sub_args.len > 2 or (sub_args.len == 2 and !std.mem.eql(u8, sub_args[1], "--json"))) {
+            std.debug.print("Usage: nullclaw models summary [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+
+        var cfg = yc.config.Config.load(allocator) catch {
+            if (hasJsonFlag(sub_args[1..])) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
+            std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+            std_compat.process.exit(1);
+        };
+        defer cfg.deinit();
+
+        const summary_json = buildModelsSummaryJson(allocator, &cfg) catch |err| {
+            if (hasJsonFlag(sub_args[1..])) writeJsonError("models_summary_failed", "Failed to build models summary", null);
+            std.debug.print("Failed to build models summary: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+        defer allocator.free(summary_json);
+
+        if (hasJsonFlag(sub_args[1..])) {
+            printStdoutBytes(summary_json);
+            printStdoutBytes("\n");
+        } else {
+            std.debug.print("Configured provider summary:\n", .{});
+            std.debug.print("  Default provider: {s}\n", .{if (cfg.default_provider.len > 0) cfg.default_provider else "(not set)"});
+            if (cfg.default_model) |model| {
+                if (cfg.default_provider.len > 0) {
+                    std.debug.print("  Default model:    {s}/{s}\n", .{ cfg.default_provider, model });
+                } else {
+                    std.debug.print("  Default model:    {s}\n", .{model});
+                }
+            } else {
+                std.debug.print("  Default model:    (not set)\n", .{});
+            }
+            if (cfg.providers.len == 0) {
+                std.debug.print("  Providers:        (none configured)\n", .{});
+            } else {
+                std.debug.print("  Providers:\n", .{});
+                for (cfg.providers) |provider| {
+                    std.debug.print("    - {s} [{s}]\n", .{
+                        provider.name,
+                        if (provider.api_key != null and std.mem.trim(u8, provider.api_key.?, " \t\r\n").len > 0) "has_key" else "no_key",
+                    });
+                }
+            }
+        }
     } else if (std.mem.eql(u8, subcmd, "info")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw models info <model>\n", .{});
@@ -3271,6 +3534,7 @@ fn printUsage() void {
 
 test "parse known commands" {
     try std.testing.expectEqual(.agent, parseCommand("agent").?);
+    try std.testing.expectEqual(.config, parseCommand("config").?);
     try std.testing.expectEqual(.status, parseCommand("status").?);
     try std.testing.expectEqual(.version, parseCommand("version").?);
     try std.testing.expectEqual(.version, parseCommand("--version").?);
@@ -3290,6 +3554,7 @@ test "parse known commands" {
 
 test "top level usage stays aligned with current subcommand synopses" {
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "service <" ++ SERVICE_SUBCOMMANDS ++ ">"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "config <" ++ CONFIG_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "cron <" ++ CRON_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "channel <" ++ CHANNEL_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "skills <" ++ SKILLS_SUBCOMMANDS ++ "> [ARGS]"));
@@ -3299,6 +3564,47 @@ test "top level usage stays aligned with current subcommand synopses" {
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "workspace <" ++ WORKSPACE_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "models <" ++ MODELS_SUBCOMMANDS ++ "> [ARGS]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "auth <" ++ AUTH_SUBCOMMANDS ++ "> <provider> [--import-codex]"));
+}
+
+test "allocDefaultModelRef reconstructs provider-prefixed model ref" {
+    const allocator = std.testing.allocator;
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = allocator,
+        .default_provider = "custom:https://gateway.example.com/api",
+        .default_model = "qianfan/custom-model",
+    };
+
+    const value = (try allocDefaultModelRef(allocator, &cfg)).?;
+    defer allocator.free(value);
+
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/api/qianfan/custom-model", value);
+}
+
+test "buildModelsSummaryJson emits sorted provider summaries without key contents" {
+    const allocator = std.testing.allocator;
+    const providers = [_]yc.config.ProviderEntry{
+        .{ .name = "openrouter", .api_key = "sk-test" },
+        .{ .name = "ollama", .api_key = null },
+    };
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .default_model = "anthropic/claude-sonnet-4.6",
+        .providers = &providers,
+    };
+
+    const json = try buildModelsSummaryJson(allocator, &cfg);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"default_provider\":\"openrouter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"default_model\":\"openrouter/anthropic/claude-sonnet-4.6\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"ollama\",\"has_key\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"openrouter\",\"has_key\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "sk-test") == null);
 }
 
 test "configureWindowsConsoleUtf8 is safe to call" {
