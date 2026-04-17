@@ -264,6 +264,7 @@ jobs:
           push: true
           build-args: |
             VERSION=${{ steps.docker_version.outputs.value }}
+            ZIG_VERSION=${{ env.ZIG_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
