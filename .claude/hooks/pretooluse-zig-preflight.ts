@@ -34,15 +34,16 @@ async function main(): Promise<void> {
 		emitPreTool({ kind: "allow" });
 	}
 
-	// Obtain the proposed content depending on tool shape
+	// Codex P1: only Write provides full file content. Edit.new_string and
+	// MultiEdit.edits[].new_string are *replacement fragments*, not complete
+	// .zig sources — `zig ast-check` on a fragment fails for many valid
+	// edits (e.g. replacing a single expression). Skip preflight on those
+	// shapes; the post-tool hook still validates the resulting file.
 	let proposed: string | undefined;
 	if (tool === "Write") {
 		proposed = payload.tool_input?.content;
-	} else if (tool === "Edit") {
-		proposed = payload.tool_input?.new_string;
-	} else if (tool === "MultiEdit") {
-		const edits = payload.tool_input?.edits ?? [];
-		proposed = edits.map((e) => e.new_string ?? "").join("\n");
+	} else {
+		emitPreTool({ kind: "allow" });
 	}
 
 	if (!proposed || proposed.length === 0) {
