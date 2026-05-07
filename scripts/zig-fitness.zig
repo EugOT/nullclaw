@@ -200,12 +200,32 @@ fn scanFile(
 
                 // Inferred error set detection: look for `!` in the return
                 // position without a preceding named-set identifier.
-                if (hasInferredErrorSet(body)) {
+                // Exception: `main` and `root` are sanctioned entry-points
+                // that may return `!void` per the Juicy Main pattern.
+                const is_entry_point = std.mem.eql(u8, name, "main") or
+                    std.mem.eql(u8, name, "root");
+                if (!is_entry_point and hasInferredErrorSet(body)) {
                     try emitFmt(w, gpa, .{
                         .file = path,
                         .kind = "inferred-error-set",
                         .line = line,
                         .message_fmt = "pub fn `{s}` returns `!T` with inferred error set; prefer a named set",
+                        .message_arg = name,
+                    });
+                    count += 1;
+                }
+
+                // anyerror ban: public API must not expose anyerror as it
+                // prevents callers from exhaustive error handling.
+                if (containsAny(body, &.{"anyerror"}) and
+                    std.mem.indexOf(u8, body, ") anyerror") != null or
+                    std.mem.indexOf(u8, body, ")anyerror") != null)
+                {
+                    try emitFmt(w, gpa, .{
+                        .file = path,
+                        .kind = "anyerror-public-api",
+                        .line = line,
+                        .message_fmt = "pub fn `{s}` exposes `anyerror` in return type; use a named error set",
                         .message_arg = name,
                     });
                     count += 1;

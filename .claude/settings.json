@@ -11,7 +11,9 @@
       "Bash(chezmoi purge *)",
       "Read(.env)",
       "Read(**/.env)",
-      "Edit(.git/**)"
+      "Edit(.git/**)",
+      "Write(.git/**)",
+      "MultiEdit(.git/**)"
     ]
   },
   "hooks": {

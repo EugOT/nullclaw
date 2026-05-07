@@ -15,7 +15,9 @@ allowed-tools: Read
 This skill is a **router**, not a knowledge dump. Each row points to one
 `.md` file in the prompt-infra corpus at:
 
-`${HOME}/Library/CloudStorage/GoogleDrive-<your-email>/My Drive/01_🏗️Projects/2026-04-23-prompt-infra/`
+`<CORPUS_ROOT>/prompt-infra/`
+
+Set `CORPUS_ROOT` to the local path of your prompt-infra corpus checkout. This path is user-specific and must not be hardcoded in the repo.
 
 The filenames, topics, and triggers below were inferred from titles only.
 Load a single file on demand when your task matches its triggers. `.gdoc`

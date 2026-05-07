@@ -40,13 +40,14 @@ const HIGH_RISK: Array<{ re: RegExp; category: string }> = [
 	{ re: /secrets?\s*:\s*op:\/\//i, category: "secret-exfil" },
 ];
 
-const ZERO_WIDTH = /[\u200B-\u200D\uFEFF]/;
+const ZERO_WIDTH = /[​-‍﻿]/;
 
 async function main(): Promise<void> {
 	const payload = await readStdinJson<PostToolPayload>();
 	const toolName = payload.tool_name ?? "";
 	if (!toolName.startsWith("mcp__")) {
 		emitPostTool({ kind: "allow" });
+		return;
 	}
 
 	const text = JSON.stringify(payload.tool_response ?? "");

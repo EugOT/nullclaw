@@ -45,6 +45,7 @@ async function main(): Promise<void> {
 	const file = payload.tool_input?.file_path ?? "";
 	if (!file.endsWith(".zig")) {
 		emitPreTool({ kind: "allow" });
+		return;
 	}
 
 	// Obtain the proposed POST-EDIT file content. ast-check requires complete
@@ -66,18 +67,23 @@ async function main(): Promise<void> {
 		) {
 			// Let the actual tool surface a real error (file missing, no match)
 			emitPreTool({ kind: "allow" });
+			return;
 		}
-		proposed = original!.replace(oldStr, newStr);
+		proposed = original.replace(oldStr, newStr);
 	} else if (tool === "MultiEdit") {
 		const edits = payload.tool_input?.edits ?? [];
 		const original = await readOriginalOrUndefined(file);
-		if (original === undefined) emitPreTool({ kind: "allow" });
-		let working = original!;
+		if (original === undefined) {
+			emitPreTool({ kind: "allow" });
+			return;
+		}
+		let working = original;
 		for (const e of edits) {
 			const oldStr = e.old_string ?? "";
 			const newStr = e.new_string ?? "";
 			if (oldStr.length === 0 || !working.includes(oldStr)) {
 				emitPreTool({ kind: "allow" });
+				return;
 			}
 			working = working.replace(oldStr, newStr);
 		}
@@ -86,27 +92,39 @@ async function main(): Promise<void> {
 
 	if (!proposed || proposed.length === 0) {
 		emitPreTool({ kind: "allow" });
+		return;
 	}
 
-	// Dump to temp file and run zig ast-check (0.16 accepts a path)
+	// Dump to temp file and run zig ast-check (0.16 accepts a path).
+	// Use try/finally for best-effort temp-file cleanup (prevents accumulation).
 	const tmp = resolve(tmpdir(), `preflight-${Date.now()}.zig`);
-	await Bun.write(tmp, proposed!);
-	const r = zig(["ast-check", tmp]);
+	try {
+		await Bun.write(tmp, proposed);
+		const r = zig(["ast-check", tmp]);
 
-	await appendJsonl(".claude/logs/zig-preflight.jsonl", {
-		event: r.code === 0 ? "pass" : "fail",
-		file,
-		tool,
-		code: r.code,
-	});
-
-	if (r.code !== 0) {
-		emitPreTool({
-			kind: "pre-tool-decision",
-			permissionDecision: "deny",
-			permissionDecisionReason: `zig ast-check failed on proposed edit to ${file}:\n${tail(r.stderr || r.stdout, 1500)}`,
+		await appendJsonl(".claude/logs/zig-preflight.jsonl", {
+			event: r.code === 0 ? "pass" : "fail",
+			file,
+			tool,
+			code: r.code,
 		});
-		return;
+
+		if (r.code !== 0) {
+			emitPreTool({
+				kind: "pre-tool-decision",
+				permissionDecision: "deny",
+				permissionDecisionReason: `zig ast-check failed on proposed edit to ${file}:\n${tail(r.stderr || r.stdout, 1500)}`,
+			});
+			return;
+		}
+	} finally {
+		// Best-effort cleanup — ignore errors (file may already be gone).
+		await Bun.file(tmp)
+			.exists()
+			.then((exists) => {
+				if (exists) Bun.spawn(["rm", "-f", tmp]);
+			})
+			.catch(() => {});
 	}
 	emitPreTool({ kind: "allow" });
 }

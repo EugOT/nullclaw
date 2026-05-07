@@ -65,7 +65,14 @@ pub fn main(init: std.process.Init) !u8 {
         const entry = classifyDecl(ast, decl_idx) orelse continue; // non-pub decls skipped
         if (!first) try w.print(",\n", .{});
         first = false;
-        try w.print("  {{\"name\": \"{s}\", \"kind\": \"{s}\"}}", .{ entry.name, entry.kind });
+        // JSON-escape name and kind: Zig identifiers can use @"..." syntax
+        // and may contain quotes, backslashes, or other special chars that
+        // would corrupt the JSON output if interpolated verbatim.
+        const name_esc = try escapeJsonString(gpa, entry.name);
+        defer gpa.free(name_esc);
+        const kind_esc = try escapeJsonString(gpa, entry.kind);
+        defer gpa.free(kind_esc);
+        try w.print("  {{\"name\": \"{s}\", \"kind\": \"{s}\"}}", .{ name_esc, kind_esc });
     }
 
     try w.print("\n]\n", .{});
@@ -112,6 +119,13 @@ fn classifyDecl(ast: std.zig.Ast, decl_idx: std.zig.Ast.Node.Index) ?Entry {
             if (token_tags[name_tok] != .identifier) return null;
             return .{ .name = ast.tokenSlice(name_tok), .kind = kind };
         },
+        // pub usingnamespace SomeModule — inventoried as part of the public
+        // surface. The AST node tag is `.usingnamespace` (not a var decl).
+        .usingnamespace => {
+            const main_tok = main_tokens[@intFromEnum(decl_idx)];
+            if (!hasPubBefore(token_tags, main_tok)) return null;
+            return .{ .name = "usingnamespace", .kind = "usingnamespace" };
+        },
         else => return null,
     }
 }
@@ -152,6 +166,33 @@ fn findFnNameToken(ast: std.zig.Ast, decl_idx: std.zig.Ast.Node.Index) ?std.zig.
         if (token_tags[i] == .identifier) return @intCast(i);
     }
     return null;
+}
+
+/// JSON-escape `s` per RFC 8259 §7. Escapes `"`, `\`, and the control
+/// characters `\n`/`\r`/`\t`/`\b`/`\f` plus any remaining byte in the
+/// `\u{0000}`-`\u{001F}` range as `\uXXXX`. Caller owns the returned slice.
+fn escapeJsonString(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf: std.array_list.Managed(u8) = std.array_list.Managed(u8).init(gpa);
+    errdefer buf.deinit();
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice("\\\""),
+            '\\' => try buf.appendSlice("\\\\"),
+            '\n' => try buf.appendSlice("\\n"),
+            '\r' => try buf.appendSlice("\\r"),
+            '\t' => try buf.appendSlice("\\t"),
+            0x08 => try buf.appendSlice("\\b"),
+            0x0C => try buf.appendSlice("\\f"),
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                const hex_digits = "0123456789abcdef";
+                try buf.appendSlice("\\u00");
+                try buf.append(hex_digits[(c >> 4) & 0xF]);
+                try buf.append(hex_digits[c & 0xF]);
+            },
+            else => try buf.append(c),
+        }
+    }
+    return buf.toOwnedSlice();
 }
 
 fn printErr(io: std.Io, msg: []const u8) !void {

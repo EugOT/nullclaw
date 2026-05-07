@@ -39,6 +39,12 @@ const UNTRUSTED_INSTR_MARKERS: RegExp[] = [
 	/\{\{\s*secret/i,
 ];
 
+/** Safe command preview: first 40 chars + byte length. Never logs full text. */
+function cmdPreview(cmd: string): string {
+	const preview = cmd.length > 40 ? cmd.slice(0, 40) + "…" : cmd;
+	return `${preview} [${cmd.length}B]`;
+}
+
 async function main(): Promise<void> {
 	const payload = await readStdinJson<PreToolPayload>();
 	const toolName = payload.tool_name ?? "";
@@ -50,12 +56,15 @@ async function main(): Promise<void> {
 			await appendJsonl(".claude/logs/bash-guard.jsonl", {
 				event: "deny",
 				pattern: re.source,
-				command: cmd,
+				// Log a safe preview rather than the full command to avoid
+				// persisting tokens or PII that may be passed via CLI args.
+				commandPreview: cmdPreview(cmd),
+				commandBytes: cmd.length,
 			});
 			emitPreTool({
 				kind: "pre-tool-decision",
 				permissionDecision: "deny",
-				permissionDecisionReason: `pretooluse-bash-guard: blocked ${re.source} in "${cmd}". Use a reversible alternative or ask the user.`,
+				permissionDecisionReason: `pretooluse-bash-guard: blocked ${re.source}. Use a reversible alternative or ask the user.`,
 			});
 			return;
 		}

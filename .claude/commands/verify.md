@@ -1,7 +1,7 @@
 ---
 description: Run the tiered Zig quality gate. Usage — /verify [fast|commit|pr|release] (default: fast).
 argument-hint: "[fast|commit|pr|release]"
-allowed-tools: Bash(bun scripts/verify-fast.ts:*), Bash(bun scripts/verify-commit.ts:*), Bash(bun scripts/verify-pr.ts:*), Bash(bun scripts/verify-release.ts:*), Bash(./scripts/verify-fast.sh:*), Bash(./scripts/verify-commit.sh:*), Bash(./scripts/verify-pr.sh:*), Bash(./scripts/verify-release.sh:*), Bash(git:*)
+allowed-tools: Bash(bun scripts/verify-fast.ts:*), Bash(bun scripts/verify-commit.ts:*), Bash(bun scripts/verify-pr.ts:*), Bash(bun scripts/verify-release.ts:*), Bash(./scripts/verify-fast.sh:*), Bash(./scripts/verify-commit.sh:*), Bash(./scripts/verify-pr.sh:*), Bash(./scripts/verify-release.sh:*)
 ---
 
 # /verify
@@ -38,7 +38,7 @@ rule, do not add new bash logic to these gates — extend the TS modules.
    - `commit` → `bun scripts/verify-commit.ts`
    - `pr` → `bun scripts/verify-pr.ts`
    - `release` → `bun scripts/verify-release.ts`
-   - Anything else → refuse and print the usage table above.
+   - Anything else → **refuse** with: "Unknown tier '<arg>'. Valid tiers: fast, commit, pr, release." Do NOT silently fall back to fast.
 2. Execute via Bash tool and stream output. The legacy `./scripts/<name>.sh`
    shim is also acceptable when a caller's allowlist is shim-only.
 3. On non-zero exit, summarize what failed (which tier, which step, top 10 lines of stderr) and stop — do not proceed to higher tiers.

@@ -10,9 +10,9 @@ allowed-tools: Bash(bun scripts/verify-fast.ts:*), Bash(bun scripts/verify-commi
 
 # /verify — Tiered Zig Quality Gate
 
-This skill replaces the `/verify` command. The harness has no
-`.claude/commands/` directory; manual workflow entrypoints live here as
-skills so the primary interaction surface stays uniform.
+This skill dispatches tiered Zig quality checks. The `/verify` command
+in `.claude/commands/verify.md` provides the same surface for callers
+that prefer slash-command syntax.
 
 ## Tier → script map
 
@@ -27,8 +27,11 @@ skills so the primary interaction surface stays uniform.
 
 - If the user supplies an argument, match it literally against the four
   tiers above.
-- If the argument is empty, ambiguous, or unknown, fall back to `fast` and
-  state the fallback explicitly in the reply.
+- If the argument is empty, run `fast` and state the default explicitly
+  in the reply.
+- If the argument is unknown or ambiguous, **refuse** with a clear error
+  message listing the valid tiers. Do NOT silently fall back to `fast` —
+  a typo like `prr` must not silently run the weakest gate.
 - Never invoke `verify-release.ts` implicitly; the `release` tier belongs
   to the `release` skill and requires explicit user intent.
 - Run the selected script with `bun`. Do not inline any TypeScript logic;

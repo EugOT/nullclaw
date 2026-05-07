@@ -23,6 +23,8 @@ type PostToolPayload = {
 
 // 0.14/0.15 drift patterns — grep blocks obvious hallucinations.
 // Keep strict and short: each pattern here is a proven regression source.
+// Note: usingnamespace is intentionally NOT banned here because pub usingnamespace
+// is a valid public surface construct tracked by zig-api-surface.zig.
 const BANNED_API: Array<{ re: RegExp; fix: string }> = [
 	{
 		re: /std\.heap\.GeneralPurposeAllocator\b/,
@@ -34,15 +36,11 @@ const BANNED_API: Array<{ re: RegExp; fix: string }> = [
 	},
 	{
 		re: /std\.io\.getStdOut\s*\(\)/,
-		fix: "Use std.fs.File.stdout() returning a writer that takes Io in 0.16",
+		fix: "Use std.Io.File.stdout() in 0.16 (std.fs.File moved to std.Io.File)",
 	},
 	{
 		re: /\bThread\.Pool\b/,
 		fix: "std.Thread.Pool removed in 0.16; use std.Io.async / Io.Group.async",
-	},
-	{
-		re: /\busingnamespace\b/,
-		fix: "usingnamespace removed in 0.15.1+; use explicit pub const re-exports",
 	},
 ];
 

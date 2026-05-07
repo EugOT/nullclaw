@@ -146,7 +146,9 @@ done
 
 ## ziglint
 
-Use `github.com/EugOT/ziglint` as the authoritative linter fork (Zig 0.16).
+Use `github.com/EugOT/ziglint
+
+> **Fork rationale**: `EugOT/ziglint` is the only actively maintained Zig 0.16-compatible fork of `Techatrix/ziglint` at time of adoption. It is pinned by fingerprint in `build.zig.zon` and audited before each version bump. If an upstream release catches up, prefer migrating back to the upstream package.` as the authoritative linter fork (Zig 0.16).
 Do not substitute `mattware`/`nektro` forks. It is one gate beside `zig
 fmt`, `zig ast-check`, tests, fuzzing, and architecture fitness checks.
 

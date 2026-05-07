@@ -60,8 +60,11 @@ async function main(): Promise<void> {
 		await finish(test.code ?? 1, startedAt);
 	}
 
+	// Check both conventional module roots: lib.zig (library crates) and
+	// root.zig (used by this repo and other nullclaw-style projects).
 	const libZig = Bun.file(resolve(root, "src/lib.zig"));
-	if (await libZig.exists()) {
+	const rootZig = Bun.file(resolve(root, "src/root.zig"));
+	if ((await libZig.exists()) || (await rootZig.exists())) {
 		console.log("== check-public-api ==");
 		const api = Bun.spawnSync(["bun", "scripts/check-public-api.ts"], {
 			cwd: root,
