@@ -116,7 +116,10 @@ fn classifyDecl(ast: std.zig.Ast, decl_idx: std.zig.Ast.Node.Index) ?Entry {
     }
 }
 
-/// Returns true if the nearest non-doc-comment token before `tok` is `pub`.
+/// Returns true if the nearest non-doc-comment, non-fn-modifier token before
+/// `tok` is `pub`. Skips `inline`/`extern`/`export`/`noinline` so that
+/// `pub inline fn`, `pub extern fn`, `pub export fn`, and `pub noinline fn`
+/// are recognised as public (CEL-456 #5).
 fn hasPubBefore(token_tags: []const std.zig.Token.Tag, tok: std.zig.Ast.TokenIndex) bool {
     if (tok == 0) return false;
     var i: usize = @as(usize, tok);
@@ -125,13 +128,12 @@ fn hasPubBefore(token_tags: []const std.zig.Token.Tag, tok: std.zig.Ast.TokenInd
         const t = token_tags[i];
         switch (t) {
             .keyword_pub => return true,
-            .doc_comment,
-            .container_doc_comment,
             .keyword_inline,
-            .keyword_noinline,
             .keyword_extern,
             .keyword_export,
-            .keyword_threadlocal,
+            .keyword_noinline,
+            .doc_comment,
+            .container_doc_comment,
             => continue,
             else => return false,
         }

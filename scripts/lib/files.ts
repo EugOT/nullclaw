@@ -32,15 +32,30 @@ export function collectZigInputs(root = repoRoot()): {
 	if (roots.length === 0) return { fmtInputs: [], zigFiles: [] };
 
 	// Try jj first. Pass the pre-filtered relative paths directly so we do
-	// not redo the existence check.
-	const jj = spawnSync(["jj", "files", "--", ...existingDirs], { cwd: root });
+	// not redo the existence check. `spawnSync` returns code 127 with an
+	// error message in stderr when `jj` is not installed, so we naturally
+	// fall through to git without crashing (CEL-456 #7).
 	let tracked: string[] = [];
-	if (jj.code === 0 && jj.stdout.trim().length > 0) {
-		tracked = jj.stdout.split("\n").filter((l) => l.length > 0);
-	} else {
-		const git = spawnSync(["git", "ls-files", ...existingDirs], { cwd: root });
-		if (git.code === 0 && git.stdout.trim().length > 0) {
-			tracked = git.stdout.split("\n").filter((l) => l.length > 0);
+	try {
+		const jj = spawnSync(["jj", "files", "--", ...existingDirs], {
+			cwd: root,
+		});
+		if (jj.code === 0 && jj.stdout.trim().length > 0) {
+			tracked = jj.stdout.split("\n").filter((l) => l.length > 0);
+		}
+	} catch {
+		// jj missing or threw; fall through to git.
+	}
+	if (tracked.length === 0) {
+		try {
+			const git = spawnSync(["git", "ls-files", ...existingDirs], {
+				cwd: root,
+			});
+			if (git.code === 0 && git.stdout.trim().length > 0) {
+				tracked = git.stdout.split("\n").filter((l) => l.length > 0);
+			}
+		} catch {
+			// git missing too; fall through to fsWalk.
 		}
 	}
 
