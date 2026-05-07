@@ -26,3 +26,7 @@ config.signal.json
 .cursor/
 .trae/
 .codebuddy/
+
+# Allow agent toolkit (override user-global ~/.config/git/ignore)
+!.claude/
+!.claude/**
