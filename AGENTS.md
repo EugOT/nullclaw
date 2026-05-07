@@ -309,3 +309,15 @@ When working in fast iterative mode:
 - Do not "ship and hope" on security-sensitive paths.
 - If uncertain about Zig 0.16 API, check `src/` for existing usage patterns before guessing.
 - If uncertain about architecture, read the vtable interface definition before implementing.
+
+## Quality Tools (Zig 0.16)
+
+This project adopts the chezmoi-managed `zig-qm-toolkit` (centralized at `~/.local/share/chezmoi/.chezmoitemplates/zig-qm-toolkit/`).
+
+- **zls 0.16.0** — install via `mise install zls@0.16.0` and configure `.zls.json` with mise-resolved zig path
+- **ziglint** — invoked via Tier-1 PostToolUse hook; honest absence reporting if not on PATH
+- **zigdoc** — invoked at Tier-3 verify-pr docs gate
+- **4-tier verify pipeline** — `bun scripts/verify-fast.ts` (Tier 1, <2s), `verify-commit.ts` (Tier 2, ~30s), `verify-pr.ts` (Tier 3, ~10min), `verify-release.ts` (Tier 4, ~30min)
+- **6 eval domains** — idioms, allocator-discipline, error-sets, io-injection, build-system, fuzz-target
+
+Umbrella skill: @~/.agents/skills/zig-quality/SKILL.md
