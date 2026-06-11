@@ -9580,19 +9580,19 @@ test "execBlockMessage allows all commands when exec_security=full" {
     agent.exec_ask = .off;
 
     // Even high-risk commands should not be blocked by execBlockMessage
-    var args1: std.json.ObjectMap = .empty;
-    defer args1.deinit(allocator);
-    try args1.put(allocator, "command", .{ .string = "rm -rf /tmp/test" });
+    var args1 = std.json.ObjectMap.init(allocator);
+    defer args1.deinit();
+    try args1.put("command", .{ .string = "rm -rf /tmp/test" });
     try std.testing.expect(agent.execBlockMessage(args1) == null);
 
-    var args2: std.json.ObjectMap = .empty;
-    defer args2.deinit(allocator);
-    try args2.put(allocator, "command", .{ .string = "curl https://example.com" });
+    var args2 = std.json.ObjectMap.init(allocator);
+    defer args2.deinit();
+    try args2.put("command", .{ .string = "curl https://example.com" });
     try std.testing.expect(agent.execBlockMessage(args2) == null);
 
-    var args3: std.json.ObjectMap = .empty;
-    defer args3.deinit(allocator);
-    try args3.put(allocator, "command", .{ .string = "ls -la" });
+    var args3 = std.json.ObjectMap.init(allocator);
+    defer args3.deinit();
+    try args3.put("command", .{ .string = "ls -la" });
     try std.testing.expect(agent.execBlockMessage(args3) == null);
 }
 
@@ -9617,15 +9617,15 @@ test "execBlockMessage checks allowlist when exec_security=allowlist" {
     agent.policy = &policy;
 
     // Allowed command passes
-    var args1: std.json.ObjectMap = .empty;
-    defer args1.deinit(allocator);
-    try args1.put(allocator, "command", .{ .string = "ls -la" });
+    var args1 = std.json.ObjectMap.init(allocator);
+    defer args1.deinit();
+    try args1.put("command", .{ .string = "ls -la" });
     try std.testing.expect(agent.execBlockMessage(args1) == null);
 
     // Disallowed command is blocked
-    var args2: std.json.ObjectMap = .empty;
-    defer args2.deinit(allocator);
-    try args2.put(allocator, "command", .{ .string = "curl https://example.com" });
+    var args2 = std.json.ObjectMap.init(allocator);
+    defer args2.deinit();
+    try args2.put("command", .{ .string = "curl https://example.com" });
     try std.testing.expect(agent.execBlockMessage(args2) != null);
 }
 
@@ -9663,9 +9663,9 @@ test "execBlockMessage allowlist mode honors wildcard allowed_commands" {
 
     // Command outside default allowlist should pass with wildcard policy.
     agent.policy = &open_policy;
-    var args: std.json.ObjectMap = .empty;
-    defer args.deinit(allocator);
-    try args.put(allocator, "command", .{ .string = "python3 script.py" });
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("command", .{ .string = "python3 script.py" });
     try std.testing.expect(agent.execBlockMessage(args) == null);
 
     // Same command should be blocked under restrictive allowlist.

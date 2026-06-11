@@ -776,9 +776,9 @@ fn primaryModelProviderObjectJson(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var model_obj: std.json.ObjectMap = .empty;
-    try model_obj.put(arena.allocator(), "provider", .{ .string = provider });
-    try model_obj.put(arena.allocator(), "primary", .{ .string = model });
+    var model_obj = std.json.ObjectMap.init(arena.allocator());
+    try model_obj.put("provider", .{ .string = provider });
+    try model_obj.put("primary", .{ .string = model });
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
 }
 
@@ -3927,8 +3927,8 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var args: std.json.ObjectMap = .empty;
-    try args.put(arena, "command", .{ .string = command });
+    var args = std.json.ObjectMap.init(arena);
+    try args.put("command", .{ .string = command });
 
     const result = shell_tool.execute(arena, args) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Bash failed: {s}", .{@errorName(err)});
@@ -4624,9 +4624,9 @@ fn hotReloadValueJson(
         if (config_module.shouldSerializeDefaultModelProviderField(cfg.default_provider)) {
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
-            var model_obj: std.json.ObjectMap = .empty;
-            try model_obj.put(arena.allocator(), "provider", .{ .string = cfg.default_provider });
-            try model_obj.put(arena.allocator(), "primary", .{ .string = model });
+            var model_obj = std.json.ObjectMap.init(arena.allocator());
+            try model_obj.put("provider", .{ .string = cfg.default_provider });
+            try model_obj.put("primary", .{ .string = model });
             return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
         }
 

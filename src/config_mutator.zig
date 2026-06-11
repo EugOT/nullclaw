@@ -137,11 +137,10 @@ fn parseValueInput(allocator: std.mem.Allocator, raw_input: []const u8) !std.jso
 }
 
 fn ensureObject(value: *std.json.Value, allocator: std.mem.Allocator) *std.json.ObjectMap {
-    _ = allocator;
     switch (value.*) {
         .object => |*obj| return obj,
         else => {
-            value.* = .{ .object = .empty };
+            value.* = .{ .object = std.json.ObjectMap.init(allocator) };
             return &value.object;
         },
     }
@@ -200,7 +199,7 @@ fn setAtPath(
         }
 
         const key_copy = try allocator.dupe(u8, token);
-        try obj.put(allocator, key_copy, .{ .object = .empty });
+        try obj.put(key_copy, .{ .object = std.json.ObjectMap.init(allocator) });
         current = obj.getPtr(token).?;
     }
 
@@ -212,7 +211,7 @@ fn setAtPath(
     }
 
     const key_copy = try allocator.dupe(u8, last);
-    try obj.put(allocator, key_copy, value);
+    try obj.put(key_copy, value);
 }
 
 fn setPrimaryModelPathValue(
@@ -381,7 +380,7 @@ pub fn findPathValueJson(allocator: std.mem.Allocator, path: []const u8) !?[]u8 
 
     var root = parsed.value;
     if (root != .object) {
-        root = .{ .object = .empty };
+        root = .{ .object = std.json.ObjectMap.init(a) };
     }
 
     const tokens = try splitPathTokens(a, path);
@@ -429,7 +428,7 @@ pub fn mutateDefaultConfig(
     const parsed = std.json.parseFromSlice(std.json.Value, a, current.content, .{}) catch return error.InvalidJson;
     var root = parsed.value;
     if (root != .object) {
-        root = .{ .object = .empty };
+        root = .{ .object = std.json.ObjectMap.init(a) };
     }
 
     const tokens = try splitPathTokens(a, trimmed_path);
@@ -519,7 +518,7 @@ test "setAtPath creates nested objects and stores value" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var root = std.json.Value{ .object = .empty };
+    var root = std.json.Value{ .object = std.json.ObjectMap.init(a) };
     const tokens = [_][]const u8{ "memory", "backend" };
     const value = std.json.Value{ .string = try a.dupe(u8, "sqlite") };
 
@@ -535,7 +534,7 @@ test "unsetAtPath removes existing key" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var root = std.json.Value{ .object = .empty };
+    var root = std.json.Value{ .object = std.json.ObjectMap.init(a) };
     const tokens = [_][]const u8{ "gateway", "port" };
     try setAtPath(&root, a, &tokens, .{ .integer = 3000 });
 
@@ -572,7 +571,7 @@ test "setPrimaryModelPathValue stores split provider field for versionless custo
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var root = std.json.Value{ .object = .empty };
+    var root = std.json.Value{ .object = std.json.ObjectMap.init(a) };
 
     try setPrimaryModelPathValue(&root, a, "custom:https://gateway.example.com/api/qianfan/custom-model");
 
