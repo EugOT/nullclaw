@@ -776,9 +776,10 @@ fn primaryModelProviderObjectJson(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var model_obj: std.json.ObjectMap = .empty;
-    try model_obj.put(arena.allocator(), "provider", .{ .string = provider });
-    try model_obj.put(arena.allocator(), "primary", .{ .string = model });
+    const arena_allocator = arena.allocator();
+    var model_obj = std.json.ObjectMap.empty;
+    try model_obj.put(arena_allocator, "provider", .{ .string = provider });
+    try model_obj.put(arena_allocator, "primary", .{ .string = model });
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
 }
 
@@ -3891,6 +3892,22 @@ fn parseApproveDecision(raw: []const u8) ?enum { allow_once, allow_always, deny 
     return null;
 }
 
+fn buildShellCommandArgs(allocator: std.mem.Allocator, command: []const u8) !std.json.ObjectMap {
+    var args = std.json.ObjectMap.empty;
+    errdefer args.deinit(allocator);
+    try args.put(allocator, "command", .{ .string = command });
+    return args;
+}
+
+test "buildShellCommandArgs stores command string" {
+    var args = try buildShellCommandArgs(std.testing.allocator, "echo hello");
+    defer args.deinit(std.testing.allocator);
+
+    const command_value = args.get("command") orelse return error.TestExpectedEqual;
+    try std.testing.expect(command_value == .string);
+    try std.testing.expectEqualStrings("echo hello", command_value.string);
+}
+
 fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool) ![]const u8 {
     if (self.exec_host == .node) {
         return try self.allocator.dupe(u8, "Exec blocked: host=node is not available in this runtime");
@@ -3927,8 +3944,7 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var args: std.json.ObjectMap = .empty;
-    try args.put(arena, "command", .{ .string = command });
+    const args = try buildShellCommandArgs(arena, command);
 
     const result = shell_tool.execute(arena, args) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Bash failed: {s}", .{@errorName(err)});
@@ -4624,9 +4640,10 @@ fn hotReloadValueJson(
         if (config_module.shouldSerializeDefaultModelProviderField(cfg.default_provider)) {
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
-            var model_obj: std.json.ObjectMap = .empty;
-            try model_obj.put(arena.allocator(), "provider", .{ .string = cfg.default_provider });
-            try model_obj.put(arena.allocator(), "primary", .{ .string = model });
+            const arena_allocator = arena.allocator();
+            var model_obj = std.json.ObjectMap.empty;
+            try model_obj.put(arena_allocator, "provider", .{ .string = cfg.default_provider });
+            try model_obj.put(arena_allocator, "primary", .{ .string = model });
             return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
         }
 

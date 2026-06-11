@@ -343,7 +343,7 @@ fn normalizeWizardAccountObject(
     allocator: std.mem.Allocator,
     raw_obj: std.json.ObjectMap,
 ) anyerror!std.json.ObjectMap {
-    var normalized: std.json.ObjectMap = .empty;
+    var normalized = std.json.ObjectMap.empty;
 
     var it = raw_obj.iterator();
     while (it.next()) |entry| {
@@ -368,7 +368,7 @@ fn addAccountsChannelValue(
         break :blk raw_channel_obj;
     };
 
-    var accounts_obj: std.json.ObjectMap = .empty;
+    var accounts_obj = std.json.ObjectMap.empty;
     var acc_it = accounts_source.iterator();
     while (acc_it.next()) |acc_entry| {
         const account_name = acc_entry.key_ptr.*;
@@ -379,7 +379,7 @@ fn addAccountsChannelValue(
 
     if (accounts_obj.count() == 0) return;
 
-    var wrapper: std.json.ObjectMap = .empty;
+    var wrapper = std.json.ObjectMap.empty;
     try wrapper.put(allocator, "accounts", .{ .object = accounts_obj });
     try channels_obj.put(allocator, channel_type, .{ .object = wrapper });
 }
@@ -416,7 +416,7 @@ fn addSingleChannelValue(
 }
 
 fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void {
-    var channels_obj: std.json.ObjectMap = .empty;
+    var channels_obj = std.json.ObjectMap.empty;
 
     var ch_it = raw_channels.iterator();
     while (ch_it.next()) |ch_entry| {
@@ -440,7 +440,7 @@ fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void
         }
     }
 
-    var root_obj: std.json.ObjectMap = .empty;
+    var root_obj = std.json.ObjectMap.empty;
     try root_obj.put(cfg.allocator, "channels", .{ .object = channels_obj });
     const root_value: std.json.Value = .{ .object = root_obj };
     const patch_json = try std.json.Stringify.valueAlloc(cfg.allocator, root_value, .{});

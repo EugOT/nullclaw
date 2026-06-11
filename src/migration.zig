@@ -275,7 +275,7 @@ fn normalizeJsonValueKeys(allocator: std.mem.Allocator, value: std.json.Value) !
             break :blk .{ .array = out };
         },
         .object => blk: {
-            var out: std.json.ObjectMap = .empty;
+            var out = std.json.ObjectMap.empty;
             var it = value.object.iterator();
             while (it.next()) |entry| {
                 const key = try camelToSnakeKey(allocator, entry.key_ptr.*);

@@ -66,11 +66,9 @@ fn normalizeToolName(name: []const u8) []const u8 {
 }
 
 fn extractToolNameAndArgs(
-    allocator: std.mem.Allocator,
     name: []const u8,
     arguments: std.json.Value,
 ) struct { name: []const u8, args: std.json.Value } {
-    _ = allocator;
     const stripped_name = stripToolPrefixes(name);
 
     // Pattern 1: Nested tool_call wrapper
@@ -111,7 +109,7 @@ fn formatToolCallsForLoop(
     for (tool_calls, 0..) |tc, i| {
         if (i > 0) try result.append(allocator, ',');
 
-        const extracted = extractToolNameAndArgs(allocator, tc.function.name, tc.function.arguments);
+        const extracted = extractToolNameAndArgs(tc.function.name, tc.function.arguments);
 
         // Serialize arguments to string
         const args_str = if (extracted.args == .null)
@@ -573,32 +571,32 @@ test "buildAuthHeaders errors when api_key exceeds header buffer" {
 // ─── Tool Call Tests ─────────────────────────────────────────────────────────
 
 test "extractToolNameAndArgs with normal name" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "shell", .null);
+    const result = extractToolNameAndArgs("shell", .null);
     try std.testing.expectEqualStrings("shell", result.name);
 }
 
 test "extractToolNameAndArgs with tool. prefix" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.shell", .null);
+    const result = extractToolNameAndArgs("tool.shell", .null);
     try std.testing.expectEqualStrings("shell", result.name);
 }
 
 test "extractToolNameAndArgs with tools. prefix" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "tools.file_read", .null);
+    const result = extractToolNameAndArgs("tools.file_read", .null);
     try std.testing.expectEqualStrings("file_read", result.name);
 }
 
 test "extractToolNameAndArgs normalizes scheduler_tool alias" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "scheduler_tool", .null);
+    const result = extractToolNameAndArgs("scheduler_tool", .null);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
 test "extractToolNameAndArgs normalizes schedule_tool alias" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "schedule_tool", .null);
+    const result = extractToolNameAndArgs("schedule_tool", .null);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
 test "extractToolNameAndArgs normalizes prefixed schedule alias" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.schedule_tool", .null);
+    const result = extractToolNameAndArgs("tool.schedule_tool", .null);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
@@ -761,7 +759,7 @@ test "extractToolNameAndArgs with nested tool_call wrapper" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool_call", parsed.value);
+    const result = extractToolNameAndArgs("tool_call", parsed.value);
     try std.testing.expectEqualStrings("shell", result.name);
     // The inner arguments should contain "command"
     try std.testing.expect(result.args == .object);
@@ -777,7 +775,7 @@ test "extractToolNameAndArgs with tool.call wrapper" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.call", parsed.value);
+    const result = extractToolNameAndArgs("tool.call", parsed.value);
     try std.testing.expectEqualStrings("file_read", result.name);
 }
 
@@ -789,7 +787,7 @@ test "extractToolNameAndArgs with tool.call wrapper normalizes scheduler alias" 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.call", parsed.value);
+    const result = extractToolNameAndArgs("tool.call", parsed.value);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
@@ -801,7 +799,7 @@ test "extractToolNameAndArgs with prefixed tool_call wrapper normalizes schedule
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.tool_call", parsed.value);
+    const result = extractToolNameAndArgs("tool.tool_call", parsed.value);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
@@ -835,6 +833,29 @@ test "formatToolCallsForLoop with single tool call" {
 
     // Check ID
     try std.testing.expectEqualStrings("call_abc", tool_calls.items[0].object.get("id").?.string);
+}
+
+test "formatToolCallsForLoop wrapped tool_call missing arguments uses empty object" {
+    const alloc = std.testing.allocator;
+    // Regression: wrapped tool_call payloads with no nested arguments must
+    // serialize downstream as an empty JSON object, not null.
+    const json_str =
+        \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"shell"}}}]}}
+    ;
+    const parsed = try std.json.parseFromSlice(OllamaChatResponse, alloc, json_str, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const result = try formatToolCallsForLoop(alloc, parsed.value.message);
+    defer alloc.free(result);
+
+    const verify = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer verify.deinit();
+    const tool_calls = verify.value.object.get("tool_calls").?.array;
+    const func = tool_calls.items[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings("shell", func.get("name").?.string);
+    try std.testing.expectEqualStrings("{}", func.get("arguments").?.string);
 }
 
 test "formatToolCallsForLoop with no tool calls returns content" {

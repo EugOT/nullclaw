@@ -120,7 +120,7 @@ pub const SchemaCleanr = struct {
         const root = parsed.value;
 
         // Extract $defs for reference resolution
-        var defs = extractDefs(arena_alloc, root);
+        var defs = extractDefs(root);
 
         // Track visited refs for circular detection
         var ref_stack = std.StringHashMap(void).init(arena_alloc);
@@ -155,8 +155,7 @@ fn isUnsupported(keyword: []const u8, strategy: CleaningStrategy) bool {
 }
 
 /// Extract `$defs` and `definitions` from a root schema value.
-fn extractDefs(allocator: std.mem.Allocator, root: std.json.Value) std.json.ObjectMap {
-    _ = allocator;
+fn extractDefs(root: std.json.Value) std.json.ObjectMap {
     if (root != .object) {
         // Return an empty map — won't be used, just need a valid value.
         return .empty;
@@ -226,7 +225,7 @@ fn cleanObject(
     const has_union = obj.contains("anyOf") or obj.contains("oneOf");
 
     // Build cleaned object
-    var cleaned: std.json.ObjectMap = .empty;
+    var cleaned = std.json.ObjectMap.empty;
 
     var it = obj.iterator();
     while (it.next()) |entry| {
@@ -426,7 +425,7 @@ fn tryFlattenLiteralUnion(allocator: std.mem.Allocator, variants: []const std.js
 
     const ct = common_type orelse return null;
 
-    var result: std.json.ObjectMap = .empty;
+    var result = std.json.ObjectMap.empty;
     result.put(allocator, "type", .{ .string = ct }) catch return null;
     var enum_arr = std.json.Array.init(allocator);
     enum_arr.ensureTotalCapacity(all_values.items.len) catch return null;
@@ -466,7 +465,7 @@ fn cleanProperties(
     ref_stack: *std.StringHashMap(void),
 ) CleanError!std.json.Value {
     if (value != .object) return value;
-    var cleaned: std.json.ObjectMap = .empty;
+    var cleaned = std.json.ObjectMap.empty;
     var it = value.object.iterator();
     while (it.next()) |entry| {
         const k = entry.key_ptr.*;

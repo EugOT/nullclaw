@@ -20,7 +20,7 @@ include pure computation.
 
 ```zig
 // Good — I/O explicit
-pub fn readConfig(io: std.Io, dir: std.Io.Dir, path: []const u8) !Config {
+pub fn readConfig(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir, path: []const u8) !Config {
     var file = try dir.openFile(io, path, .{});
     defer file.close(io);
     const bytes = try file.readAllAlloc(io, gpa, 1 << 20);
@@ -55,7 +55,8 @@ test "parseConfig is pure" {
 }
 
 test "readConfig on failing Io" {
-    const cfg = readConfig(.failing, some_dir, "x.toml");
+    const gpa = std.testing.allocator;
+    const cfg = readConfig(.failing, gpa, some_dir, "x.toml");
     try std.testing.expectError(error.Unexpected, cfg);
 }
 ```

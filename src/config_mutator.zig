@@ -136,8 +136,7 @@ fn parseValueInput(allocator: std.mem.Allocator, raw_input: []const u8) !std.jso
     return parsed.value;
 }
 
-fn ensureObject(value: *std.json.Value, allocator: std.mem.Allocator) *std.json.ObjectMap {
-    _ = allocator;
+fn ensureObject(value: *std.json.Value) *std.json.ObjectMap {
     switch (value.*) {
         .object => |*obj| return obj,
         else => {
@@ -193,7 +192,7 @@ fn setAtPath(
     if (tokens.len == 0) return;
 
     for (tokens[0 .. tokens.len - 1]) |token| {
-        const obj = ensureObject(current, allocator);
+        const obj = ensureObject(current);
         if (obj.getPtr(token)) |next| {
             current = next;
             continue;
@@ -205,7 +204,7 @@ fn setAtPath(
     }
 
     const last = tokens[tokens.len - 1];
-    const obj = ensureObject(current, allocator);
+    const obj = ensureObject(current);
     if (obj.getPtr(last)) |slot| {
         slot.* = value;
         return;
