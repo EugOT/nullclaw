@@ -3,7 +3,7 @@ name: zig-api-drift
 description: Walks std.zig.Ast and diffs the public surface against
   the baseline. Use when a PR touches pub declarations or when a
   semver decision is pending. Read-only.
-tools: Read, Grep, Bash(bun scripts/check-public-api.ts:*), Bash(mise x zig@0.16.0:*), Bash(jj:*), Bash(git diff:*)
+tools: Read, Grep, Bash(bun scripts/check-public-api.ts:*), Bash(mise x zig@0.16.0:*), Bash(jj diff:*), Bash(jj log:*), Bash(jj show:*), Bash(jj status:*), Bash(git diff:*)
 model: haiku
 ---
 

@@ -44,7 +44,15 @@ async function extractSurface(root: string, rootFile: string): Promise<string> {
 	// (CodeRabbit finding).
 	if (await Bun.file(scriptPath).exists()) {
 		const r = zig(["run", "scripts/zig-api-surface.zig", "--", abs]);
-		if (r.code === 0) return r.stdout.trimEnd();
+		if (r.code !== 0) {
+			// The authoritative extractor exists but failed — fail closed
+			// instead of silently downgrading to the looser grep fallback
+			// (CodeRabbit finding).
+			throw new Error(
+				`zig-api-surface.zig failed (exit ${r.code})\nstdout:\n${r.stdout}\nstderr:\n${r.stderr}`,
+			);
+		}
+		return r.stdout.trimEnd();
 	}
 	// Fallback: grep-and-sed. Matches lines like:
 	//   pub const Foo = ...

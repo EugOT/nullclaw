@@ -1,8 +1,8 @@
 # TIGER_STYLE_ZIG — Zig 0.16 quality discipline
 
 This is the canonical style and discipline guide for Zig code in this
-template. It is opinionated. The rules are enforced by the verifier,
-the fixer, and the fitness engine; they are **not** suggestions.
+template. It is opinionated. The rules are enforced by verify gates,
+hook checks, and the fitness engine; they are **not** suggestions.
 
 The name echoes TigerStyle (TigerBeetle). The spirit is the same:
 assertions as a first-class engineering tool, correctness before
@@ -113,7 +113,7 @@ isolation.
 | `std.heap.GeneralPurposeAllocator(.{}){}`   | `std.heap.DebugAllocator(.{})`                              |
 | `std.mem.Allocator{}`                       | Always propagate, never construct                          |
 | `fs.File.reader()`                          | `fs.File.deprecatedReader()` in transitional code          |
-| `std.process.argsAlloc(alloc)`              | `std.process.argsAlloc(alloc)` (unchanged, `os.argv` gone) |
+| `std.process.argsAlloc(alloc)`              | Removed; use `init.args` (Juicy Main) or `std.process.argsWithAllocator(alloc)` |
 | `std.BoundedArray`                          | Removed in **0.15.1** (still gone in 0.16); roll your own  |
 | `std.LinearFifo`                            | Removed in **0.15.1** (still gone in 0.16); use `std.fifo` |
 | `b.addExecutable(.{ .root_source_file = f })` | `b.addExecutable(.{ .root_module = m })`                 |
@@ -321,9 +321,8 @@ silent on questions where reasonable projects differ:
 | Reproducible release build              | `scripts/verify-release.ts`       | Per-release |
 | SBOM generation                         | `scripts/emit-sbom.zig`           | Per-release |
 
-When a rule fails, the verifier reports the specific fitness rule id,
-the file and line, and the canonical fix. The `zig-fixer` subagent
-knows the deterministic fix for every rule in the table above.
+When a rule fails, the verify/reporting path reports the specific
+fitness rule id, the file and line, and the canonical fix.
 
 ## 13. Reading order for new contributors
 

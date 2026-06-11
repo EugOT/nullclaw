@@ -132,7 +132,16 @@ fn scanFile(
 
     var ast = try std.zig.Ast.parse(gpa, source_z, .zig);
     defer ast.deinit(gpa);
-    if (ast.errors.len > 0) return 0;
+    if (ast.errors.len > 0) {
+        // Fail closed: a malformed file must not bypass the fitness gate.
+        try emit(w, gpa, .{
+            .file = path,
+            .kind = "parse-error",
+            .line = 1,
+            .message = "source contains syntax errors; fitness check cannot safely continue",
+        });
+        return 1;
+    }
 
     const base = std.fs.path.basename(path);
     const allow_top_var = std.mem.eql(u8, base, "main.zig") or std.mem.eql(u8, base, "build.zig");
@@ -160,14 +169,22 @@ fn scanFile(
             },
             .fn_decl => {
                 if (!isPubFn(token_tags, main_tokens[@intFromEnum(decl_idx)])) continue;
-                const span = ast.nodeToSpan(decl_idx);
-                const body = source[span.start..span.end];
+                // `nodeToSpan` is an error-reporting helper that collapses
+                // multi-line nodes to the main-token line; `getNodeSource`
+                // is the API that returns the full decl text.
+                const body = ast.getNodeSource(decl_idx);
+                const decl_start = ast.tokenStart(ast.firstToken(decl_idx));
+                // Parameter-presence checks must look at the signature only;
+                // scanning the whole body lets local annotations mask a
+                // missing public parameter (CodeRabbit finding).
+                const signature_end = std.mem.indexOfScalar(u8, body, '{') orelse body.len;
+                const signature = body[0..signature_end];
                 const name_tok = findFnNameToken(ast, decl_idx) orelse continue;
                 const name = ast.tokenSlice(name_tok);
-                const line = lineOf(source, span.start);
+                const line = lineOf(source, decl_start);
 
                 const allocates = containsAny(body, &.{ ".alloc(", ".create(", ".destroy(", ".free(", "allocPrint(", ".dupe(" });
-                const has_alloc_param = containsAny(body, &.{ "std.mem.Allocator", ": Allocator", ":Allocator" });
+                const has_alloc_param = containsAny(signature, &.{ "std.mem.Allocator", ": Allocator", ":Allocator" });
                 if (allocates and !has_alloc_param) {
                     try emitFmt(w, gpa, .{
                         .file = path,
@@ -186,7 +203,7 @@ fn scanFile(
                     "std.Io.File",
                     "std.fs.cwd",
                 });
-                const has_io_param = containsAny(body, &.{ ": std.Io", ":std.Io", ": Io", ":Io" });
+                const has_io_param = containsAny(signature, &.{ ": std.Io", ":std.Io", ": Io", ":Io" });
                 if (touches_io and !has_io_param) {
                     try emitFmt(w, gpa, .{
                         .file = path,

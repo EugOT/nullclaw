@@ -99,14 +99,16 @@ policy without re-reading 52 source markdown files.
 Three narrow subagents earn their isolation. The main agent handles
 sequential execution by default.
 
-| Subagent        | Model    | Role                                      | Tools narrow to              |
-|-----------------|----------|-------------------------------------------|------------------------------|
-| `zig-verifier`  | sonnet   | Read-only quality verifier                | verify-fast, verify-commit   |
-| `zig-fixer`     | sonnet   | Isolated, bounded-scope fixer             | edit + verify-fast           |
-| `zig-api-drift` | haiku    | Public-surface diff against baseline      | check-public-api.ts          |
+| Subagent               | Model  | Role                                            | Tools narrow to                          |
+|------------------------|--------|-------------------------------------------------|------------------------------------------|
+| `zig-api-drift`        | haiku  | Public-surface diff against baseline (read-only)| check-public-api.ts, read-only jj/git    |
+| `zig-fuzzer`           | sonnet | Bounded fuzz campaigns, explicit degradations   | verify-pr.ts, read-only jj/git           |
+| `zig-release-engineer` | opus   | Release gate, reproducibility, SBOM, signing    | verify-release.ts, cosign, syft          |
 
-Each subagent definition is in `.claude/agents/<name>.md` with a tool
-whitelist. None of them own commit authority; the main agent commits.
+Each subagent definition is in `.claude/agents/<name>.md`
+(`zig-api-drift.md`, `zig-fuzzer.md`, `zig-release-engineer.md`) with a
+tool whitelist. None of them own commit authority; the main agent
+commits.
 
 ## 5. Hook flow
 
