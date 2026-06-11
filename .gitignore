@@ -4,6 +4,8 @@ zig-cache/
 zig-pkg/
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 .DS_Store
 .env
 .env.*
@@ -30,3 +32,7 @@ config.signal.json
 # Allow agent toolkit (override user-global ~/.config/git/ignore)
 !.claude/
 !.claude/**
+
+# Keep runtime/personal Claude state ignored even when toolkit files are tracked.
+.claude/logs/
+.claude/*.local.*
