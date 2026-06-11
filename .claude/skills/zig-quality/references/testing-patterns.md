@@ -61,7 +61,7 @@ claim enforceable.
 
 ## Per-test timeouts (new in 0.16)
 
-```
+```bash
 zig build test --test-timeout 30000
 ```
 
@@ -136,7 +136,7 @@ test "diff: our parser matches reference-json" {
 
 ## Structure
 
-```
+```text
 src/
   parse.zig
   render.zig
@@ -184,7 +184,7 @@ Where `tests/all.zig` is
 
 ## Run targeted subsets
 
-```
+```bash
 zig build test --test-filter "parse"
 zig build test --summary failures
 zig build test -ODebug

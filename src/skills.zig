@@ -2444,6 +2444,27 @@ fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     }
 }
 
+fn runGitTestCommit(allocator: std.mem.Allocator, repo: []const u8) !void {
+    // Regression: user/global Git config can require signed commits or run
+    // global hooks, which makes these throwaway repository tests nondeterministic.
+    try runCommand(allocator, &.{
+        "git",
+        "-C",
+        repo,
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--no-verify",
+        "--no-gpg-sign",
+        "-m",
+        "init",
+    });
+}
+
 test "parseManifest full JSON" {
     const json =
         \\{"name": "code-review", "version": "1.2.0", "description": "Automated code review", "author": "nullclaw"}
@@ -3756,7 +3777,7 @@ test "installSkillFromGit installs from local git repository" {
 
     try runCommand(allocator, &.{ "git", "-C", repo, "init" });
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skill.json", "SKILL.md" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommit(allocator, repo);
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
@@ -3794,7 +3815,7 @@ test "installSkillFromGit supports root markdown-only repository" {
 
     try runCommand(allocator, &.{ "git", "-C", repo, "init" });
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "SKILL.md" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommit(allocator, repo);
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
@@ -3841,7 +3862,7 @@ test "installSkillFromGit installs all skills from repository skills directory" 
 
     try runCommand(allocator, &.{ "git", "-C", repo, "init" });
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/http_request/SKILL.md", "skills/review/SKILL.md", "README.md" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommit(allocator, repo);
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
@@ -3898,7 +3919,7 @@ test "installSkillFromGit installs SKILL.toml entry from repository skills direc
 
     try runCommand(allocator, &.{ "git", "-C", repo, "init" });
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/toml_only/SKILL.toml" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommit(allocator, repo);
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
@@ -3944,7 +3965,7 @@ test "installSkillFromGit keeps clone directory name when manifest name differs"
 
     try runCommand(allocator, &.{ "git", "-C", repo, "init" });
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skill.json", "SKILL.md", "assets/payload.txt" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommit(allocator, repo);
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
@@ -4000,7 +4021,7 @@ test "installSkillFromGit continues installing when one skill fails" {
 
     try runCommand(allocator, &.{ "git", "-C", repo, "init" });
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/good_skill/SKILL.md", "skills/another_good/SKILL.md" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommit(allocator, repo);
 
     // Should succeed even though good_skill fails to install (already exists)
     try installSkillFromGit(allocator, repo, workspace, null);
@@ -4045,7 +4066,7 @@ test "installSkillFromGit returns SkillAlreadyExists when repository collection 
 
     try runCommand(allocator, &.{ "git", "-C", repo, "init" });
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/existing_skill/SKILL.md" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommit(allocator, repo);
 
     var install_error_detail: ?[]u8 = null;
     defer if (install_error_detail) |msg| allocator.free(msg);
@@ -4080,7 +4101,7 @@ test "installSkillFromGit preserves repository collection security failures" {
 
     try runCommand(allocator, &.{ "git", "-C", repo, "init" });
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/unsafe/SKILL.md" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommit(allocator, repo);
 
     var install_error_detail: ?[]u8 = null;
     defer if (install_error_detail) |msg| allocator.free(msg);
