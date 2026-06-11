@@ -30,3 +30,9 @@ config.signal.json
 # Allow agent toolkit (override user-global ~/.config/git/ignore)
 !.claude/
 !.claude/**
+
+# Keep runtime/personal Claude state ignored even when toolkit files are tracked.
+*.db-shm
+*.db-wal
+.claude/logs/
+.claude/*.local.*
