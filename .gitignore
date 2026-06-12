@@ -34,5 +34,7 @@ config.signal.json
 # Keep runtime/personal Claude state ignored even when toolkit files are tracked.
 *.db-shm
 *.db-wal
+.agents/
+.codex/
 .claude/logs/
 .claude/*.local.*
