@@ -9,6 +9,7 @@ const onboard = @import("onboard.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const config_mod = @import("config.zig");
 const config_paths = @import("config_paths.zig");
+const json_object_map = @import("json_object_map.zig");
 const Config = config_mod.Config;
 
 const WizardAnswers = struct {
@@ -92,12 +93,12 @@ fn applyConfigPatchFields(cfg: *Config, raw_parsed: ?std.json.Parsed(std.json.Va
     const rp = raw_parsed orelse return;
     if (rp.value != .object) return;
 
-    var root_obj: std.json.ObjectMap = .empty;
-    defer root_obj.deinit(cfg.allocator);
+    var root_obj = try json_object_map.init(cfg.allocator);
+    defer json_object_map.deinit(&root_obj, cfg.allocator);
     const patch_fields = [_][]const u8{ "gateway", "a2a", "tools", "memory" };
     for (patch_fields) |field| {
         const value = rp.value.object.get(field) orelse continue;
-        if (value == .object) try root_obj.put(cfg.allocator, field, value);
+        if (value == .object) try json_object_map.put(&root_obj, cfg.allocator, field, value);
     }
     if (root_obj.count() == 0) return;
 
@@ -335,7 +336,7 @@ fn putValueByDottedKey(
     value: std.json.Value,
 ) anyerror!void {
     if (std.mem.indexOfScalar(u8, dotted_key, '.') == null) {
-        try root_obj.put(allocator, dotted_key, value);
+        try json_object_map.put(root_obj, allocator, dotted_key, value);
         return;
     }
 
@@ -348,24 +349,24 @@ fn putValueByDottedKey(
     while (segments.next()) |next_segment| {
         if (current_obj.getPtr(segment)) |existing_ptr| {
             if (existing_ptr.* != .object) {
-                existing_ptr.* = .{ .object = .empty };
+                existing_ptr.* = .{ .object = try json_object_map.init(allocator) };
             }
         } else {
-            try current_obj.put(allocator, segment, .{ .object = .empty });
+            try json_object_map.put(current_obj, allocator, segment, .{ .object = try json_object_map.init(allocator) });
         }
 
         current_obj = &current_obj.getPtr(segment).?.object;
         segment = next_segment;
     }
 
-    try current_obj.put(allocator, segment, value);
+    try json_object_map.put(current_obj, allocator, segment, value);
 }
 
 fn normalizeWizardAccountObject(
     allocator: std.mem.Allocator,
     raw_obj: std.json.ObjectMap,
 ) anyerror!std.json.ObjectMap {
-    var normalized = std.json.ObjectMap.empty;
+    var normalized = try json_object_map.init(allocator);
 
     var it = raw_obj.iterator();
     while (it.next()) |entry| {
@@ -390,20 +391,20 @@ fn addAccountsChannelValue(
         break :blk raw_channel_obj;
     };
 
-    var accounts_obj = std.json.ObjectMap.empty;
+    var accounts_obj = try json_object_map.init(allocator);
     var acc_it = accounts_source.iterator();
     while (acc_it.next()) |acc_entry| {
         const account_name = acc_entry.key_ptr.*;
         if (acc_entry.value_ptr.* != .object) continue;
         const normalized = try normalizeWizardAccountObject(allocator, acc_entry.value_ptr.*.object);
-        try accounts_obj.put(allocator, account_name, .{ .object = normalized });
+        try json_object_map.put(&accounts_obj, allocator, account_name, .{ .object = normalized });
     }
 
     if (accounts_obj.count() == 0) return;
 
-    var wrapper = std.json.ObjectMap.empty;
-    try wrapper.put(allocator, "accounts", .{ .object = accounts_obj });
-    try channels_obj.put(allocator, channel_type, .{ .object = wrapper });
+    var wrapper = try json_object_map.init(allocator);
+    try json_object_map.put(&wrapper, allocator, "accounts", .{ .object = accounts_obj });
+    try json_object_map.put(channels_obj, allocator, channel_type, .{ .object = wrapper });
 }
 
 fn addSingleChannelValue(
@@ -434,11 +435,11 @@ fn addSingleChannelValue(
 
     if (candidate != .object) return;
     const normalized = try normalizeWizardAccountObject(allocator, candidate.object);
-    try channels_obj.put(allocator, channel_type, .{ .object = normalized });
+    try json_object_map.put(channels_obj, allocator, channel_type, .{ .object = normalized });
 }
 
 fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void {
-    var channels_obj = std.json.ObjectMap.empty;
+    var channels_obj = try json_object_map.init(cfg.allocator);
 
     var ch_it = raw_channels.iterator();
     while (ch_it.next()) |ch_entry| {
@@ -458,12 +459,12 @@ fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void
 
     if (channels_obj.getPtr("webhook")) |webhook_ptr| {
         if (webhook_ptr.* == .object and webhook_ptr.object.get("port") == null) {
-            try webhook_ptr.object.put(cfg.allocator, "port", .{ .integer = @as(i64, @intCast(cfg.gateway.port)) });
+            try json_object_map.put(&webhook_ptr.object, cfg.allocator, "port", .{ .integer = @as(i64, @intCast(cfg.gateway.port)) });
         }
     }
 
-    var root_obj = std.json.ObjectMap.empty;
-    try root_obj.put(cfg.allocator, "channels", .{ .object = channels_obj });
+    var root_obj = try json_object_map.init(cfg.allocator);
+    try json_object_map.put(&root_obj, cfg.allocator, "channels", .{ .object = channels_obj });
     const root_value: std.json.Value = .{ .object = root_obj };
     const patch_json = try std.json.Stringify.valueAlloc(cfg.allocator, root_value, .{});
     defer cfg.allocator.free(patch_json);

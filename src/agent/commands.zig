@@ -21,6 +21,7 @@ const model_refs = @import("../model_refs.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
+const json_object_map = @import("../json_object_map.zig");
 const util = @import("../util.zig");
 const cost_mod = @import("../cost.zig");
 const log = std.log.scoped(.agent);
@@ -796,9 +797,9 @@ fn primaryModelProviderObjectJson(
     defer arena.deinit();
 
     const arena_allocator = arena.allocator();
-    var model_obj = std.json.ObjectMap.empty;
-    try model_obj.put(arena_allocator, "provider", .{ .string = provider });
-    try model_obj.put(arena_allocator, "primary", .{ .string = model });
+    var model_obj = try json_object_map.init(arena_allocator);
+    try json_object_map.put(&model_obj, arena_allocator, "provider", .{ .string = provider });
+    try json_object_map.put(&model_obj, arena_allocator, "primary", .{ .string = model });
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
 }
 
@@ -4067,15 +4068,15 @@ fn parseApproveDecision(raw: []const u8) ?enum { allow_once, allow_always, deny 
 }
 
 fn buildShellCommandArgs(allocator: std.mem.Allocator, command: []const u8) !std.json.ObjectMap {
-    var args = std.json.ObjectMap.empty;
-    errdefer args.deinit(allocator);
-    try args.put(allocator, "command", .{ .string = command });
+    var args = try json_object_map.init(allocator);
+    errdefer json_object_map.deinit(&args, allocator);
+    try json_object_map.put(&args, allocator, "command", .{ .string = command });
     return args;
 }
 
 test "buildShellCommandArgs stores command string" {
     var args = try buildShellCommandArgs(std.testing.allocator, "echo hello");
-    defer args.deinit(std.testing.allocator);
+    defer json_object_map.deinit(&args, std.testing.allocator);
 
     const command_value = args.get("command") orelse return error.TestExpectedEqual;
     try std.testing.expect(command_value == .string);
@@ -4860,9 +4861,9 @@ fn hotReloadValueJson(
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
             const arena_allocator = arena.allocator();
-            var model_obj = std.json.ObjectMap.empty;
-            try model_obj.put(arena_allocator, "provider", .{ .string = cfg.default_provider });
-            try model_obj.put(arena_allocator, "primary", .{ .string = model });
+            var model_obj = try json_object_map.init(arena_allocator);
+            try json_object_map.put(&model_obj, arena_allocator, "provider", .{ .string = cfg.default_provider });
+            try json_object_map.put(&model_obj, arena_allocator, "primary", .{ .string = model });
             return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
         }
 

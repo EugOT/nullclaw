@@ -4860,7 +4860,21 @@ test "installSkillFromGit installs nested repository skills directory entries" {
 
     try runCommand(allocator, &.{ "git", "-C", repo, "init" });
     try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runCommand(allocator, &.{
+        "git",
+        "-C",
+        repo,
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--no-gpg-sign",
+        "-m",
+        "test: init",
+    });
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
