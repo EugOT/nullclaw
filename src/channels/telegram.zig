@@ -2198,10 +2198,25 @@ pub const TelegramChannel = struct {
     }
 
     fn resolveMessageContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
-        return self.resolveVoiceOrAudioContent(allocator, message) orelse
+        const base = self.resolveVoiceOrAudioContent(allocator, message) orelse
             self.resolvePhotoContent(allocator, message) orelse
             self.resolveDocumentContent(allocator, message) orelse
             telegram_update_ingress.textOrCaption(allocator, message);
+
+        const base_content = base orelse return null;
+
+        // Telegram replies arrive with the original message in `reply_to_message`.
+        // Prepending it to the inbound payload gives the agent the conversational
+        // context the user clearly expected to be visible (issue #916).
+        const reply_text = telegram_update_ingress.replyToText(message) orelse return base_content;
+
+        const enriched = telegram_update_ingress.contentWithReplyContext(
+            allocator,
+            base_content,
+            reply_text,
+        ) catch return base_content;
+        allocator.free(base_content);
+        return enriched;
     }
 
     fn appendIncomingMessage(
@@ -2906,11 +2921,20 @@ pub const TelegramChannel = struct {
         // Clean up buffered media group messages to prevent shutdown leaks.
         self.resetPendingMediaBuffers();
         self.resetPendingTextBuffers();
+        // Reset to .empty after deinit so a second stop() (e.g. supervisor
+        // restart on .gateway_loop transitions, or test harnesses) does not
+        // call deinit on an undefined ArrayListUnmanaged. Same pattern as
+        // SignalChannel.vtableStop and TelegramChannel.deinitDraftBuffers.
         self.pending_media_messages.deinit(self.allocator);
+        self.pending_media_messages = .empty;
         self.pending_media_group_ids.deinit(self.allocator);
+        self.pending_media_group_ids = .empty;
         self.pending_media_received_at.deinit(self.allocator);
+        self.pending_media_received_at = .empty;
         self.pending_text_messages.deinit(self.allocator);
+        self.pending_text_messages = .empty;
         self.pending_text_received_at.deinit(self.allocator);
+        self.pending_text_received_at = .empty;
         if (self.bot_username) |name| {
             self.allocator.free(name);
             self.bot_username = null;
@@ -5001,6 +5025,49 @@ test "telegram processUpdate falls back to caption when text is absent" {
     try std.testing.expectEqualStrings("caption-only fallback", messages.items[0].content);
 }
 
+test "telegram processUpdate includes reply context in message content" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{
+        \\  "update_id": 1,
+        \\  "message": {
+        \\    "message_id": 42,
+        \\    "from": {"id": 1001, "username": "tester", "first_name": "Test"},
+        \\    "chat": {"id": 2002, "type": "private"},
+        \\    "reply_to_message": {"message_id": 41, "text": "Here are the results"},
+        \\    "text": "show me more"
+        \\  }
+        \\}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        messages.deinit(alloc);
+    }
+    var media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (media_group_ids.items) |mg| if (mg) |s| alloc.free(s);
+        media_group_ids.deinit(alloc);
+    }
+
+    ch.processUpdate(alloc, parsed.value, &messages, &media_group_ids);
+
+    // Regression: Telegram replies must carry the replied-to text into the agent input.
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqualStrings("[Replying to \"Here are the results\"] show me more", messages.items[0].content);
+}
+
 test "telegram nextPendingMediaDeadline returns earliest group deadline" {
     const group_ids = [_]?[]const u8{
         "group-a",
@@ -5867,4 +5934,39 @@ test "makeSink returns null for topic targets" {
 test "createForumTopicFromTarget rejects empty name" {
     var ch = TelegramChannel.init(std.testing.allocator, "test-token", &.{}, &.{}, "allowlist");
     try std.testing.expectError(error.InvalidTopicName, ch.createForumTopicFromTarget("-100123#topic:77", "   "));
+}
+
+test "TelegramChannel create + healthCheck + stop leaks zero bytes" {
+    // TelegramChannel holds no heap allocations at init-time (all fields are
+    // slices into caller-owned config data).  No deinit needed.
+    var ch_struct = TelegramChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-token",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "TelegramChannel double stop is safe" {
+    // Regression: TelegramChannel.vtableStop used to deinit pending_media_messages,
+    // pending_media_group_ids, pending_media_received_at, pending_text_messages,
+    // and pending_text_received_at WITHOUT resetting them to .empty.
+    // ArrayListUnmanaged.deinit sets self.* = undefined, so a second
+    // vtableStop() call would deinit undefined memory — the same latent UB
+    // SignalChannel had before its own .empty fix (signal.zig:1356).
+    //
+    // Unlike Signal, Telegram is .listener_mode = .polling so the supervisor
+    // does not double-call vtableStop today, but a refactor that promotes
+    // Telegram to .gateway_loop or a test harness that exercises stop+stop
+    // would trigger the bug. This test pins the idempotent-stop contract
+    // alongside the fix.
+    var ch_struct = TelegramChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-token",
+    });
+
+    const ch = ch_struct.channel();
+    ch.stop();
+    // Second stop must be a no-op, not a deinit-on-undefined.
+    ch.stop();
 }

@@ -83,6 +83,9 @@ const compat_providers = [_]CompatProvider{
 
     // ── Gateways & Aggregators ────────────────────────────────────────────
     .{ .name = "venice", .url = "https://api.venice.ai", .display = "Venice" },
+    .{ .name = "nearai", .url = "https://cloud-api.near.ai/v1", .display = "NEAR AI Cloud" },
+    .{ .name = "atlas-cloud", .url = "https://api.atlascloud.ai/v1", .display = "Atlas Cloud" },
+    .{ .name = "evolink", .url = "https://direct.evolink.ai/v1", .display = "Evolink" },
     .{ .name = "vercel", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "vercel-ai", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "together", .url = "https://api.together.xyz", .display = "Together AI" },
@@ -517,6 +520,57 @@ pub const ProviderHolder = union(enum) {
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
+const ProviderHolderTag = std.meta.Tag(ProviderHolder);
+
+const ProviderHolderCase = struct {
+    name: []const u8,
+    expected_name_substr: []const u8,
+    expected_tag: ProviderHolderTag,
+    base_url: ?[]const u8 = null,
+};
+
+const provider_holder_cases = [_]ProviderHolderCase{
+    .{ .name = "openrouter", .expected_name_substr = "openrouter", .expected_tag = .openrouter },
+    .{ .name = "anthropic", .expected_name_substr = "anthropic", .expected_tag = .anthropic },
+    .{ .name = "openai", .expected_name_substr = "openai", .expected_tag = .openai },
+    .{ .name = "gemini", .expected_name_substr = "gemini", .expected_tag = .gemini },
+    .{ .name = "vertex", .expected_name_substr = "vertex", .expected_tag = .vertex },
+    .{ .name = "ollama", .expected_name_substr = "ollama", .expected_tag = .ollama },
+    .{ .name = "groq", .expected_name_substr = "groq", .expected_tag = .compatible },
+    .{ .name = "claude-cli", .expected_name_substr = "claude", .expected_tag = .claude_cli },
+    .{ .name = "codex-cli", .expected_name_substr = "codex", .expected_tag = .codex_cli },
+    .{ .name = "gemini-cli", .expected_name_substr = "gemini", .expected_tag = .gemini_cli },
+    .{ .name = "openai-codex", .expected_name_substr = "openai", .expected_tag = .openai_codex },
+};
+
+fn providerHolderForCase(allocator: std.mem.Allocator, c: ProviderHolderCase) ProviderHolder {
+    return switch (c.expected_tag) {
+        .claude_cli => .{ .claude_cli = .{
+            .allocator = allocator,
+            .model = "test-claude",
+        } },
+        .codex_cli => .{ .codex_cli = .{
+            .allocator = allocator,
+            .model = "test-codex",
+        } },
+        .gemini_cli => .{ .gemini_cli = .{
+            .allocator = allocator,
+            .model = "test-gemini",
+        } },
+        else => ProviderHolder.fromConfig(
+            allocator,
+            c.name,
+            "test-key",
+            c.base_url,
+            true,
+            null,
+            null,
+            false,
+            null,
+        ),
+    };
+}
+
 test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("anthropic") == .anthropic_provider);
     try std.testing.expect(classifyProvider("openai") == .openai_provider);
@@ -534,6 +588,11 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("mistral") == .compatible_provider);
     try std.testing.expect(classifyProvider("deepseek") == .compatible_provider);
     try std.testing.expect(classifyProvider("venice") == .compatible_provider);
+    try std.testing.expect(classifyProvider("nearai") == .compatible_provider);
+    try std.testing.expect(classifyProvider("atlas-cloud") == .compatible_provider);
+    try std.testing.expect(classifyProvider("atlas") == .compatible_provider);
+    try std.testing.expect(classifyProvider("atlascloud") == .compatible_provider);
+    try std.testing.expect(classifyProvider("evolink") == .compatible_provider);
     try std.testing.expect(classifyProvider("poe") == .compatible_provider);
     try std.testing.expect(classifyProvider("custom:https://example.com") == .compatible_provider);
     try std.testing.expect(classifyProvider("openai-codex") == .openai_codex_provider);
@@ -574,6 +633,11 @@ test "classifyProvider new providers" {
 
 test "compatibleProviderUrl returns correct URLs" {
     try std.testing.expectEqualStrings("https://api.venice.ai", compatibleProviderUrl("venice").?);
+    try std.testing.expectEqualStrings("https://cloud-api.near.ai/v1", compatibleProviderUrl("nearai").?);
+    try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlas-cloud").?);
+    try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlas").?);
+    try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlascloud").?);
+    try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", compatibleProviderUrl("evolink").?);
     try std.testing.expectEqualStrings("https://api.groq.com/openai/v1", compatibleProviderUrl("groq").?);
     try std.testing.expectEqualStrings("https://api.deepseek.com", compatibleProviderUrl("deepseek").?);
     try std.testing.expectEqualStrings("https://api.poe.com/v1", compatibleProviderUrl("poe").?);
@@ -685,6 +749,11 @@ test "new providers display names" {
     try std.testing.expectEqualStrings("Baichuan", compatibleProviderDisplayName("baichuan"));
     try std.testing.expectEqualStrings("Novita", compatibleProviderDisplayName("novita"));
     try std.testing.expectEqualStrings("Novita", compatibleProviderDisplayName("novita-ai"));
+    try std.testing.expectEqualStrings("NEAR AI Cloud", compatibleProviderDisplayName("nearai"));
+    try std.testing.expectEqualStrings("Atlas Cloud", compatibleProviderDisplayName("atlas-cloud"));
+    try std.testing.expectEqualStrings("Atlas Cloud", compatibleProviderDisplayName("atlas"));
+    try std.testing.expectEqualStrings("Atlas Cloud", compatibleProviderDisplayName("atlascloud"));
+    try std.testing.expectEqualStrings("Evolink", compatibleProviderDisplayName("evolink"));
     try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("xiaomi"));
     try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("xiaomi-mimo"));
     try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("mimo"));
@@ -705,6 +774,10 @@ test "new providers classify as compatible" {
     try std.testing.expect(classifyProvider("baichuan") == .compatible_provider);
     try std.testing.expect(classifyProvider("novita") == .compatible_provider);
     try std.testing.expect(classifyProvider("novita-ai") == .compatible_provider);
+    try std.testing.expect(classifyProvider("nearai") == .compatible_provider);
+    try std.testing.expect(classifyProvider("atlas-cloud") == .compatible_provider);
+    try std.testing.expect(classifyProvider("atlas") == .compatible_provider);
+    try std.testing.expect(classifyProvider("atlascloud") == .compatible_provider);
     try std.testing.expect(classifyProvider("xiaomi") == .compatible_provider);
     try std.testing.expect(classifyProvider("xiaomi-mimo") == .compatible_provider);
     try std.testing.expect(classifyProvider("mimo") == .compatible_provider);
@@ -754,6 +827,21 @@ test "findCompatProvider returns correct flags" {
     const groq_p = findCompatProvider("groq").?;
     try std.testing.expect(!groq_p.no_responses_fallback);
     try std.testing.expect(!groq_p.merge_system_into_user);
+
+    // NEAR AI Cloud supports the OpenAI-compatible Responses API.
+    const nearai = findCompatProvider("nearai").?;
+    try std.testing.expect(!nearai.no_responses_fallback);
+    try std.testing.expect(nearai.auth_style == .bearer);
+
+    // Atlas Cloud is an OpenAI-compatible Bearer-token provider.
+    const atlas = findCompatProvider("atlas").?;
+    try std.testing.expect(!atlas.no_responses_fallback);
+    try std.testing.expect(atlas.auth_style == .bearer);
+
+    // Evolink is an OpenAI-compatible Bearer-token provider.
+    const evolink = findCompatProvider("evolink").?;
+    try std.testing.expect(!evolink.no_responses_fallback);
+    try std.testing.expect(evolink.auth_style == .bearer);
 
     // minimax-cn also has both flags
     const minimax_cn = findCompatProvider("minimax-cn").?;
@@ -859,6 +947,36 @@ test "fromConfig applies no_responses_fallback flag" {
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(!h.compatible.supports_responses_fallback);
+}
+
+test "fromConfig configures NEAR AI Cloud compatible provider" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "nearai", "key", null, true, null, null, false, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqualStrings("https://cloud-api.near.ai/v1", h.compatible.base_url);
+    try std.testing.expectEqualStrings("nearai", h.compatible.name);
+    try std.testing.expect(h.compatible.supports_responses_fallback);
+}
+
+test "fromConfig configures Atlas Cloud compatible provider" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "atlas-cloud", "key", null, true, null, null, false, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", h.compatible.base_url);
+    try std.testing.expectEqualStrings("atlas-cloud", h.compatible.name);
+    try std.testing.expect(h.compatible.supports_responses_fallback);
+}
+
+test "fromConfig configures Evolink compatible provider" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "evolink", "key", null, true, null, null, false, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", h.compatible.base_url);
+    try std.testing.expectEqualStrings("evolink", h.compatible.name);
+    try std.testing.expect(h.compatible.supports_responses_fallback);
 }
 
 test "fromConfig applies thinking_param flag for GLM" {
@@ -1034,18 +1152,20 @@ test "detectProviderByApiKey short key" {
     try std.testing.expect(detectProviderByApiKey("ab") == .unknown);
 }
 
-test "ProviderHolder tagged union has all expected fields" {
-    try std.testing.expect(@hasField(ProviderHolder, "openrouter"));
-    try std.testing.expect(@hasField(ProviderHolder, "anthropic"));
-    try std.testing.expect(@hasField(ProviderHolder, "openai"));
-    try std.testing.expect(@hasField(ProviderHolder, "gemini"));
-    try std.testing.expect(@hasField(ProviderHolder, "vertex"));
-    try std.testing.expect(@hasField(ProviderHolder, "ollama"));
-    try std.testing.expect(@hasField(ProviderHolder, "compatible"));
-    try std.testing.expect(@hasField(ProviderHolder, "claude_cli"));
-    try std.testing.expect(@hasField(ProviderHolder, "codex_cli"));
-    try std.testing.expect(@hasField(ProviderHolder, "gemini_cli"));
-    try std.testing.expect(@hasField(ProviderHolder, "openai_codex"));
+test "ProviderHolder case table covers every union variant" {
+    const fields = @typeInfo(ProviderHolder).@"union".fields;
+    try std.testing.expectEqual(fields.len, provider_holder_cases.len);
+
+    inline for (fields) |field| {
+        var seen = false;
+        for (provider_holder_cases) |c| {
+            if (std.mem.eql(u8, field.name, @tagName(c.expected_tag))) {
+                try std.testing.expect(!seen);
+                seen = true;
+            }
+        }
+        try std.testing.expect(seen);
+    }
 }
 
 test "ProviderHolder.fromConfig routes to correct variant" {
@@ -1193,4 +1313,38 @@ test "fromConfigWithApiMode applies responses mode to compatible provider" {
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expectEqual(compatible.CompatibleApiMode.responses, h.compatible.api_mode);
+}
+
+test "ProviderHolder all variants deinit leaks zero bytes" {
+    const alloc = std.testing.allocator;
+
+    for (provider_holder_cases) |c| {
+        var holder = providerHolderForCase(alloc, c);
+        try std.testing.expectEqual(c.expected_tag, std.meta.activeTag(holder));
+
+        // Touch the vtable getter to ensure the interface is well-formed.
+        const provider = holder.provider();
+        _ = provider;
+        holder.deinit();
+    }
+}
+
+test "every ProviderHolder variant returns non-empty name matching key" {
+    const alloc = std.testing.allocator;
+
+    for (provider_holder_cases) |c| {
+        var holder = providerHolderForCase(alloc, c);
+
+        const provider = holder.provider();
+        const name = provider.getName();
+        try std.testing.expect(name.len > 0);
+
+        const lower_name = try std.ascii.allocLowerString(alloc, name);
+        defer alloc.free(lower_name);
+        const lower_substr = try std.ascii.allocLowerString(alloc, c.expected_name_substr);
+        defer alloc.free(lower_substr);
+        try std.testing.expect(std.mem.indexOf(u8, lower_name, lower_substr) != null);
+
+        holder.deinit();
+    }
 }

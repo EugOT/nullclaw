@@ -91,7 +91,7 @@ The example below is enough to run local CLI mode (replace API key):
 - Controls runtime diagnostics and observability output.
 - For OpenTelemetry, use the nested `diagnostics.otel` object.
 - OTEL spans are flushed at natural runtime boundaries such as turn completion and agent shutdown, with batch flushing still used as a fallback for longer-running flows.
-- OTEL endpoints should use HTTPS. Plain HTTP is appropriate only for localhost/private collectors or container-local targets such as `host.docker.internal`, `host.containers.internal`, or single-label service names like `otel`.
+- `diagnostics.otel.endpoint` should use `https://...` for remote collectors. Plain `http://...` is accepted only for localhost/private collectors or container-local targets such as `host.docker.internal`, `host.containers.internal`, or single-label service names like `otel`.
 
 Example:
 
@@ -104,7 +104,7 @@ Example:
     "log_message_payloads": true,
     "log_llm_io": true,
     "otel": {
-      "endpoint": "https://otel:4318",
+      "endpoint": "https://otel.example.com:4318",
       "service_name": "nullclaw",
       "headers": {
         "Authorization": "Bearer example-token"
@@ -117,7 +117,7 @@ Example:
 ### `models.providers`
 
 - Defines LLM provider connection parameters and API keys.
-- Common providers: `openrouter`, `openai`, `anthropic`, `groq`.
+- Common providers: `openrouter`, `openai`, `anthropic`, `groq`, `nearai`, `atlas-cloud`, `evolink`.
 
 Example:
 
@@ -126,6 +126,9 @@ Example:
   "models": {
     "providers": {
       "openrouter": { "api_key": "sk-or-..." },
+      "nearai": { "api_key": "YOUR_NEARAI_API_KEY" },
+      "atlas-cloud": { "api_key": "YOUR_ATLASCLOUD_API_KEY" },
+      "evolink": { "api_key": "YOUR_EVOLINK_API_KEY" },
       "anthropic": { "api_key": "sk-ant-..." },
       "openai": { "api_key": "sk-..." }
     }
@@ -146,6 +149,28 @@ Common per-provider fields:
 
 - Sets default model route, typically `provider/vendor/model`.
 - Example: `openrouter/anthropic/claude-sonnet-4`
+
+### `workspace_audit.llm_triage`
+
+- Selects the provider/model used by `nullclaw workspace audit --llm-triage external`.
+- Does not enable LLM triage by itself; the command-line mode remains opt-in.
+- Falls back to `agents.defaults.model.primary` when omitted.
+
+Example:
+
+```json
+{
+  "workspace_audit": {
+    "llm_triage": {
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "max_calls": 20
+    }
+  }
+}
+```
+
+You can also provide the model as a provider-prefixed ref when the provider is configured in `models.providers`, for example `"model": "openrouter/anthropic/claude-sonnet-4"`.
 
 ### `model_routes`
 
@@ -464,6 +489,7 @@ Telegram example:
       "accounts": {
         "main": {
           "bot_token": "123456:ABCDEF",
+          "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"]
         }
       }
@@ -572,6 +598,7 @@ Minimal end-to-end example:
       "accounts": {
         "main": {
           "bot_token": "123456:ABCDEF",
+          "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
           "draft_previews": false,
           "binding_commands_enabled": true,
@@ -646,6 +673,7 @@ Practical rules:
 
 - Keep `listen = "127.0.0.1"` for the pairing-first local UX.
 - In local transport, unauthenticated WebSocket upgrade is allowed only on loopback. This is what lets a UI connect first and then send `pairing_request`.
+- Local loopback pairing no longer depends on a fixed shared code. `pairing_request` may omit `payload.pairing_code`, and legacy loopback clients that still send `123456` remain compatible.
 - If you change `listen` to `0.0.0.0` or another non-loopback address, the WebSocket upgrade must already include the channel token:
   - `ws://host:32123/ws?token=<auth_token>`
   - or `Authorization: Bearer <auth_token>`
@@ -687,8 +715,10 @@ Effect on delivery:
 
 Rules:
 
-- Empty `allow_from` behavior is channel-specific. Some channels, including WeChat and Discord, treat an omitted or empty list as "no filtering" rather than "deny all", so set explicit IDs/OpenIDs for a private bot.
+- Empty `allow_from` denies inbound messages on allowlist-based channels. Set explicit IDs/OpenIDs for a private bot.
 - `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
+- Telegram webhooks require `channels.telegram.accounts.<id>.webhook_secret` and Telegram's `X-Telegram-Bot-Api-Secret-Token` header to match.
+- Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams[].webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
 
 Max example:
 
@@ -748,7 +778,7 @@ Discord example:
 }
 ```
 
-Set `allow_from` explicitly unless you intentionally want an open bot. In the current Discord runtime, an omitted or empty `allow_from` list disables filtering instead of denying all inbound messages.
+Set `allow_from` explicitly. An omitted or empty `allow_from` list denies inbound messages; use `["*"]` only when you intentionally want an open bot.
 
 Enable MESSAGE CONTENT INTENT in the Discord Developer Portal if you want the bot to process ordinary guild messages. Without it, Discord omits message content for most guild traffic; direct messages and messages that mention the bot still include content.
 
@@ -825,7 +855,7 @@ Parameters:
 - `token` (required) - Bot token from Discord Developer Portal
 - `intents` (default: 37377) - Gateway intents bitmask
 - `allow_bots` (default: false) - Allow messages from other bots
-- `allow_from` (default: []) - Optional allowlist of user IDs; for Discord, an omitted or empty list disables filtering, so set explicit IDs for a private bot. `["*"]` also matches all users
+- `allow_from` (default: []) - User ID allowlist. An omitted or empty list denies inbound messages. `["*"]` explicitly allows all users
 - `require_mention` (default: false) - Require bot mention in guilds to respond
 - `guild_id` (optional) - Reserved for Discord server scoping; current runtime does not enforce it
 
@@ -861,6 +891,8 @@ Recommended defaults:
 - `require_pairing = true`
 
 Avoid direct public exposure. Use tunnel when external access is required.
+On non-loopback binds, generic gateway endpoints such as `/webhook`, `/cron/*`, `/a2a`, and `/media/transcribe` still require a stored bearer token even if interactive pairing is disabled, so keep `require_pairing = true` or preconfigure `paired_tokens`.
+On non-loopback binds, `/pair` only accepts loopback clients; do the initial pairing locally or preconfigure `paired_tokens` before exposing the gateway.
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -869,9 +901,9 @@ Avoid direct public exposure. Use tunnel when external access is required.
 | `require_pairing` | `true` | Require bearer token on all API requests |
 | `allow_public_bind` | `false` | Allow binding to non-loopback addresses |
 | `pair_rate_limit_per_minute` | `10` | Max `/pair` requests per minute per IP |
-| `webhook_rate_limit_per_minute` | `60` | Max webhook requests per minute per IP |
+| `webhook_rate_limit_per_minute` | `60` | Max webhook-like authenticated requests per minute. Raise this for live `/media/transcribe` audio chunks. |
 | `idempotency_ttl_secs` | `300` | Duration to cache idempotent request results |
-| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image or file payloads (e.g. `20971520` for 20 MB). |
+| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image, audio, or file payloads (e.g. `67108864` for 64 MiB). |
 | `request_timeout_secs` | `30` | Socket read timeout for incoming HTTP requests in seconds. Raise this when accepting large payloads over slow connections. |
 
 ### `tunnel`
@@ -915,10 +947,27 @@ Tunnel providers for exposing the gateway to the public internet. Required for w
 }
 ```
 
+**Example: Tailscale**
+
+```json
+{
+  "tunnel": {
+    "provider": "tailscale",
+    "tailscale": {
+      "funnel": true,
+      "hostname": "nullclaw.ts.net",
+      "auth_key": "tskey-auth-..."
+    }
+  }
+}
+```
+
 **Notes:**
 
 - Tunnel starts before gateway.
 - Public URL is printed on startup and written to `daemon_state.json`.
+- `tailscale.auth_key` is optional. Use it when the machine should auto-run `tailscale up` before starting `serve`/`funnel`.
+- Tunnel secrets such as `cloudflare.token`, `ngrok.auth_token`, and `tailscale.auth_key` are encrypted at rest when `secrets.encrypt = true`.
 
 ### `autonomy`
 
@@ -926,6 +975,10 @@ Tunnel providers for exposing the gateway to the public internet. Required for w
 - `level = "yolo"`: bypasses command policy checks; use only for trusted local debugging.
 - `workspace_only`: keep `true` to limit file access scope.
 - `max_actions_per_hour`: keep conservative limits first.
+- `block_high_risk_commands` (default: `true`): blocks destructive commands such as `rm`, `sudo`, `mkfs`, `dd`, `shutdown`, `ssh`.
+- `block_medium_risk_commands` (default: `true`): blocks medium-risk commands, including network/transfer commands such as `curl`, `wget`, `nc`, `scp`, `ftp`, `telnet` and state-changing commands such as `git commit`, `npm install`, `touch`, or `mkdir`. Set to `false` to allow these while still blocking high-risk commands.
+- `require_approval_for_medium_risk` (default: `true`): when `block_medium_risk_commands` is `false`, require explicit approval before running medium-risk commands in `supervised` mode.
+- `allowed_commands`: explicit list of allowed command basenames. Use `["*"]` for wildcard (full autonomy only). High-risk and medium-risk runtime gates still apply regardless of this list.
 
 ### `security`
 
@@ -950,6 +1003,7 @@ Use only in controlled environments:
     "allowed_commands": ["*"],
     "allowed_paths": ["*"],
     "require_approval_for_medium_risk": false,
+    "block_medium_risk_commands": false,
     "block_high_risk_commands": false
   }
 }

@@ -2,7 +2,7 @@
 //!
 //! Spawns subagents in separate OS threads with restricted tool sets
 //! (no message, spawn, delegate — to prevent infinite loops).
-//! Task results are routed via the event bus as system InboundMessages.
+//! Task results are routed back to the originating channel/session.
 
 const std = @import("std");
 const std_compat = @import("compat");
@@ -11,6 +11,7 @@ const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const config_types = @import("config_types.zig");
 const observability = @import("observability.zig");
+const provider_names = @import("provider_names.zig");
 const providers = @import("providers/root.zig");
 const thread_stacks = @import("thread_stacks.zig");
 
@@ -27,12 +28,24 @@ pub const TaskStatus = enum {
 pub const TaskState = struct {
     status: TaskStatus,
     label: []const u8,
+    origin_channel: []const u8,
+    origin_chat_id: []const u8,
+    origin_account_id: ?[]const u8 = null,
     session_key: ?[]const u8 = null,
     result: ?[]const u8 = null,
     error_msg: ?[]const u8 = null,
+    notified: bool = false,
     started_at: i64,
     completed_at: ?i64 = null,
     thread: ?std.Thread = null,
+};
+
+pub const CompletionNotice = struct {
+    task_id: u64,
+    content: []u8,
+    origin_channel: []u8,
+    origin_chat_id: []u8,
+    origin_account_id: ?[]u8 = null,
 };
 
 pub const SubagentConfig = struct {
@@ -62,6 +75,7 @@ pub const TaskRunRequest = struct {
     max_actions_per_hour: u32,
     require_approval_for_medium_risk: bool,
     block_high_risk_commands: bool,
+    block_medium_risk_commands: bool,
     allow_raw_url_chars: bool,
     configured_providers: []const config_types.ProviderEntry,
     observer: ?observability.Observer = null,
@@ -76,8 +90,6 @@ const ThreadContext = struct {
     task_id: u64,
     task: []const u8,
     label: []const u8,
-    origin_channel: []const u8,
-    origin_chat_id: []const u8,
     agent_name: ?[]const u8 = null,
     trace_id: ?[32]u8 = null,
 };
@@ -106,6 +118,7 @@ pub const SubagentManager = struct {
     max_actions_per_hour: u32,
     require_approval_for_medium_risk: bool,
     block_high_risk_commands: bool,
+    block_medium_risk_commands: bool,
     allow_raw_url_chars: bool,
     configured_providers: []const config_types.ProviderEntry,
     http_enabled: bool,
@@ -143,6 +156,7 @@ pub const SubagentManager = struct {
             .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
             .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
             .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+            .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
             .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
             .configured_providers = cfg.providers,
             .http_enabled = cfg.http_request.enabled,
@@ -164,6 +178,9 @@ pub const SubagentManager = struct {
             }
             if (state.result) |r| self.allocator.free(r);
             if (state.error_msg) |e| self.allocator.free(e);
+            self.allocator.free(state.origin_channel);
+            self.allocator.free(state.origin_chat_id);
+            if (state.origin_account_id) |aid| self.allocator.free(aid);
             if (state.session_key) |sk| self.allocator.free(sk);
             self.allocator.free(state.label);
             self.allocator.destroy(state);
@@ -178,8 +195,10 @@ pub const SubagentManager = struct {
         label: []const u8,
         origin_channel: []const u8,
         origin_chat_id: []const u8,
+        origin_account_id: ?[]const u8,
+        origin_session_key: []const u8,
     ) !u64 {
-        return self.spawnWithAgent(task, label, origin_channel, origin_chat_id, null);
+        return self.spawnWithAgent(task, label, origin_channel, origin_chat_id, origin_account_id, origin_session_key, null);
     }
 
     /// Spawn a background subagent using an optional named agent profile.
@@ -190,6 +209,8 @@ pub const SubagentManager = struct {
         label: []const u8,
         origin_channel: []const u8,
         origin_chat_id: []const u8,
+        origin_account_id: ?[]const u8,
+        origin_session_key: []const u8,
         agent_name: ?[]const u8,
     ) !u64 {
         self.mutex.lock();
@@ -209,11 +230,20 @@ pub const SubagentManager = struct {
         errdefer self.allocator.destroy(state);
         const state_label = try self.allocator.dupe(u8, label);
         errdefer self.allocator.free(state_label);
-        const state_session = try self.allocator.dupe(u8, origin_chat_id);
+        const state_origin_channel = try self.allocator.dupe(u8, origin_channel);
+        errdefer self.allocator.free(state_origin_channel);
+        const state_origin_chat = try self.allocator.dupe(u8, origin_chat_id);
+        errdefer self.allocator.free(state_origin_chat);
+        const state_origin_account = if (origin_account_id) |account_id| try self.allocator.dupe(u8, account_id) else null;
+        errdefer if (state_origin_account) |account_id| self.allocator.free(account_id);
+        const state_session = try self.allocator.dupe(u8, origin_session_key);
         errdefer self.allocator.free(state_session);
         state.* = .{
             .status = .running,
             .label = state_label,
+            .origin_channel = state_origin_channel,
+            .origin_chat_id = state_origin_chat,
+            .origin_account_id = state_origin_account,
             .session_key = state_session,
             .started_at = std_compat.time.milliTimestamp(),
         };
@@ -225,10 +255,6 @@ pub const SubagentManager = struct {
         errdefer self.allocator.free(task_copy);
         const label_copy = try self.allocator.dupe(u8, label);
         errdefer self.allocator.free(label_copy);
-        const origin_channel_copy = try self.allocator.dupe(u8, origin_channel);
-        errdefer self.allocator.free(origin_channel_copy);
-        const origin_chat_copy = try self.allocator.dupe(u8, origin_chat_id);
-        errdefer self.allocator.free(origin_chat_copy);
         const agent_name_copy = if (agent_name) |name| try self.allocator.dupe(u8, name) else null;
         errdefer if (agent_name_copy) |name| self.allocator.free(name);
 
@@ -242,8 +268,6 @@ pub const SubagentManager = struct {
             .task_id = task_id,
             .task = task_copy,
             .label = label_copy,
-            .origin_channel = origin_channel_copy,
-            .origin_chat_id = origin_chat_copy,
             .agent_name = agent_name_copy,
             .trace_id = trace_id,
         };
@@ -293,6 +317,15 @@ pub const SubagentManager = struct {
         return count;
     }
 
+    fn formatTaskCompletionContent(allocator: Allocator, label: []const u8, result: ?[]const u8, err_msg: ?[]const u8) ![]u8 {
+        return if (result) |r|
+            try std.fmt.allocPrint(allocator, "[Subagent '{s}' completed]\n{s}", .{ label, r })
+        else if (err_msg) |e|
+            try std.fmt.allocPrint(allocator, "[Subagent '{s}' failed]\n{s}", .{ label, e })
+        else
+            try std.fmt.allocPrint(allocator, "[Subagent '{s}' finished]", .{label});
+    }
+
     /// Mark a task as completed or failed. Thread-safe.
     fn completeTask(self: *SubagentManager, task_id: u64, result: ?[]const u8, err_msg: ?[]const u8) void {
         // Dupe result/error into manager's allocator (source may be arena-backed)
@@ -300,6 +333,9 @@ pub const SubagentManager = struct {
         const owned_err = if (err_msg) |e| self.allocator.dupe(u8, e) catch null else null;
 
         var label: []const u8 = "subagent";
+        var origin_channel: []const u8 = "system";
+        var origin_chat_id: []const u8 = "subagent";
+        var origin_account_id: ?[]const u8 = null;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -307,38 +343,154 @@ pub const SubagentManager = struct {
                 state.status = if (owned_err != null) .failed else .completed;
                 state.result = owned_result;
                 state.error_msg = owned_err;
+                state.notified = false;
                 state.completed_at = std_compat.time.milliTimestamp();
                 label = state.label;
+                origin_channel = state.origin_channel;
+                origin_chat_id = state.origin_chat_id;
+                origin_account_id = state.origin_account_id;
             }
         }
 
+        const content = formatTaskCompletionContent(self.allocator, label, owned_result, owned_err) catch return;
+        defer self.allocator.free(content);
+
         // Route result via bus (outside lock)
         if (self.bus) |b| {
-            const content = if (owned_result) |r|
-                std.fmt.allocPrint(self.allocator, "[Subagent '{s}' completed]\n{s}", .{ label, r }) catch return
-            else if (owned_err) |e|
-                std.fmt.allocPrint(self.allocator, "[Subagent '{s}' failed]\n{s}", .{ label, e }) catch return
+            var out = if (origin_account_id) |account_id|
+                bus_mod.makeOutboundWithAccount(
+                    self.allocator,
+                    origin_channel,
+                    account_id,
+                    origin_chat_id,
+                    content,
+                ) catch return
             else
-                std.fmt.allocPrint(self.allocator, "[Subagent '{s}' finished]", .{label}) catch return;
+                bus_mod.makeOutbound(
+                    self.allocator,
+                    origin_channel,
+                    origin_chat_id,
+                    content,
+                ) catch return;
 
-            const msg = bus_mod.makeInbound(
-                self.allocator,
-                "system",
-                "subagent",
-                "agent",
-                content,
-                "system:subagent",
-            ) catch {
-                self.allocator.free(content);
-                return;
-            };
-            self.allocator.free(content);
-
-            b.publishInbound(msg) catch |err| {
-                msg.deinit(self.allocator);
-                log.err("subagent: failed to publish result to bus: {}", .{err});
+            b.publishOutbound(out) catch |err| {
+                out.deinit(self.allocator);
+                log.err("subagent: failed to publish result to outbound bus: {}", .{err});
             };
         }
+    }
+
+    pub fn takeCompletionNoticesForSession(
+        self: *SubagentManager,
+        allocator: Allocator,
+        session_key: ?[]const u8,
+    ) ![]CompletionNotice {
+        return self.takeCompletionNoticesFiltered(allocator, .{ .session_key = session_key });
+    }
+
+    pub fn takeCompletionNoticesForOrigin(
+        self: *SubagentManager,
+        allocator: Allocator,
+        origin_channel: []const u8,
+        origin_account_id: ?[]const u8,
+    ) ![]CompletionNotice {
+        return self.takeCompletionNoticesFiltered(allocator, .{
+            .origin_channel = origin_channel,
+            .origin_account_id = origin_account_id,
+        });
+    }
+
+    const CompletionNoticeFilter = struct {
+        session_key: ?[]const u8 = null,
+        origin_channel: ?[]const u8 = null,
+        origin_account_id: ?[]const u8 = null,
+    };
+
+    fn taskMatchesNoticeFilter(state: *const TaskState, filter: CompletionNoticeFilter) bool {
+        if (filter.session_key) |expected_session| {
+            const state_session = state.session_key orelse return false;
+            if (!std.mem.eql(u8, state_session, expected_session)) return false;
+        }
+        if (filter.origin_channel) |expected_channel| {
+            if (!std.mem.eql(u8, state.origin_channel, expected_channel)) return false;
+        }
+        if (filter.origin_account_id) |expected_account| {
+            const state_account = state.origin_account_id orelse return false;
+            if (!std.mem.eql(u8, state_account, expected_account)) return false;
+        }
+        return true;
+    }
+
+    fn takeCompletionNoticesFiltered(
+        self: *SubagentManager,
+        allocator: Allocator,
+        filter: CompletionNoticeFilter,
+    ) ![]CompletionNotice {
+        var notices: std.ArrayListUnmanaged(CompletionNotice) = .empty;
+        errdefer {
+            for (notices.items) |notice| freeNoticeFields(allocator, notice);
+            notices.deinit(allocator);
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var it = self.tasks.iterator();
+        while (it.next()) |entry| {
+            const task_id = entry.key_ptr.*;
+            const state = entry.value_ptr.*;
+            if (state.status == .running or state.notified) continue;
+            if (!taskMatchesNoticeFilter(state, filter)) continue;
+
+            const content = formatTaskCompletionContent(allocator, state.label, state.result, state.error_msg) catch continue;
+            const origin_channel_dup = allocator.dupe(u8, state.origin_channel) catch {
+                allocator.free(content);
+                continue;
+            };
+            const origin_chat_dup = allocator.dupe(u8, state.origin_chat_id) catch {
+                allocator.free(content);
+                allocator.free(origin_channel_dup);
+                continue;
+            };
+            const origin_account_dup: ?[]u8 = if (state.origin_account_id) |aid|
+                allocator.dupe(u8, aid) catch {
+                    allocator.free(content);
+                    allocator.free(origin_channel_dup);
+                    allocator.free(origin_chat_dup);
+                    continue;
+                }
+            else
+                null;
+
+            notices.append(allocator, .{
+                .task_id = task_id,
+                .content = content,
+                .origin_channel = origin_channel_dup,
+                .origin_chat_id = origin_chat_dup,
+                .origin_account_id = origin_account_dup,
+            }) catch {
+                allocator.free(content);
+                allocator.free(origin_channel_dup);
+                allocator.free(origin_chat_dup);
+                if (origin_account_dup) |aid| allocator.free(aid);
+                continue;
+            };
+            state.notified = true;
+        }
+
+        return notices.toOwnedSlice(allocator);
+    }
+
+    fn freeNoticeFields(allocator: Allocator, notice: CompletionNotice) void {
+        allocator.free(notice.content);
+        allocator.free(notice.origin_channel);
+        allocator.free(notice.origin_chat_id);
+        if (notice.origin_account_id) |aid| allocator.free(aid);
+    }
+
+    pub fn freeCompletionNotices(allocator: Allocator, notices: []CompletionNotice) void {
+        for (notices) |notice| freeNoticeFields(allocator, notice);
+        allocator.free(notices);
     }
 };
 
@@ -357,14 +509,43 @@ fn resolveWorkspacePath(
     return std_compat.fs.path.join(allocator, &.{ home_dir, normalized_workspace_path }) catch null;
 }
 
+fn findConfiguredProvider(
+    configured_providers: []const config_types.ProviderEntry,
+    provider_name: []const u8,
+) ?config_types.ProviderEntry {
+    for (configured_providers) |entry| {
+        if (provider_names.providerNamesMatch(entry.name, provider_name)) return entry;
+    }
+    return null;
+}
+
+fn resolveSubagentProviderApiKey(
+    configured_provider: ?config_types.ProviderEntry,
+    explicit_api_key: ?[]const u8,
+    fallback_api_key: ?[]const u8,
+) ?[]const u8 {
+    if (explicit_api_key) |api_key| return api_key;
+    if (configured_provider) |entry| {
+        if (entry.api_key) |api_key| return api_key;
+    }
+    return fallback_api_key;
+}
+
+fn subagentProviderHolder(
+    allocator: Allocator,
+    provider_name: []const u8,
+    api_key: ?[]const u8,
+    configured_provider: ?config_types.ProviderEntry,
+) providers.ProviderHolder {
+    return providers.holderFromEntry(allocator, provider_name, api_key, configured_provider);
+}
+
 // ── Thread function ─────────────────────────────────────────────
 
 fn subagentThreadFn(ctx: *ThreadContext) void {
     defer {
         ctx.manager.allocator.free(ctx.task);
         ctx.manager.allocator.free(ctx.label);
-        ctx.manager.allocator.free(ctx.origin_channel);
-        ctx.manager.allocator.free(ctx.origin_chat_id);
         if (ctx.agent_name) |agent_name| ctx.manager.allocator.free(agent_name);
         ctx.manager.allocator.destroy(ctx);
     }
@@ -389,10 +570,10 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         "You are a background subagent. Complete the assigned task concisely and accurately. Use available tools when they materially improve correctness."
     else
         "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
-    var api_key = ctx.manager.api_key;
     var default_provider = ctx.manager.default_provider;
     var default_model = ctx.manager.default_model;
     var temperature: f64 = 0.7;
+    var explicit_api_key: ?[]const u8 = null;
     var effective_workspace = ctx.manager.workspace_dir;
     var resolved_workspace: ?[]const u8 = null;
     defer if (resolved_workspace) |workspace_dir| ctx.manager.allocator.free(workspace_dir);
@@ -405,7 +586,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
 
         default_provider = agent_cfg.provider;
         default_model = agent_cfg.model;
-        api_key = agent_cfg.api_key orelse ctx.manager.api_key;
+        explicit_api_key = agent_cfg.api_key;
         if (agent_cfg.system_prompt) |sp| system_prompt = sp;
         if (agent_cfg.temperature) |t| temperature = t;
         if (agent_cfg.workspace_path) |workspace_path| {
@@ -421,6 +602,9 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             }
         }
     }
+
+    const configured_provider = findConfiguredProvider(ctx.manager.configured_providers, default_provider);
+    const api_key = resolveSubagentProviderApiKey(configured_provider, explicit_api_key, ctx.manager.api_key);
 
     if (ctx.manager.task_runner) |runner| {
         const request = TaskRunRequest{
@@ -445,6 +629,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             .max_actions_per_hour = ctx.manager.max_actions_per_hour,
             .require_approval_for_medium_risk = ctx.manager.require_approval_for_medium_risk,
             .block_high_risk_commands = ctx.manager.block_high_risk_commands,
+            .block_medium_risk_commands = ctx.manager.block_medium_risk_commands,
             .allow_raw_url_chars = ctx.manager.allow_raw_url_chars,
             .configured_providers = ctx.manager.configured_providers,
             .observer = ctx.manager.observer,
@@ -462,20 +647,25 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     var cfg_arena = std.heap.ArenaAllocator.init(ctx.manager.allocator);
     defer cfg_arena.deinit();
 
-    // Build a config-like struct that providers.completeWithSystem() accepts
-    const cfg = .{
-        .api_key = api_key,
-        .default_provider = default_provider,
-        .default_model = default_model,
-        .temperature = temperature,
-        .max_tokens = @as(?u64, null),
+    const model = default_model orelse {
+        ctx.manager.completeTask(ctx.task_id, null, @errorName(error.NoDefaultModel));
+        return;
     };
 
-    const result = providers.completeWithSystem(
+    var holder = subagentProviderHolder(
         cfg_arena.allocator(),
-        &cfg,
+        default_provider,
+        api_key,
+        configured_provider,
+    );
+    defer holder.deinit();
+
+    const result = holder.provider().chatWithSystem(
+        cfg_arena.allocator(),
         system_prompt,
         ctx.task,
+        model,
+        temperature,
     ) catch |err| {
         ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
         return;
@@ -494,6 +684,63 @@ fn waitTaskTerminalStatus(manager: *SubagentManager, task_id: u64) !TaskStatus {
         std_compat.thread.sleep(10 * std.time.ns_per_ms);
     }
     return error.TestUnexpectedResult;
+}
+
+test "subagent provider api key prefers explicit then configured then fallback" {
+    const entries = [_]config_types.ProviderEntry{.{
+        .name = "groq",
+        .api_key = "configured-key",
+    }};
+    const configured = findConfiguredProvider(&entries, "groq");
+    try std.testing.expect(configured != null);
+
+    try std.testing.expectEqualStrings(
+        "explicit-key",
+        resolveSubagentProviderApiKey(configured, "explicit-key", "fallback-key").?,
+    );
+    try std.testing.expectEqualStrings(
+        "configured-key",
+        resolveSubagentProviderApiKey(configured, null, "fallback-key").?,
+    );
+    try std.testing.expectEqualStrings(
+        "fallback-key",
+        resolveSubagentProviderApiKey(null, null, "fallback-key").?,
+    );
+    try std.testing.expect(resolveSubagentProviderApiKey(null, null, null) == null);
+}
+
+test "subagent provider holder applies configured provider options" {
+    const configured = config_types.ProviderEntry{
+        .name = "custom-local",
+        .base_url = "http://localhost:4321/v1",
+        .native_tools = false,
+        .user_agent = "nullclaw-test",
+        .api_mode = .responses,
+        .chat_template_enable_thinking_param = true,
+        .max_streaming_prompt_bytes = 123,
+        .extra_body_params = "{\"seed\":1}",
+    };
+
+    var holder = subagentProviderHolder(
+        std.testing.allocator,
+        "custom-local",
+        null,
+        configured,
+    );
+    defer holder.deinit();
+
+    switch (holder) {
+        .compatible => |*provider| {
+            try std.testing.expectEqualStrings("http://localhost:4321/v1", provider.base_url);
+            try std.testing.expect(!provider.native_tools);
+            try std.testing.expectEqualStrings("nullclaw-test", provider.user_agent.?);
+            try std.testing.expectEqual(providers.compatible.CompatibleApiMode.responses, provider.api_mode);
+            try std.testing.expect(provider.chat_template_enable_thinking_param);
+            try std.testing.expectEqual(@as(?usize, 123), provider.max_streaming_prompt_bytes);
+            try std.testing.expectEqualStrings("{\"seed\":1}", provider.extra_body_params.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 fn testTaskRunnerOk(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
@@ -548,10 +795,13 @@ test "TaskState initial defaults" {
     const state = TaskState{
         .status = .running,
         .label = "test",
+        .origin_channel = "agent",
+        .origin_chat_id = "session:1",
         .started_at = 0,
     };
     try std.testing.expect(state.result == null);
     try std.testing.expect(state.error_msg == null);
+    try std.testing.expect(!state.notified);
     try std.testing.expect(state.completed_at == null);
     try std.testing.expect(state.thread == null);
 }
@@ -603,6 +853,8 @@ test "SubagentManager completeTask updates state" {
     state.* = .{
         .status = .running,
         .label = try std.testing.allocator.dupe(u8, "test-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "agent"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "session:1"),
         .started_at = std_compat.time.milliTimestamp(),
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
@@ -626,6 +878,8 @@ test "SubagentManager completeTask with error" {
     state.* = .{
         .status = .running,
         .label = try std.testing.allocator.dupe(u8, "fail-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "agent"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "session:1"),
         .started_at = std_compat.time.milliTimestamp(),
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
@@ -636,7 +890,7 @@ test "SubagentManager completeTask with error" {
     try std.testing.expect(mgr.getTaskResult(1) == null);
 }
 
-test "SubagentManager completeTask routes via bus" {
+test "SubagentManager completeTask routes outbound via bus to origin channel" {
     const cfg = config_mod.Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
@@ -652,20 +906,165 @@ test "SubagentManager completeTask routes via bus" {
     state.* = .{
         .status = .running,
         .label = try std.testing.allocator.dupe(u8, "bus-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "chat-42"),
+        .origin_account_id = try std.testing.allocator.dupe(u8, "primary"),
         .started_at = std_compat.time.milliTimestamp(),
     };
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
     mgr.completeTask(1, "result text", null);
 
-    // Check bus received the message — verify depth increased
-    try std.testing.expect(bus.inboundDepth() > 0);
+    try std.testing.expectEqual(@as(usize, 1), bus.outboundDepth());
+    var msg = bus.consumeOutbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("chat-42", msg.chat_id);
+    try std.testing.expect(msg.account_id != null);
+    try std.testing.expectEqualStrings("primary", msg.account_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "bus-task") != null);
+}
 
-    // Drain the bus to avoid memory leak
-    bus.close();
-    if (bus.consumeInbound()) |msg| {
-        msg.deinit(std.testing.allocator);
-    }
+test "SubagentManager takeCompletionNoticesForSession returns once per task" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "notice-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "cli"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "session:42"),
+        .session_key = try std.testing.allocator.dupe(u8, "session:42"),
+        .started_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+    mgr.completeTask(1, "done", null);
+
+    const notices1 = try mgr.takeCompletionNoticesForSession(std.testing.allocator, "session:42");
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, notices1);
+    try std.testing.expectEqual(@as(usize, 1), notices1.len);
+    try std.testing.expectEqual(@as(u64, 1), notices1[0].task_id);
+    try std.testing.expect(std.mem.indexOf(u8, notices1[0].content, "notice-task") != null);
+
+    const notices2 = try mgr.takeCompletionNoticesForSession(std.testing.allocator, "session:42");
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, notices2);
+    try std.testing.expectEqual(@as(usize, 0), notices2.len);
+}
+
+test "CompletionNotice carries origin channel/chat/account for polling delivery (regression #918)" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "polling-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "987654321"),
+        .origin_account_id = try std.testing.allocator.dupe(u8, "main"),
+        .session_key = try std.testing.allocator.dupe(u8, "telegram:987654321"),
+        .started_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+    mgr.completeTask(1, "all done", null);
+
+    const notices = try mgr.takeCompletionNoticesForSession(std.testing.allocator, null);
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, notices);
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expectEqualStrings("telegram", notices[0].origin_channel);
+    try std.testing.expectEqualStrings("987654321", notices[0].origin_chat_id);
+    try std.testing.expect(notices[0].origin_account_id != null);
+    try std.testing.expectEqualStrings("main", notices[0].origin_account_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, notices[0].content, "polling-task") != null);
+}
+
+test "CompletionNotice origin_account_id stays null when task has none" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "no-account-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "cli"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "session:1"),
+        .origin_account_id = null,
+        .session_key = try std.testing.allocator.dupe(u8, "session:1"),
+        .started_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+    mgr.completeTask(1, "ok", null);
+
+    const notices = try mgr.takeCompletionNoticesForSession(std.testing.allocator, null);
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, notices);
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expectEqualStrings("cli", notices[0].origin_channel);
+    try std.testing.expect(notices[0].origin_account_id == null);
+}
+
+test "SubagentManager takeCompletionNoticesForOrigin preserves other accounts (regression #918)" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const main_state = try std.testing.allocator.create(TaskState);
+    main_state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "main-account-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "chat-main"),
+        .origin_account_id = try std.testing.allocator.dupe(u8, "main"),
+        .session_key = try std.testing.allocator.dupe(u8, "telegram:main:chat-main"),
+        .started_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, main_state);
+
+    const secondary_state = try std.testing.allocator.create(TaskState);
+    secondary_state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "secondary-account-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "chat-secondary"),
+        .origin_account_id = try std.testing.allocator.dupe(u8, "secondary"),
+        .session_key = try std.testing.allocator.dupe(u8, "telegram:secondary:chat-secondary"),
+        .started_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 2, secondary_state);
+
+    mgr.completeTask(1, "main done", null);
+    mgr.completeTask(2, "secondary done", null);
+
+    const main_notices = try mgr.takeCompletionNoticesForOrigin(std.testing.allocator, "telegram", "main");
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, main_notices);
+    try std.testing.expectEqual(@as(usize, 1), main_notices.len);
+    try std.testing.expectEqual(@as(u64, 1), main_notices[0].task_id);
+    try std.testing.expectEqualStrings("chat-main", main_notices[0].origin_chat_id);
+
+    const secondary_notices = try mgr.takeCompletionNoticesForOrigin(std.testing.allocator, "telegram", "secondary");
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, secondary_notices);
+    try std.testing.expectEqual(@as(usize, 1), secondary_notices.len);
+    try std.testing.expectEqual(@as(u64, 2), secondary_notices[0].task_id);
+    try std.testing.expectEqualStrings("chat-secondary", secondary_notices[0].origin_chat_id);
 }
 
 test "SubagentManager spawn stores session key" {
@@ -677,7 +1076,7 @@ test "SubagentManager spawn stores session key" {
     var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer mgr.deinit();
 
-    const task_id = try mgr.spawn("quick task", "session-check", "agent", "session:42");
+    const task_id = try mgr.spawn("quick task", "session-check", "agent", "session:42", null, "session:42");
     mgr.mutex.lock();
     defer mgr.mutex.unlock();
     const state = mgr.tasks.get(task_id) orelse return error.TestUnexpectedResult;
@@ -696,7 +1095,7 @@ test "SubagentManager spawnWithAgent rejects unknown agent" {
 
     try std.testing.expectError(
         error.UnknownAgent,
-        mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", "missing-agent"),
+        mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", null, "session:42", "missing-agent"),
     );
 }
 
@@ -715,7 +1114,7 @@ test "SubagentManager spawnWithAgent accepts configured agent" {
     var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer mgr.deinit();
 
-    const task_id = try mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", "researcher");
+    const task_id = try mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", null, "session:42", "researcher");
     try std.testing.expect(task_id > 0);
 }
 
@@ -746,7 +1145,7 @@ test "SubagentManager uses named agent workspace_path for task runner" {
     mgr.task_runner = testTaskRunnerWorkspace;
     defer mgr.deinit();
 
-    const task_id = try mgr.spawnWithAgent("quick task", "workspace-check", "agent", "session:42", "researcher");
+    const task_id = try mgr.spawnWithAgent("quick task", "workspace-check", "agent", "session:42", null, "session:42", "researcher");
     const status = try waitTaskTerminalStatus(&mgr, task_id);
     try std.testing.expectEqual(TaskStatus.completed, status);
     try std.testing.expectEqualStrings(expected_workspace, mgr.getTaskResult(task_id).?);
@@ -781,7 +1180,7 @@ test "SubagentManager preserves named agent system_prompt when workspace_path is
     mgr.task_runner = testTaskRunnerWorkspaceAndPrompt;
     defer mgr.deinit();
 
-    const task_id = try mgr.spawnWithAgent("quick task", "workspace-prompt-check", "agent", "session:42", "researcher");
+    const task_id = try mgr.spawnWithAgent("quick task", "workspace-prompt-check", "agent", "session:42", null, "session:42", "researcher");
     const status = try waitTaskTerminalStatus(&mgr, task_id);
     try std.testing.expectEqual(TaskStatus.completed, status);
 
@@ -800,7 +1199,7 @@ test "SubagentManager uses task runner callback result" {
     mgr.task_runner = testTaskRunnerOk;
     defer mgr.deinit();
 
-    const task_id = try mgr.spawn("quick task", "runner-ok", "agent", "session:42");
+    const task_id = try mgr.spawn("quick task", "runner-ok", "agent", "session:42", null, "session:42");
     const status = try waitTaskTerminalStatus(&mgr, task_id);
     try std.testing.expectEqual(TaskStatus.completed, status);
     try std.testing.expectEqualStrings("runner-ok", mgr.getTaskResult(task_id).?);
@@ -819,7 +1218,7 @@ test "SubagentManager propagates http timeout to task runner" {
     mgr.task_runner = testTaskRunnerHttpTimeout;
     defer mgr.deinit();
 
-    const task_id = try mgr.spawn("quick task", "runner-timeout", "agent", "session:42");
+    const task_id = try mgr.spawn("quick task", "runner-timeout", "agent", "session:42", null, "session:42");
     const status = try waitTaskTerminalStatus(&mgr, task_id);
     try std.testing.expectEqual(TaskStatus.completed, status);
     try std.testing.expectEqualStrings("17", mgr.getTaskResult(task_id).?);
@@ -835,7 +1234,7 @@ test "SubagentManager stores runner callback error" {
     mgr.task_runner = testTaskRunnerFail;
     defer mgr.deinit();
 
-    const task_id = try mgr.spawn("quick task", "runner-fail", "agent", "session:42");
+    const task_id = try mgr.spawn("quick task", "runner-fail", "agent", "session:42", null, "session:42");
     const status = try waitTaskTerminalStatus(&mgr, task_id);
     try std.testing.expectEqual(TaskStatus.failed, status);
 
@@ -862,7 +1261,7 @@ test "SubagentManager spawn rollback removes task on out-of-memory" {
 
     try std.testing.expectError(
         error.OutOfMemory,
-        mgr.spawn("oom-task", "oom-label", "agent", "session:oom"),
+        mgr.spawn("oom-task", "oom-label", "agent", "session:oom", null, "session:oom"),
     );
     try std.testing.expectEqual(@as(usize, 0), mgr.tasks.count());
     try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());

@@ -65,7 +65,7 @@ pub const WebSearchTool = struct {
     timeout_secs: u64 = DEFAULT_TIMEOUT_SECS,
 
     pub const tool_name = "web_search";
-    pub const tool_description = "Search the web. Providers: searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina. Configure via http_request.search_provider/search_fallback_providers and API key env vars.";
+    pub const tool_description = "Search the internet for real-time information, recipes, news, or technical documentation that might not be in your local knowledge base. Use this whenever the user asks for information from the web or the internet.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"},"provider":{"type":"string","description":"Optional provider override (auto,searxng,duckduckgo,ddg,brave,firecrawl,tavily,perplexity,exa,jina)"}},"required":["query"]}
     ;
@@ -115,6 +115,9 @@ pub const WebSearchTool = struct {
                     continue;
                 },
             };
+            if (result.success) {
+                return wrapSuccessfulProviderResult(allocator, result);
+            }
             return result;
         }
 
@@ -305,6 +308,17 @@ fn executeWithProvider(
     }
 }
 
+fn wrapSuccessfulProviderResult(allocator: std.mem.Allocator, result: ToolResult) !ToolResult {
+    std.debug.assert(result.success);
+    defer allocator.free(result.output);
+
+    const security = @import("../security/root.zig");
+    return ToolResult{
+        .success = true,
+        .output = try security.wrapExternalContent(allocator, result.output, .web_search),
+    };
+}
+
 fn tryApiKeyFromEnvOrNull(allocator: std.mem.Allocator, names: []const []const u8) ?[]const u8 {
     for (names) |name| {
         const key = platform.getEnvOrNull(allocator, name) orelse continue;
@@ -349,15 +363,53 @@ pub fn formatSearxngResults(allocator: std.mem.Allocator, json_body: []const u8,
     return search_providers.searxng.formatResults(allocator, json_body, query);
 }
 
-fn formatDuckDuckGoResults(allocator: std.mem.Allocator, json_body: []const u8, query: []const u8, count: usize) !ToolResult {
-    return search_providers.duckduckgo.formatResults(allocator, json_body, query, count);
-}
-
 // ══════════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+const search_api_key_env_vars = [_][]const u8{
+    "BRAVE_API_KEY",
+    "FIRECRAWL_API_KEY",
+    "TAVILY_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "EXA_API_KEY",
+    "JINA_API_KEY",
+    "WEB_SEARCH_API_KEY",
+};
+
+const SearchApiKeyEnvGuard = struct {
+    values: [search_api_key_env_vars.len]?[]const u8 = [_]?[]const u8{null} ** search_api_key_env_vars.len,
+
+    fn init(allocator: std.mem.Allocator) !SearchApiKeyEnvGuard {
+        var guard = SearchApiKeyEnvGuard{};
+        errdefer guard.deinit(allocator);
+        errdefer guard.restore(allocator) catch {};
+
+        for (search_api_key_env_vars, 0..) |name, i| {
+            guard.values[i] = platform.getEnvOrNull(allocator, name);
+            try platform.setProcessEnv(allocator, name, null);
+        }
+
+        return guard;
+    }
+
+    fn restore(self: *const SearchApiKeyEnvGuard, allocator: std.mem.Allocator) !void {
+        for (search_api_key_env_vars, 0..) |name, i| {
+            try platform.setProcessEnv(allocator, name, self.values[i]);
+        }
+    }
+
+    fn deinit(self: *SearchApiKeyEnvGuard, allocator: std.mem.Allocator) void {
+        for (self.values) |value| {
+            if (value) |owned| allocator.free(owned);
+        }
+    }
+};
+
+fn restoreSearchApiKeyEnvOrPanic(allocator: std.mem.Allocator, guard: *const SearchApiKeyEnvGuard) void {
+    guard.restore(allocator) catch @panic("failed to restore web_search API key environment");
+}
 
 test "WebSearchTool name and description" {
     var wst = WebSearchTool{};
@@ -386,6 +438,11 @@ test "WebSearchTool empty query fails" {
 }
 
 test "WebSearchTool without working provider chain returns aggregate error" {
+    // Regression: process-level web search API keys must not make this aggregate-failure test hit real providers.
+    var env_guard = try SearchApiKeyEnvGuard.init(testing.allocator);
+    defer env_guard.deinit(testing.allocator);
+    defer restoreSearchApiKeyEnvOrPanic(testing.allocator, &env_guard);
+
     var wst = WebSearchTool{};
     const parsed = try root.parseTestArgs("{\"query\":\"zig programming\"}");
     defer parsed.deinit();
@@ -487,6 +544,17 @@ test "buildProviderChain rejects invalid fallback provider" {
     var wst = WebSearchTool{ .fallback_providers = &fallbacks };
     var chain_buf: [MAX_PROVIDER_CHAIN]SearchProvider = undefined;
     try testing.expectError(error.InvalidProvider, buildProviderChain(&wst, "auto", &chain_buf));
+}
+
+test "wrapSuccessfulProviderResult wraps web search output" {
+    const output = try testing.allocator.dupe(u8, "raw result");
+    const wrapped = try wrapSuccessfulProviderResult(testing.allocator, .{ .success = true, .output = output });
+    defer testing.allocator.free(wrapped.output);
+
+    try testing.expect(wrapped.success);
+    try testing.expect(std.mem.indexOf(u8, wrapped.output, "<<<UNTRUSTED_EXTERNAL_CONTENT id=\"") != null);
+    try testing.expect(std.mem.indexOf(u8, wrapped.output, "Source: Web Search") != null);
+    try testing.expect(std.mem.indexOf(u8, wrapped.output, "raw result") != null);
 }
 
 test "parseCount defaults to 5" {
@@ -600,30 +668,10 @@ test "formatSearxngResults parses valid JSON" {
     try testing.expect(std.mem.indexOf(u8, result.output, "https://docs.searxng.org") != null);
 }
 
-test "formatDuckDuckGoResults parses related topics" {
-    const json =
-        \\{
-        \\  "Heading": "Zig",
-        \\  "AbstractText": "",
-        \\  "AbstractURL": "",
-        \\  "RelatedTopics": [
-        \\    {"Text": "Zig - Programming language", "FirstURL": "https://ziglang.org"},
-        \\    {"Topics": [
-        \\      {"Text": "Ziglang docs - Official docs", "FirstURL": "https://ziglang.org/documentation/master/"}
-        \\    ]}
-        \\  ]
-        \\}
-    ;
-    const result = try formatDuckDuckGoResults(testing.allocator, json, "zig", 5);
-    defer testing.allocator.free(result.output);
-    try testing.expect(result.success);
-    try testing.expect(std.mem.indexOf(u8, result.output, "1. Zig") != null);
-    try testing.expect(std.mem.indexOf(u8, result.output, "https://ziglang.org") != null);
-}
-
 test "formatBraveResults empty results" {
     const json = "{\"web\":{\"results\":[]}}";
     const result = try formatBraveResults(testing.allocator, json, "nothing");
+    defer testing.allocator.free(result.output);
     try testing.expect(result.success);
     try testing.expectEqualStrings("No web results found.", result.output);
 }
@@ -631,6 +679,7 @@ test "formatBraveResults empty results" {
 test "formatSearxngResults empty results" {
     const json = "{\"results\":[]}";
     const result = try formatSearxngResults(testing.allocator, json, "nothing");
+    defer testing.allocator.free(result.output);
     try testing.expect(result.success);
     try testing.expectEqualStrings("No web results found.", result.output);
 }
@@ -643,4 +692,8 @@ test "formatBraveResults invalid JSON" {
 test "formatSearxngResults invalid JSON" {
     const result = try formatSearxngResults(testing.allocator, "not json", "q");
     try testing.expect(!result.success);
+}
+
+test {
+    _ = search_providers;
 }
