@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const json_object_map = @import("../json_object_map.zig");
 const redaction = @import("../redaction.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -248,8 +249,8 @@ test "anonymize_text: oversized input rejected without allocating redactor state
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var obj: JsonObjectMap = .empty;
-    try obj.put(arena_alloc, "text", .{ .string = big });
+    var obj = try json_object_map.init(arena_alloc);
+    try json_object_map.put(&obj, arena_alloc, "text", .{ .string = big });
 
     var at = AnonymizeTextTool{};
     const t = at.tool();
@@ -380,8 +381,8 @@ test "anonymize_text: input exactly at MAX_INPUT_BYTES accepted" {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var obj: JsonObjectMap = .empty;
-    try obj.put(arena_alloc, "text", .{ .string = filler });
+    var obj = try json_object_map.init(arena_alloc);
+    try json_object_map.put(&obj, arena_alloc, "text", .{ .string = filler });
 
     var at = AnonymizeTextTool{};
     const t = at.tool();

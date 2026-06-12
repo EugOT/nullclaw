@@ -3,6 +3,7 @@ const std_compat = @import("compat");
 const types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
 const model_refs = @import("model_refs.zig");
+const json_object_map = @import("json_object_map.zig");
 const secrets = @import("security/secrets.zig");
 
 const log = std.log.scoped(.config);
@@ -813,11 +814,10 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
             break :blk .{ .array = cloned };
         },
         .object => |obj| blk: {
-            var cloned: std.json.ObjectMap = .empty;
+            var cloned = try json_object_map.init(allocator);
             var it = obj.iterator();
             while (it.next()) |entry| {
-                const gop = try cloned.getOrPut(allocator, entry.key_ptr.*);
-                gop.value_ptr.* = try cloneJsonValue(allocator, entry.value_ptr.*);
+                try json_object_map.put(&cloned, allocator, entry.key_ptr.*, try cloneJsonValue(allocator, entry.value_ptr.*));
             }
             break :blk .{ .object = cloned };
         },

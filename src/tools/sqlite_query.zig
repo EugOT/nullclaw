@@ -11,6 +11,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
+const json_object_map = @import("../json_object_map.zig");
 const path_security = @import("path_security.zig");
 const redaction = @import("../redaction.zig");
 const Tool = root.Tool;
@@ -1355,9 +1356,9 @@ test "sqlite_query: db_path with embedded null byte rejected" {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var obj: JsonObjectMap = .empty;
-    try obj.put(arena_alloc, "db_path", .{ .string = "safe\x00.db" });
-    try obj.put(arena_alloc, "query", .{ .string = "SELECT 1" });
+    var obj = try json_object_map.init(arena_alloc);
+    try json_object_map.put(&obj, arena_alloc, "db_path", .{ .string = "safe\x00.db" });
+    try json_object_map.put(&obj, arena_alloc, "query", .{ .string = "SELECT 1" });
 
     var sqt = SqliteQueryTool{ .workspace_dir = "/tmp/yc_test_sqlite_query_nul" };
     const t = sqt.tool();

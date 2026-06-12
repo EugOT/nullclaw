@@ -2,6 +2,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const config_mod = @import("config.zig");
 const config_paths = @import("config_paths.zig");
+const json_object_map = @import("json_object_map.zig");
 const platform = @import("platform.zig");
 
 pub const MutationAction = enum {
@@ -136,11 +137,11 @@ fn parseValueInput(allocator: std.mem.Allocator, raw_input: []const u8) !std.jso
     return parsed.value;
 }
 
-fn ensureObject(value: *std.json.Value) *std.json.ObjectMap {
+fn ensureObject(allocator: std.mem.Allocator, value: *std.json.Value) !*std.json.ObjectMap {
     switch (value.*) {
         .object => |*obj| return obj,
         else => {
-            value.* = .{ .object = .empty };
+            value.* = .{ .object = try json_object_map.init(allocator) };
             return &value.object;
         },
     }
@@ -192,26 +193,26 @@ fn setAtPath(
     if (tokens.len == 0) return;
 
     for (tokens[0 .. tokens.len - 1]) |token| {
-        const obj = ensureObject(current);
+        const obj = try ensureObject(allocator, current);
         if (obj.getPtr(token)) |next| {
             current = next;
             continue;
         }
 
         const key_copy = try allocator.dupe(u8, token);
-        try obj.put(allocator, key_copy, .{ .object = .empty });
+        try json_object_map.put(obj, allocator, key_copy, .{ .object = try json_object_map.init(allocator) });
         current = obj.getPtr(token).?;
     }
 
     const last = tokens[tokens.len - 1];
-    const obj = ensureObject(current);
+    const obj = try ensureObject(allocator, current);
     if (obj.getPtr(last)) |slot| {
         slot.* = value;
         return;
     }
 
     const key_copy = try allocator.dupe(u8, last);
-    try obj.put(allocator, key_copy, value);
+    try json_object_map.put(obj, allocator, key_copy, value);
 }
 
 fn setPrimaryModelPathValue(
@@ -380,7 +381,7 @@ pub fn findPathValueJson(allocator: std.mem.Allocator, path: []const u8) !?[]u8 
 
     var root = parsed.value;
     if (root != .object) {
-        root = .{ .object = .empty };
+        root = .{ .object = try json_object_map.init(a) };
     }
 
     const tokens = try splitPathTokens(a, path);
@@ -428,7 +429,7 @@ pub fn mutateDefaultConfig(
     const parsed = std.json.parseFromSlice(std.json.Value, a, current.content, .{}) catch return error.InvalidJson;
     var root = parsed.value;
     if (root != .object) {
-        root = .{ .object = .empty };
+        root = .{ .object = try json_object_map.init(a) };
     }
 
     const tokens = try splitPathTokens(a, trimmed_path);
@@ -518,7 +519,7 @@ test "setAtPath creates nested objects and stores value" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var root = std.json.Value{ .object = .empty };
+    var root = std.json.Value{ .object = try json_object_map.init(a) };
     const tokens = [_][]const u8{ "memory", "backend" };
     const value = std.json.Value{ .string = try a.dupe(u8, "sqlite") };
 
@@ -534,7 +535,7 @@ test "unsetAtPath removes existing key" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var root = std.json.Value{ .object = .empty };
+    var root = std.json.Value{ .object = try json_object_map.init(a) };
     const tokens = [_][]const u8{ "gateway", "port" };
     try setAtPath(&root, a, &tokens, .{ .integer = 3000 });
 
@@ -571,7 +572,7 @@ test "setPrimaryModelPathValue stores split provider field for versionless custo
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var root = std.json.Value{ .object = .empty };
+    var root = std.json.Value{ .object = try json_object_map.init(a) };
 
     try setPrimaryModelPathValue(&root, a, "custom:https://gateway.example.com/api/qianfan/custom-model");
 

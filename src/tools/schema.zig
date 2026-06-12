@@ -13,8 +13,7 @@
 //! 6. Detects circular references and stops recursion safely
 
 const std = @import("std");
-
-const log = std.log.scoped(.schema);
+const json_object_map = @import("../json_object_map.zig");
 
 /// Schema cleaning strategies for different LLM providers.
 pub const CleaningStrategy = enum {
@@ -120,7 +119,7 @@ pub const SchemaCleanr = struct {
         const root = parsed.value;
 
         // Extract $defs for reference resolution
-        var defs = extractDefs(root);
+        var defs = try extractDefs(arena_alloc, root);
 
         // Track visited refs for circular detection
         var ref_stack = std.StringHashMap(void).init(arena_alloc);
@@ -155,10 +154,10 @@ fn isUnsupported(keyword: []const u8, strategy: CleaningStrategy) bool {
 }
 
 /// Extract `$defs` and `definitions` from a root schema value.
-fn extractDefs(root: std.json.Value) std.json.ObjectMap {
+fn extractDefs(allocator: std.mem.Allocator, root: std.json.Value) CleanError!std.json.ObjectMap {
     if (root != .object) {
         // Return an empty map — won't be used, just need a valid value.
-        return .empty;
+        return try json_object_map.init(allocator);
     }
     const obj = root.object;
 
@@ -169,7 +168,7 @@ fn extractDefs(root: std.json.Value) std.json.ObjectMap {
     if (obj.get("definitions")) |v| {
         if (v == .object) return v.object;
     }
-    return .empty;
+    return try json_object_map.init(allocator);
 }
 
 const CleanError = std.mem.Allocator.Error;
@@ -225,7 +224,7 @@ fn cleanObject(
     const has_union = obj.contains("anyOf") or obj.contains("oneOf");
 
     // Build cleaned object
-    var cleaned = std.json.ObjectMap.empty;
+    var cleaned = try json_object_map.init(allocator);
 
     var it = obj.iterator();
     while (it.next()) |entry| {
@@ -241,26 +240,26 @@ fn cleanObject(
             var enum_arr = std.json.Array.init(allocator);
             try enum_arr.ensureTotalCapacity(1);
             enum_arr.appendAssumeCapacity(value);
-            try cleaned.put(allocator, "enum", .{ .array = enum_arr });
+            try json_object_map.put(&cleaned, allocator, "enum", .{ .array = enum_arr });
         } else if (std.mem.eql(u8, key, "type") and has_union) {
             // Skip type if we have anyOf/oneOf (they define the type)
             continue;
         } else if (std.mem.eql(u8, key, "type") and value == .array) {
             // Handle type arrays (remove null)
-            try cleaned.put(allocator, key, cleanTypeArray(value));
+            try json_object_map.put(&cleaned, allocator, key, cleanTypeArray(value));
         } else if (std.mem.eql(u8, key, "properties")) {
-            try cleaned.put(allocator, key, try cleanProperties(allocator, value, strategy, defs, ref_stack));
+            try json_object_map.put(&cleaned, allocator, key, try cleanProperties(allocator, value, strategy, defs, ref_stack));
         } else if (std.mem.eql(u8, key, "items")) {
-            try cleaned.put(allocator, key, try cleanValue(allocator, value, strategy, defs, ref_stack));
+            try json_object_map.put(&cleaned, allocator, key, try cleanValue(allocator, value, strategy, defs, ref_stack));
         } else if (std.mem.eql(u8, key, "anyOf") or std.mem.eql(u8, key, "oneOf") or std.mem.eql(u8, key, "allOf")) {
-            try cleaned.put(allocator, key, try cleanUnion(allocator, value, strategy, defs, ref_stack));
+            try json_object_map.put(&cleaned, allocator, key, try cleanUnion(allocator, value, strategy, defs, ref_stack));
         } else {
             // Keep all other keys, cleaning nested objects/arrays recursively
             const cleaned_val = switch (value) {
                 .object, .array => try cleanValue(allocator, value, strategy, defs, ref_stack),
                 else => value,
             };
-            try cleaned.put(allocator, key, cleaned_val);
+            try json_object_map.put(&cleaned, allocator, key, cleaned_val);
         }
     }
 
@@ -278,7 +277,7 @@ fn resolveRef(
 ) CleanError!std.json.Value {
     // Prevent circular references
     if (ref_stack.contains(ref_value)) {
-        return preserveMeta(allocator, obj, .{ .object = .empty });
+        return try preserveMeta(allocator, obj, .{ .object = try json_object_map.init(allocator) });
     }
 
     // Try to resolve local ref (#/$defs/Name or #/definitions/Name)
@@ -287,12 +286,12 @@ fn resolveRef(
             try ref_stack.put(ref_value, {});
             const cleaned = try cleanValue(allocator, definition, strategy, defs, ref_stack);
             _ = ref_stack.remove(ref_value);
-            return preserveMeta(allocator, obj, cleaned);
+            return try preserveMeta(allocator, obj, cleaned);
         }
     }
 
     // Can't resolve: return empty object with metadata
-    return preserveMeta(allocator, obj, .{ .object = .empty });
+    return try preserveMeta(allocator, obj, .{ .object = try json_object_map.init(allocator) });
 }
 
 /// Parse a local JSON Pointer ref (#/$defs/Name or #/definitions/Name).
@@ -352,12 +351,12 @@ fn trySimplifyUnion(
 
     // If only one variant remains after stripping nulls, return it
     if (non_null.items.len == 1) {
-        return preserveMeta(allocator, obj, non_null.items[0]);
+        return try preserveMeta(allocator, obj, non_null.items[0]);
     }
 
     // Try to flatten to enum if all variants are literals
-    if (tryFlattenLiteralUnion(allocator, non_null.items)) |enum_value| {
-        return preserveMeta(allocator, obj, enum_value);
+    if (try tryFlattenLiteralUnion(allocator, non_null.items)) |enum_value| {
+        return try preserveMeta(allocator, obj, enum_value);
     }
 
     return null;
@@ -390,10 +389,11 @@ fn isNullSchema(value: std.json.Value) bool {
 
 /// Try to flatten anyOf/oneOf with only literal values to enum.
 /// Example: anyOf: [{const:"a",type:"string"},{const:"b",type:"string"}] -> {type:"string",enum:["a","b"]}
-fn tryFlattenLiteralUnion(allocator: std.mem.Allocator, variants: []const std.json.Value) ?std.json.Value {
+fn tryFlattenLiteralUnion(allocator: std.mem.Allocator, variants: []const std.json.Value) CleanError!?std.json.Value {
     if (variants.len == 0) return null;
 
     var all_values: std.ArrayList(std.json.Value) = .empty;
+    defer all_values.deinit(allocator);
     var common_type: ?[]const u8 = null;
 
     for (variants) |variant| {
@@ -420,19 +420,19 @@ fn tryFlattenLiteralUnion(allocator: std.mem.Allocator, variants: []const std.js
             common_type = variant_type;
         }
 
-        all_values.append(allocator, literal_value) catch return null;
+        try all_values.append(allocator, literal_value);
     }
 
     const ct = common_type orelse return null;
 
-    var result = std.json.ObjectMap.empty;
-    result.put(allocator, "type", .{ .string = ct }) catch return null;
+    var result = try json_object_map.init(allocator);
+    try json_object_map.put(&result, allocator, "type", .{ .string = ct });
     var enum_arr = std.json.Array.init(allocator);
-    enum_arr.ensureTotalCapacity(all_values.items.len) catch return null;
+    try enum_arr.ensureTotalCapacity(all_values.items.len);
     for (all_values.items) |v| {
         enum_arr.appendAssumeCapacity(v);
     }
-    result.put(allocator, "enum", .{ .array = enum_arr }) catch return null;
+    try json_object_map.put(&result, allocator, "enum", .{ .array = enum_arr });
 
     return .{ .object = result };
 }
@@ -465,12 +465,12 @@ fn cleanProperties(
     ref_stack: *std.StringHashMap(void),
 ) CleanError!std.json.Value {
     if (value != .object) return value;
-    var cleaned = std.json.ObjectMap.empty;
+    var cleaned = try json_object_map.init(allocator);
     var it = value.object.iterator();
     while (it.next()) |entry| {
         const k = entry.key_ptr.*;
         const v = entry.value_ptr.*;
-        try cleaned.put(allocator, k, try cleanValue(allocator, v, strategy, defs, ref_stack));
+        try json_object_map.put(&cleaned, allocator, k, try cleanValue(allocator, v, strategy, defs, ref_stack));
     }
     return .{ .object = cleaned };
 }
@@ -495,12 +495,16 @@ fn cleanUnion(
 }
 
 /// Preserve metadata (description, title, default) from source to target.
-fn preserveMeta(allocator: std.mem.Allocator, source: *const std.json.ObjectMap, target: std.json.Value) std.json.Value {
+fn preserveMeta(
+    allocator: std.mem.Allocator,
+    source: *const std.json.ObjectMap,
+    target: std.json.Value,
+) CleanError!std.json.Value {
     if (target != .object) return target;
     var obj = target.object;
     for (&SCHEMA_META_KEYS) |key| {
         if (source.get(key)) |val| {
-            obj.put(allocator, key, val) catch |err| log.err("preserveMeta: failed to put key {s}: {}", .{ key, err });
+            try json_object_map.put(&obj, allocator, key, val);
         }
     }
     return .{ .object = obj };
