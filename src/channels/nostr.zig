@@ -282,16 +282,16 @@ pub const NostrChannel = struct {
     /// Extract `["relay","<url>"]` tag values from a kind:10050 event JSON string.
     /// Returns an owned slice of owned URL strings. Caller must free each item and the slice.
     pub fn parseRelayTags(allocator: Allocator, json: []const u8) ![][]u8 {
-        var list = std.ArrayListUnmanaged([]u8).empty;
+        var list = std.ArrayList([]u8).empty;
         errdefer {
             for (list.items) |r| allocator.free(r);
             list.deinit(allocator);
         }
         const needle = "[\"relay\",\"";
         var pos: usize = 0;
-        while (std.mem.indexOfPos(u8, json, pos, needle)) |idx| {
+        while (std.mem.findPos(u8, json, pos, needle)) |idx| {
             const val_start = idx + needle.len;
-            const val_end = std.mem.indexOfPos(u8, json, val_start, "\"") orelse break;
+            const val_end = std.mem.findPos(u8, json, val_start, "\"") orelse break;
             const url = json[val_start..val_end];
             if (url.len >= 6) { // minimum viable URL: "ws://x"
                 try list.append(allocator, try allocator.dupe(u8, url));
@@ -346,7 +346,7 @@ pub const NostrChannel = struct {
         }
 
         const stdout_file = child.stdout orelse return error.NakCommandFailed;
-        var output = std.ArrayListUnmanaged(u8).empty;
+        var output = std.ArrayList(u8).empty;
         errdefer output.deinit(self.allocator);
         var read_buf: [4096]u8 = undefined;
         while (true) {
@@ -596,7 +596,7 @@ pub const NostrChannel = struct {
     /// Best-effort: caller should ignore errors (dedup is non-critical).
     pub fn recordSeenRumor(self: *NostrChannel, rumor_id: []const u8, now: i64) !void {
         // Collect stale keys (can't remove during iteration).
-        var stale = std.ArrayListUnmanaged([]const u8).empty;
+        var stale = std.ArrayList([]const u8).empty;
         defer stale.deinit(self.allocator);
 
         var it = self.seen_rumor_ids.iterator();
@@ -655,7 +655,7 @@ pub const NostrChannel = struct {
 
             // Process complete lines.
             var start: usize = 0;
-            while (std.mem.indexOfPos(u8, buf[0..filled], start, "\n")) |nl| {
+            while (std.mem.findPos(u8, buf[0..filled], start, "\n")) |nl| {
                 const line = buf[start..nl];
                 start = nl + 1;
                 if (line.len == 0) continue;
@@ -671,7 +671,7 @@ pub const NostrChannel = struct {
             // Move remaining partial line to front.
             if (start > 0) {
                 const remaining = filled - start;
-                std.mem.copyForwards(u8, buf[0..remaining], buf[start..filled]);
+                @memmove(buf[0..remaining], buf[start..filled]);
                 filled = remaining;
             } else if (filled == buf.len) {
                 // Line too long, discard buffer.
