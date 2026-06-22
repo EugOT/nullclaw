@@ -17,6 +17,7 @@ pub const claude_cli = @import("claude_cli.zig");
 pub const codex_cli = @import("codex_cli.zig");
 pub const gemini_cli = @import("gemini_cli.zig");
 pub const openai_codex = @import("openai_codex.zig");
+pub const policy_blocked = @import("policy_blocked.zig");
 pub const runtime_bundle = @import("runtime_bundle.zig");
 pub const api_error_details = @import("api_error_details.zig");
 
@@ -43,6 +44,7 @@ pub const resolveApiKeyFromConfig = api_key.resolveApiKeyFromConfig;
 // Re-exports from factory.zig
 pub const ProviderKind = factory.ProviderKind;
 pub const classifyProvider = factory.classifyProvider;
+pub const providerKindAllowedByRuntimePolicy = factory.providerKindAllowedByRuntimePolicy;
 pub const detectProviderByApiKey = factory.detectProviderByApiKey;
 pub const compatibleProviderUrl = factory.compatibleProviderUrl;
 pub const compatibleProviderDisplayName = factory.compatibleProviderDisplayName;

@@ -811,9 +811,9 @@ test "applyConfigPatchFields maps generic wizard config fields" {
         \\        "language": "en",
         \\        "models": [
         \\          {
-        \\            "provider": "openai",
-        \\            "model": "whisper-1",
-        \\            "base_url": "https://api.openai.com/v1/audio/transcriptions"
+        \\            "provider": "groq",
+        \\            "model": "whisper-large-v3",
+        \\            "base_url": "https://api.groq.com/openai/v1/audio/transcriptions"
         \\          }
         \\        ]
         \\      }
@@ -841,10 +841,10 @@ test "applyConfigPatchFields maps generic wizard config fields" {
     try std.testing.expect(cfg.a2a.multi_modal);
     try std.testing.expectEqualStrings("Desktop Overlay", cfg.a2a.name);
     try std.testing.expect(cfg.audio_media.enabled);
-    try std.testing.expectEqualStrings("openai", cfg.audio_media.provider);
-    try std.testing.expectEqualStrings("whisper-1", cfg.audio_media.model);
+    try std.testing.expectEqualStrings("groq", cfg.audio_media.provider);
+    try std.testing.expectEqualStrings("whisper-large-v3", cfg.audio_media.model);
     try std.testing.expectEqualStrings("en", cfg.audio_media.language.?);
-    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", cfg.audio_media.base_url.?);
+    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1/audio/transcriptions", cfg.audio_media.base_url.?);
     try std.testing.expectEqualStrings("minimal_none", cfg.memory.profile);
     try std.testing.expectEqualStrings("none", cfg.memory.backend);
     try std.testing.expect(!cfg.memory.auto_save);
@@ -867,7 +867,7 @@ test "applyProvidersFromArray sets model default from primary provider when omit
         \\{
         \\  "providers": [
         \\    { "provider": "groq", "api_key": "gsk_test" },
-        \\    { "provider": "openrouter", "api_key": "sk-or-test" }
+        \\    { "provider": "nearai", "api_key": "nearai-test" }
         \\  ]
         \\}
     ;
@@ -921,30 +921,28 @@ test "applyLegacyProviderAnswers preserves existing providers when updating flat
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",
         .allocator = allocator,
-        .default_provider = "openrouter",
-        .default_model = "anthropic/claude-sonnet-4.6",
+        .default_provider = "nearai",
+        .default_model = "zai-org/GLM-5.1-FP8",
         .providers = &.{
             .{
-                .name = "openrouter",
-                .api_key = "sk-or-existing",
+                .name = "nearai",
+                .api_key = "nearai-existing",
             },
             .{
-                .name = "google-vertex",
-                .api_key = "vertex-old",
-                .base_url = "https://vertex.example/v1",
+                .name = "groq",
+                .api_key = "groq-old",
             },
         },
     };
 
     try applyLegacyProviderAnswers(&cfg, .{
-        .provider = "vertex",
-        .api_key = "vertex-new",
+        .provider = "groq",
+        .api_key = "groq-new",
     });
 
-    try std.testing.expectEqualStrings("vertex", cfg.default_provider);
-    try std.testing.expectEqualStrings(onboard.defaultModelForProvider("vertex"), cfg.default_model.?);
+    try std.testing.expectEqualStrings("groq", cfg.default_provider);
+    try std.testing.expectEqualStrings(onboard.defaultModelForProvider("groq"), cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
-    try std.testing.expectEqualStrings("sk-or-existing", cfg.getProviderKey("openrouter").?);
-    try std.testing.expectEqualStrings("vertex-new", cfg.getProviderKey("google-vertex").?);
-    try std.testing.expectEqualStrings("https://vertex.example/v1", cfg.getProviderBaseUrl("vertex").?);
+    try std.testing.expectEqualStrings("nearai-existing", cfg.getProviderKey("nearai").?);
+    try std.testing.expectEqualStrings("groq-new", cfg.getProviderKey("groq").?);
 }

@@ -50,6 +50,8 @@ fn providerHasStartupCredentials(
     config: *const Config,
     provider_name: []const u8,
 ) bool {
+    if (!providers.providerKindAllowedByRuntimePolicy(providers.classifyProvider(provider_name))) return false;
+
     const resolved_key = providers.resolveApiKeyFromConfig(
         allocator,
         provider_name,
@@ -82,8 +84,10 @@ fn hasReliabilityCredentialFallback(
     allocator: std.mem.Allocator,
     config: *const Config,
 ) bool {
-    for (config.reliability.api_keys) |key| {
-        if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+    if (providers.providerKindAllowedByRuntimePolicy(providers.classifyProvider(config.default_provider))) {
+        for (config.reliability.api_keys) |key| {
+            if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+        }
     }
 
     for (config.reliability.fallback_providers) |provider_name| {

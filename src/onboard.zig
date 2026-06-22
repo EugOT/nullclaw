@@ -19,6 +19,7 @@ const config_mod = @import("config.zig");
 const net_security = @import("net_security.zig");
 const Config = config_mod.Config;
 const channel_catalog = @import("channel_catalog.zig");
+const providers = @import("providers/root.zig");
 const provider_names = @import("provider_names.zig");
 const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
@@ -100,14 +101,14 @@ pub const ProviderInfo = struct {
 
 pub const known_providers = [_]ProviderInfo{
     // --- Tier 1: Major multi-provider gateways ---
-    .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "OPENROUTER_API_KEY" },
-    .{ .key = "anthropic", .label = "Anthropic (Claude direct)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
-    .{ .key = "openai", .label = "OpenAI (GPT direct)", .default_model = "gpt-5.2", .env_var = "OPENAI_API_KEY" },
-    .{ .key = "azure", .label = "Azure OpenAI (GPT via Azure)", .default_model = "gpt-5.2-chat", .env_var = "AZURE_OPENAI_API_KEY" },
+    .{ .key = "openrouter", .label = "OpenRouter (disabled by runtime policy)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "" },
+    .{ .key = "anthropic", .label = "Anthropic direct (disabled by runtime policy)", .default_model = "claude-opus-4-6", .env_var = "" },
+    .{ .key = "openai", .label = "OpenAI direct (disabled by runtime policy)", .default_model = "gpt-5.2", .env_var = "" },
+    .{ .key = "azure", .label = "Azure OpenAI direct (disabled by runtime policy)", .default_model = "gpt-5.2-chat", .env_var = "" },
 
     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
-    .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
-    .{ .key = "vertex", .label = "Google Vertex AI (Gemini)", .default_model = "gemini-2.5-pro", .env_var = "VERTEX_API_KEY" },
+    .{ .key = "gemini", .label = "Google Gemini direct (disabled by runtime policy)", .default_model = "gemini-2.5-pro", .env_var = "" },
+    .{ .key = "vertex", .label = "Google Vertex AI direct (disabled by runtime policy)", .default_model = "gemini-2.5-pro", .env_var = "" },
     .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-chat", .env_var = "DEEPSEEK_API_KEY" },
     .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "llama-3.3-70b-versatile", .env_var = "GROQ_API_KEY" },
 
@@ -155,10 +156,10 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "lm-studio", .label = "LM Studio (local GUI)", .default_model = "local-model", .env_var = "API_KEY" },
 
     // --- Tier 10: CLI-based providers ---
-    .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
-    .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "OPENAI_API_KEY" },
+    .{ .key = "claude-cli", .label = "Claude CLI (approved runtime)", .default_model = "claude-opus-4-6", .env_var = "" },
+    .{ .key = "codex-cli", .label = "Codex CLI (approved runtime)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
     .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT login)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
-    .{ .key = "gemini-cli", .label = "Gemini CLI (Google Gemini, local)", .default_model = "gemini-2.0-flash", .env_var = "GEMINI_API_KEY" },
+    .{ .key = "gemini-cli", .label = "Gemini CLI (disabled; use Antigravity)", .default_model = "gemini-2.0-flash", .env_var = "" },
 };
 
 /// Canonicalize provider name (handle aliases).
@@ -171,6 +172,24 @@ fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
         if (std.mem.eql(u8, p.key, name)) return p;
     }
     return null;
+}
+
+fn providerAllowedByRuntimePolicy(name: []const u8) bool {
+    return providers.providerKindAllowedByRuntimePolicy(providers.classifyProvider(name));
+}
+
+fn customProviderUrlAllowedByRuntimePolicy(url: []const u8) bool {
+    const forbidden_hosts = [_][]const u8{
+        "api.openai.com",
+        "api.anthropic.com",
+        "generativelanguage.googleapis.com",
+        "aiplatform.googleapis.com",
+        "openrouter.ai",
+    };
+    for (forbidden_hosts) |host| {
+        if (std.mem.indexOf(u8, url, host) != null) return false;
+    }
+    return true;
 }
 
 fn isValidCustomProviderUrl(url: []const u8) bool {
@@ -188,6 +207,8 @@ fn isLocalEndpoint(url: []const u8) bool {
 
 fn providerRequiresApiKeyForSetup(provider: []const u8, base_url: ?[]const u8) bool {
     const canonical = canonicalProviderName(provider);
+    if (!providerAllowedByRuntimePolicy(canonical)) return false;
+
     if (std.mem.eql(u8, canonical, "ollama") or
         std.mem.eql(u8, canonical, "lm-studio") or
         std.mem.eql(u8, canonical, "lmstudio") or
@@ -219,6 +240,12 @@ fn printProviderNextSteps(
     has_configured_key: bool,
 ) !void {
     const canonical = canonicalProviderName(provider);
+
+    if (!providerAllowedByRuntimePolicy(canonical)) {
+        try out.writeAll("    1. Provider disabled by runtime policy.\n");
+        try out.writeAll("    2. Use claude-cli, codex-cli, ollama, or an approved custom/local provider.\n");
+        return;
+    }
 
     if (requires_api_key and !has_configured_key) {
         try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
@@ -275,6 +302,7 @@ pub fn resolveProviderForQuickSetup(name: []const u8) ?ProviderInfo {
     if (std.mem.startsWith(u8, name, "custom:")) {
         const custom_url = name["custom:".len..];
         if (!isValidCustomProviderUrl(custom_url)) return null;
+        if (!customProviderUrlAllowedByRuntimePolicy(custom_url)) return null;
         return .{
             .key = name,
             .label = "Custom OpenAI-compatible provider",
@@ -284,6 +312,7 @@ pub fn resolveProviderForQuickSetup(name: []const u8) ?ProviderInfo {
     }
 
     const canonical = canonicalProviderName(name);
+    if (!providerAllowedByRuntimePolicy(canonical)) return null;
     return findProviderInfoByCanonical(canonical);
 }
 
@@ -326,6 +355,7 @@ fn writeOnboardingNextSteps(out: anytype, api_key_env_hint: ?[]const u8) !void {
 /// Get the environment variable name for a provider's API key.
 pub fn providerEnvVar(provider: []const u8) []const u8 {
     const canonical = canonicalProviderName(provider);
+    if (!providerAllowedByRuntimePolicy(canonical)) return "";
     if (findProviderInfoByCanonical(canonical)) |p| return p.env_var;
     return "API_KEY";
 }
@@ -651,6 +681,8 @@ fn resolveNativeModelsRequest(
 }
 
 fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) !?[][]const u8 {
+    if (!providerAllowedByRuntimePolicy(canonical)) return null;
+
     const request = (try resolveNativeModelsRequest(allocator, canonical, base_url)) orelse return null;
     defer if (request.url_owned) allocator.free(request.url);
 
@@ -673,6 +705,8 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
 }
 
 fn staticNativeModelCatalogForProvider(canonical: []const u8) ?NativeModelCatalog {
+    if (!providerAllowedByRuntimePolicy(canonical)) return null;
+
     if (std.mem.eql(u8, canonical, "openrouter")) {
         return .{ .url = "https://openrouter.ai/api/v1/models" };
     } else if (std.mem.eql(u8, canonical, "openai")) {
@@ -1451,15 +1485,20 @@ fn promptProviderSelection(
     input_buf: []u8,
 ) !?ProviderSelection {
     try out.writeAll("    Available providers:\n");
-    for (known_providers, 0..) |p, i| {
-        try out.print("      [{d}] {s}\n", .{ i + 1, p.label });
+    var allowed_providers: [known_providers.len]ProviderInfo = undefined;
+    var allowed_count: usize = 0;
+    for (known_providers) |p| {
+        if (!providerAllowedByRuntimePolicy(p.key)) continue;
+        allowed_providers[allowed_count] = p;
+        allowed_count += 1;
+        try out.print("      [{d}] {s}\n", .{ allowed_count, p.label });
     }
-    try out.print("      [{d}] Custom OpenAI-compatible provider (custom:https://.../v1)\n", .{known_providers.len + 1});
+    try out.print("      [{d}] Custom OpenAI-compatible provider (custom:https://.../v1)\n", .{allowed_count + 1});
     try out.writeAll("    Choice [1]: ");
-    const provider_idx = promptChoice(out, input_buf, known_providers.len + 1, 0) orelse return null;
+    const provider_idx = promptChoice(out, input_buf, allowed_count + 1, 0) orelse return null;
 
-    if (provider_idx < known_providers.len) {
-        const provider = known_providers[provider_idx];
+    if (provider_idx < allowed_count) {
+        const provider = allowed_providers[provider_idx];
         return .{
             .key = provider.key,
             .default_model = provider.default_model,
@@ -1470,7 +1509,7 @@ fn promptProviderSelection(
     try out.writeAll("    Enter custom base URL (must include version segment, e.g. https://host/v1): ");
     while (true) {
         const custom_url = prompt(out, input_buf, "", "") orelse return null;
-        if (isValidCustomProviderUrl(custom_url)) {
+        if (isValidCustomProviderUrl(custom_url) and customProviderUrlAllowedByRuntimePolicy(custom_url)) {
             return .{
                 .key = try std.fmt.allocPrint(allocator, "custom:{s}", .{custom_url}),
                 .default_model = "gpt-5.2",
@@ -1478,7 +1517,7 @@ fn promptProviderSelection(
                 .base_url = try allocator.dupe(u8, custom_url),
             };
         }
-        try out.writeAll("    Invalid URL. It must start with http:// or https:// and include a version path like /v1. Try again: ");
+        try out.writeAll("    Invalid or policy-disabled URL. It must start with http:// or https://, include a version path like /v1, and avoid disabled provider endpoints. Try again: ");
     }
 }
 
@@ -2723,8 +2762,9 @@ const ModelsCatalogProvider = struct {
 };
 
 const catalog_providers = [_]ModelsCatalogProvider{
-    .{ .name = "openai", .url = "https://api.openai.com/v1/models", .models_path = "data", .id_field = "id" },
-    .{ .name = "openrouter", .url = "https://openrouter.ai/api/v1/models", .models_path = "data", .id_field = "id" },
+    .{ .name = "groq", .url = "https://api.groq.com/openai/v1/models", .models_path = "data", .id_field = "id" },
+    .{ .name = "nearai", .url = NEARAI_MODELS_URL, .models_path = "data", .id_field = "id" },
+    .{ .name = "atlas-cloud", .url = ATLAS_CLOUD_MODELS_URL, .models_path = "data", .id_field = "id" },
 };
 
 const ModelsRefreshFetchOptions = struct {
@@ -3538,10 +3578,10 @@ test "defaultModelForProvider falls back for unknown" {
 }
 
 test "providerEnvVar known providers" {
-    try std.testing.expectEqualStrings("OPENROUTER_API_KEY", providerEnvVar("openrouter"));
-    try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
-    try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
-    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
+    try std.testing.expectEqualStrings("", providerEnvVar("openrouter"));
+    try std.testing.expectEqualStrings("", providerEnvVar("anthropic"));
+    try std.testing.expectEqualStrings("", providerEnvVar("openai"));
+    try std.testing.expectEqualStrings("", providerEnvVar("azure"));
     try std.testing.expectEqualStrings("NEARAI_API_KEY", providerEnvVar("nearai"));
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas-cloud"));
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas"));
@@ -3575,7 +3615,7 @@ test "providerRequiresApiKeyForSetup marks local and OAuth providers as keyless"
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://100.64.0.1:8080/v1", "http://100.64.0.1:8080/v1"));
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://model.local:8080/v1", "http://model.local:8080/v1"));
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://[fd00::1]:8080/v1", "http://[fd00::1]:8080/v1"));
-    try std.testing.expect(providerRequiresApiKeyForSetup("openai", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("openai", null));
 }
 
 test "known_providers has entries" {
@@ -3716,11 +3756,11 @@ test "appendOrReplaceProviderEntry appends a second provider without dropping th
     var cfg = try initFreshConfig(std.testing.allocator);
     defer cfg.deinit();
 
-    try appendOrReplaceProviderEntry(&cfg, "openrouter", "sk-or-test", null);
+    try appendOrReplaceProviderEntry(&cfg, "groq", "gsk-test", null);
     try appendOrReplaceProviderEntry(&cfg, "moonshot", "sk-ms-test", null);
 
     try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
-    try std.testing.expectEqualStrings("openrouter", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("groq", cfg.providers[0].name);
     try std.testing.expectEqualStrings("moonshot", cfg.providers[1].name);
 }
 
@@ -3728,13 +3768,13 @@ test "appendOrReplaceProviderEntry replaces existing provider entry in place" {
     var cfg = try initFreshConfig(std.testing.allocator);
     defer cfg.deinit();
 
-    try appendOrReplaceProviderEntry(&cfg, "openrouter", "sk-or-test", null);
-    try appendOrReplaceProviderEntry(&cfg, "openrouter", "sk-or-updated", "https://openrouter.ai/api/v1");
+    try appendOrReplaceProviderEntry(&cfg, "groq", "gsk-test", null);
+    try appendOrReplaceProviderEntry(&cfg, "groq", "gsk-updated", "https://api.groq.com/openai/v1");
 
     try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
-    try std.testing.expectEqualStrings("openrouter", cfg.providers[0].name);
-    try std.testing.expectEqualStrings("sk-or-updated", cfg.providers[0].api_key.?);
-    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", cfg.providers[0].base_url.?);
+    try std.testing.expectEqualStrings("groq", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("gsk-updated", cfg.providers[0].api_key.?);
+    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1", cfg.providers[0].base_url.?);
 }
 
 test "appendOrReplaceProviderEntry preserves advanced provider overrides when updating credentials" {
@@ -4296,8 +4336,10 @@ test "canonicalProviderName unknown returns as-is" {
 }
 
 test "resolveProviderForQuickSetup handles known and alias names" {
-    const openrouter = resolveProviderForQuickSetup("openrouter") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("openrouter", openrouter.key);
+    try std.testing.expect(resolveProviderForQuickSetup("openrouter") == null);
+
+    const groq = resolveProviderForQuickSetup("groq") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("groq", groq.key);
 
     const grok_alias = resolveProviderForQuickSetup("grok") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("xai", grok_alias.key);
@@ -4392,61 +4434,57 @@ test "ensureSecretsEncryptionEnabled rejects plaintext secrets config" {
     try std.testing.expectError(Config.ValidationError.InsecurePlaintextSecrets, ensureSecretsEncryptionEnabled(&cfg));
 }
 
-test "printProviderNextSteps prefers interactive chat when api key is already set" {
+test "printProviderNextSteps blocks disabled direct provider when api key is already set" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
-    try printProviderNextSteps(&aw.writer, "openai", "OPENAI_API_KEY", true, true);
+    try printProviderNextSteps(&aw.writer, "openai", "", true, true);
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Then type:         Hello!") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Status:            nullclaw status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Provider disabled by runtime policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") == null);
 }
 
-test "printProviderNextSteps includes env hint before interactive chat" {
+test "printProviderNextSteps blocks disabled direct provider before env hint" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
-    try printProviderNextSteps(&aw.writer, "openai", "OPENAI_API_KEY", true, false);
+    try printProviderNextSteps(&aw.writer, "openai", "", true, false);
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "export OPENAI_API_KEY=\"sk-...\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "export OPENAI_API_KEY=\"sk-...\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Provider disabled by runtime policy") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Gateway:           nullclaw gateway") != null);
 }
 
-test "printProviderNextSteps warns about OpenRouter free-tier defaults" {
+test "printProviderNextSteps blocks OpenRouter by runtime policy" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
     try printProviderNextSteps(&aw.writer, "openrouter", "OPENROUTER_API_KEY", true, true);
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "`:free` model") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "rate-limit errors") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Provider disabled by runtime policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "`:free` model") == null);
 }
 
-test "printProviderNextSteps keeps openai-codex auth flow and interactive chat" {
+test "printProviderNextSteps blocks openai-codex auth flow" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
     try printProviderNextSteps(&aw.writer, "openai-codex", "", false, false);
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw auth login openai-codex") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "--import-codex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Provider disabled by runtime policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw auth login openai-codex") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
 }
 
 test "printProviderNextSteps keeps codex-cli auth flow and interactive chat" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
-    try printProviderNextSteps(&aw.writer, "codex-cli", "OPENAI_API_KEY", false, false);
+    try printProviderNextSteps(&aw.writer, "codex-cli", "", false, false);
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
     try std.testing.expect(std.mem.indexOf(u8, rendered, "codex login") != null);
@@ -4454,29 +4492,28 @@ test "printProviderNextSteps keeps codex-cli auth flow and interactive chat" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
 }
 
-test "printProviderNextSteps keeps gemini-cli auth flow and interactive chat" {
+test "printProviderNextSteps blocks gemini-cli auth flow" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
-    try printProviderNextSteps(&aw.writer, "gemini-cli", "GEMINI_API_KEY", false, false);
+    try printProviderNextSteps(&aw.writer, "gemini-cli", "", false, false);
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Authenticate:  gemini") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Login with Google") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Provider disabled by runtime policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Authenticate:  gemini") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
 }
 
 test "providerEnvVar gemini aliases" {
-    try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("gemini"));
-    try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google"));
-    try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google-gemini"));
+    try std.testing.expectEqualStrings("", providerEnvVar("gemini"));
+    try std.testing.expectEqualStrings("", providerEnvVar("google"));
+    try std.testing.expectEqualStrings("", providerEnvVar("google-gemini"));
 }
 
 test "providerEnvVar vertex aliases" {
-    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex"));
-    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex-ai"));
-    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("google-vertex"));
+    try std.testing.expectEqualStrings("", providerEnvVar("vertex"));
+    try std.testing.expectEqualStrings("", providerEnvVar("vertex-ai"));
+    try std.testing.expectEqualStrings("", providerEnvVar("google-vertex"));
 }
 
 test "providerEnvVar deepseek" {
@@ -4593,8 +4630,8 @@ test "autonomy_options has 4 entries" {
 
 test "catalog_providers has entries" {
     try std.testing.expect(catalog_providers.len >= 2);
-    try std.testing.expectEqualStrings("openai", catalog_providers[0].name);
-    try std.testing.expectEqualStrings("openrouter", catalog_providers[1].name);
+    try std.testing.expectEqualStrings("groq", catalog_providers[0].name);
+    try std.testing.expectEqualStrings("nearai", catalog_providers[1].name);
 }
 
 test "catalog_providers all have valid fields" {
@@ -5313,11 +5350,14 @@ test "resolveNativeModelsRequest returns null for unknown provider without base_
 test "resolveNativeModelsRequest keeps known providers and url providers intact" {
     const allocator = std.testing.allocator;
 
-    // Known static provider: fixed catalog URL, not owned.
-    const known = (try resolveNativeModelsRequest(allocator, "openrouter", null)) orelse
+    // Policy-disabled static providers do not produce fetch requests.
+    try std.testing.expect((try resolveNativeModelsRequest(allocator, "openrouter", null)) == null);
+
+    // Known policy-allowed static provider: fixed catalog URL, not owned.
+    const known = (try resolveNativeModelsRequest(allocator, "groq", null)) orelse
         return error.TestExpectedEqual;
     defer if (known.url_owned) allocator.free(known.url);
-    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/models", known.url);
+    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1/models", known.url);
     try std.testing.expect(!known.url_owned);
 
     // Bare http(s) provider (custom: path): built URL, hard auth required.
@@ -5459,9 +5499,10 @@ test "staticNativeModelCatalogForProvider maps native model endpoints" {
     try std.testing.expect(!atlas.needs_auth);
     try std.testing.expect(atlas.parse_options.require_chat_modalities);
 
-    const openai = staticNativeModelCatalogForProvider("openai") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(openai.needs_auth);
-    try std.testing.expectEqualStrings("gpt-", openai.parse_options.prefix_filter.?);
+    try std.testing.expect(staticNativeModelCatalogForProvider("openai") == null);
+
+    const groq = staticNativeModelCatalogForProvider("groq") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(groq.needs_auth);
 }
 
 test "parseModelsDevModelIds filters non-chat models and sorts them" {

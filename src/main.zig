@@ -6417,15 +6417,15 @@ test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled
     try std.testing.expectEqual(!yc.channel_catalog.isBuildEnabled(.telegram), hasConfiguredButBuildDisabledStartableChannels(&cfg));
 }
 
-test "hasStartupProviderCredentials accepts configured primary key" {
+test "hasStartupProviderCredentials accepts configured allowed provider key" {
     const providers_cfg = [_]yc.config.ProviderEntry{
-        .{ .name = "anthropic", .api_key = "sk-test" },
+        .{ .name = "groq", .api_key = "gsk_test" },
     };
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
-        .default_provider = "anthropic",
-        .default_model = "anthropic/claude-3-7-sonnet",
+        .default_provider = "groq",
+        .default_model = "openai/gpt-oss-20b",
         .allocator = std.testing.allocator,
         .providers = &providers_cfg,
     };
@@ -6445,7 +6445,7 @@ test "hasStartupProviderCredentials accepts local compatible provider without ap
     try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
 }
 
-test "hasStartupProviderCredentials accepts gemini oauth env token" {
+test "hasStartupProviderCredentials rejects gemini oauth env token by runtime policy" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const c = @cImport({
         @cInclude("stdlib.h");
@@ -6466,15 +6466,15 @@ test "hasStartupProviderCredentials accepts gemini oauth env token" {
         .allocator = std.testing.allocator,
     };
 
-    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+    try std.testing.expect(!yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
 }
 
 test "hasStartupProviderCredentials accepts reliability fallback credentials" {
     var cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
-        .default_provider = "anthropic",
-        .default_model = "anthropic/claude-3-7-sonnet",
+        .default_provider = "groq",
+        .default_model = "openai/gpt-oss-20b",
         .allocator = std.testing.allocator,
     };
     cfg.reliability.api_keys = &.{"rotating-key"};

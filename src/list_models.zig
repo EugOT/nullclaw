@@ -87,7 +87,8 @@ test "run requires --provider flag" {
 test "resolveProviderKey accepts unknown provider only with base_url" {
     try std.testing.expect(resolveProviderKey("my-gateway", null) == null);
     try std.testing.expectEqualStrings("my-gateway", resolveProviderKey("my-gateway", "https://gateway.example.com/v1").?);
-    try std.testing.expectEqualStrings("openai", resolveProviderKey("openai", null).?);
+    try std.testing.expect(resolveProviderKey("openai", null) == null);
+    try std.testing.expectEqualStrings("groq", resolveProviderKey("groq", null).?);
 }
 
 test "isValidBaseUrlArg matches provider base_url validation" {
