@@ -6,8 +6,20 @@ const std = @import("std");
 const std_compat = @import("compat");
 const onboard = @import("onboard.zig");
 const config_types = @import("config_types.zig");
+const provider_names = @import("provider_names.zig");
+
+fn providerBlockedByRuntimePolicy(provider: []const u8) bool {
+    const canonical = provider_names.canonicalProviderName(provider);
+    return std.mem.eql(u8, canonical, "anthropic") or
+        std.mem.eql(u8, canonical, "openai") or
+        std.mem.eql(u8, canonical, "azure") or
+        std.mem.eql(u8, canonical, "gemini") or
+        std.mem.eql(u8, canonical, "vertex") or
+        std.mem.eql(u8, canonical, "openai-codex");
+}
 
 fn resolveProviderKey(provider: []const u8, base_url: ?[]const u8) ?[]const u8 {
+    if (providerBlockedByRuntimePolicy(provider)) return null;
     if (onboard.resolveProviderForQuickSetup(provider)) |info| return info.key;
     if (base_url != null) return provider;
     return null;
@@ -88,7 +100,12 @@ test "resolveProviderKey accepts unknown provider only with base_url" {
     try std.testing.expect(resolveProviderKey("my-gateway", null) == null);
     try std.testing.expectEqualStrings("my-gateway", resolveProviderKey("my-gateway", "https://gateway.example.com/v1").?);
     try std.testing.expect(resolveProviderKey("openai", null) == null);
+    try std.testing.expect(resolveProviderKey("openai", "https://gateway.example.com/v1") == null);
+    try std.testing.expect(resolveProviderKey("gemini", null) == null);
+    try std.testing.expect(resolveProviderKey("vertex", null) == null);
+    try std.testing.expect(resolveProviderKey("openai-codex", null) == null);
     try std.testing.expectEqualStrings("groq", resolveProviderKey("groq", null).?);
+    try std.testing.expectEqualStrings("gemini-cli", resolveProviderKey("gemini-cli", null).?);
 }
 
 test "isValidBaseUrlArg matches provider base_url validation" {

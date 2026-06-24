@@ -6445,7 +6445,7 @@ test "hasStartupProviderCredentials accepts local compatible provider without ap
     try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
 }
 
-test "hasStartupProviderCredentials accepts gemini through antigravity cli runtime" {
+test "hasStartupProviderCredentials rejects direct gemini runtime" {
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
@@ -6454,10 +6454,23 @@ test "hasStartupProviderCredentials accepts gemini through antigravity cli runti
         .allocator = std.testing.allocator,
     };
 
-    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+    try std.testing.expect(!yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
 }
 
 test "hasStartupProviderCredentials accepts reliability fallback credentials" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "groq",
+        .default_model = "groq/llama-3.3-70b-versatile",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.api_keys = &.{"rotating-key"};
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials rejects direct provider fallback credentials" {
     var cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
@@ -6467,7 +6480,7 @@ test "hasStartupProviderCredentials accepts reliability fallback credentials" {
     };
     cfg.reliability.api_keys = &.{"rotating-key"};
 
-    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+    try std.testing.expect(!yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
 }
 
 test "hasStartupProviderCredentials rejects blank configured key" {
