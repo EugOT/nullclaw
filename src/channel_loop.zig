@@ -45,6 +45,19 @@ fn hasNonEmptyCredential(value: ?[]const u8) bool {
     return std.mem.trim(u8, credential, " \t\r\n").len > 0;
 }
 
+fn providerKeyIsAllowedStartupCredential(provider_name: []const u8) bool {
+    return switch (providers.classifyProvider(provider_name)) {
+        .anthropic_provider,
+        .openai_provider,
+        .azure_openai_provider,
+        .gemini_provider,
+        .vertex_provider,
+        .openai_codex_provider,
+        => false,
+        else => true,
+    };
+}
+
 fn providerHasStartupCredentials(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -59,7 +72,7 @@ fn providerHasStartupCredentials(
     ) catch null;
     defer if (resolved_key) |key| allocator.free(key);
 
-    if (hasNonEmptyCredential(resolved_key)) return true;
+    if (providerKeyIsAllowedStartupCredential(provider_name) and hasNonEmptyCredential(resolved_key)) return true;
 
     var holder = providers.holderFromConfig(
         allocator,

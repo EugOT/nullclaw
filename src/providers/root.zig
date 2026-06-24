@@ -16,6 +16,7 @@ pub const sse = @import("sse.zig");
 pub const claude_cli = @import("claude_cli.zig");
 pub const codex_cli = @import("codex_cli.zig");
 pub const gemini_cli = @import("gemini_cli.zig");
+pub const disabled = @import("disabled.zig");
 pub const openai_codex = @import("openai_codex.zig");
 pub const policy_blocked = @import("policy_blocked.zig");
 pub const runtime_bundle = @import("runtime_bundle.zig");

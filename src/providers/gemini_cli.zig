@@ -10,13 +10,10 @@ const ChatMessage = root.ChatMessage;
 
 const log = std.log.scoped(.gemini_cli);
 
-/// Provider that delegates to the `gemini` CLI (Google Gemini).
+/// Provider that delegates Gemini-family requests to Antigravity CLI.
 ///
-/// Implements a Lazy Persistent Singleton:
-/// 1. Spawns `gemini --experimental-acp` on first use.
-/// 2. Performs a JSON-RPC 2.0 handshake to create a session.
-/// 3. Keeps the process alive for subsequent requests.
-/// 4. Communicates via JSON-RPC 2.0 over stdio.
+/// Direct Gemini API and the standalone Gemini CLI are disabled by policy.
+/// Antigravity is the approved runtime path for Gemini-family models.
 pub const GeminiCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -31,7 +28,7 @@ pub const GeminiCliProvider = struct {
     read_offset: usize = 0,
 
     const DEFAULT_MODEL = "gemini-2.0-flash";
-    const CLI_NAME = "gemini";
+    const CLI_NAME = "agy";
     const ACP_PROTOCOL_VERSION: u32 = 1;
 
     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !GeminiCliProvider {
@@ -78,7 +75,8 @@ pub const GeminiCliProvider = struct {
             try allocator.dupe(u8, message);
         defer allocator.free(prompt);
 
-        return self.sendPrompt(allocator, prompt, effective_model);
+        _ = effective_model;
+        return runAntigravityChat(allocator, prompt);
     }
 
     fn chatImpl(
@@ -92,7 +90,7 @@ pub const GeminiCliProvider = struct {
         const effective_model = if (model.len > 0) model else self.model;
 
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
-        const content = try self.sendPrompt(allocator, prompt, effective_model);
+        const content = try runAntigravityChat(allocator, prompt);
         return ChatResponse{ .content = content, .model = try allocator.dupe(u8, effective_model) };
     }
 
@@ -105,7 +103,39 @@ pub const GeminiCliProvider = struct {
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
-        return "gemini-cli";
+        return "antigravity-cli";
+    }
+
+    fn runAntigravityChat(allocator: std.mem.Allocator, prompt: []const u8) ![]const u8 {
+        const argv = [_][]const u8{
+            CLI_NAME,
+            "-p",
+            prompt,
+        };
+
+        var child = std_compat.process.Child.init(&argv, allocator);
+        child.stdin_behavior = .Close;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+
+        child.spawn() catch return error.CliNotFound;
+        const max_output: usize = 4 * 1024 * 1024;
+        const stdout_result = child.stdout.?.readToEndAlloc(allocator, max_output) catch |err| {
+            _ = child.wait() catch {};
+            return err;
+        };
+        errdefer allocator.free(stdout_result);
+        const stderr_result = child.stderr.?.readToEndAlloc(allocator, 64 * 1024) catch null;
+        defer if (stderr_result) |stderr| allocator.free(stderr);
+
+        const term = try child.wait();
+        switch (term) {
+            .exited => |code| {
+                if (code == 0) return stdout_result;
+                return error.CliProcessFailed;
+            },
+            else => return error.CliProcessFailed,
+        }
     }
 
     fn deinitImpl(ptr: *anyopaque) void {
@@ -156,7 +186,7 @@ pub const GeminiCliProvider = struct {
         self.read_offset = 0;
     }
 
-    /// Ensure the gemini agent process is running and a session is created.
+    /// Legacy Gemini-CLI ACP implementation retained only for inactive tests.
     fn ensureStarted(self: *GeminiCliProvider) !void {
         if (self.child != null and self.session_id != null) return;
         log.debug("starting process...", .{});
@@ -172,7 +202,7 @@ pub const GeminiCliProvider = struct {
         try argv_list.append(self.allocator, try self.allocator.dupe(u8, CLI_NAME));
         try argv_list.append(self.allocator, try self.allocator.dupe(u8, "--experimental-acp"));
         try argv_list.append(self.allocator, try self.allocator.dupe(u8, "--approval-mode"));
-        // NOTE: "yolo" mode is used here to allow the gemini-cli agent to perform
+        // NOTE: "yolo" mode was used here to allow the legacy Gemini CLI agent to perform
         // its internal tool calls (like reading workspace context) without
         // interactive approval, which is required for non-interactive ACP sessions.
         // Higher-level security is enforced by nullclaw's own tool approval logic.
@@ -385,7 +415,7 @@ pub const GeminiCliProvider = struct {
                 // Record detailed error message if available
                 if (err_val == .object) {
                     if (lookupErrorMessage(err_val.object)) |err_msg| {
-                        root.setLastApiErrorDetail("gemini-cli", err_msg);
+                        root.setLastApiErrorDetail("antigravity-cli", err_msg);
                     }
                 }
 
@@ -447,10 +477,10 @@ pub const GeminiCliProvider = struct {
         }
     }
 
-    /// Fetch available model names by running `gemini -p \"/model\" -o stream-json`.
+    /// Antigravity does not expose a model list command compatible with Gemini CLI.
     pub fn fetchModels(allocator: std.mem.Allocator) [][]const u8 {
-        if (builtin.is_test) return &.{};
-        return fetchModelsInternal(allocator) catch &.{};
+        _ = allocator;
+        return &.{};
     }
 
     fn fetchModelsInternal(allocator: std.mem.Allocator) ![][]const u8 {
@@ -556,7 +586,7 @@ fn recordJsonRpcError(prefix: []const u8, line: []const u8, err_val: ?std.json.V
         }
         if (err_obj == .object) {
             if (GeminiCliProvider.lookupErrorMessage(err_obj.object)) |message| {
-                root.setLastApiErrorDetail("gemini-cli", message);
+                root.setLastApiErrorDetail("antigravity-cli", message);
             }
         }
     } else {
@@ -643,16 +673,16 @@ fn extractLastUserMessage(messages: []const ChatMessage) ?[]const u8 {
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "GeminiCliProvider.getNameImpl returns gemini-cli" {
+test "GeminiCliProvider.getNameImpl returns antigravity-cli" {
     const vt = GeminiCliProvider.vtable;
     var dummy: u8 = 0;
-    try std.testing.expectEqualStrings("gemini-cli", vt.getName(@ptrCast(&dummy)));
+    try std.testing.expectEqualStrings("antigravity-cli", vt.getName(@ptrCast(&dummy)));
 }
 
 test "GeminiCliProvider vtable has correct function pointers" {
     const vt = GeminiCliProvider.vtable;
     var dummy: u8 = 0;
-    try std.testing.expectEqualStrings("gemini-cli", vt.getName(@ptrCast(&dummy)));
+    try std.testing.expectEqualStrings("antigravity-cli", vt.getName(@ptrCast(&dummy)));
     try std.testing.expect(!vt.supportsNativeTools(@ptrCast(&dummy)));
     try std.testing.expect(vt.supports_vision != null);
     try std.testing.expect(!vt.supports_vision.?(@ptrCast(&dummy)));
@@ -712,7 +742,7 @@ test "recordJsonRpcError stores message and msg detail" {
 
     const message_snapshot = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
     defer std.testing.allocator.free(message_snapshot);
-    try std.testing.expectEqualStrings("gemini-cli: request failed", message_snapshot);
+    try std.testing.expectEqualStrings("antigravity-cli: request failed", message_snapshot);
 
     root.clearLastApiErrorDetail();
 
@@ -724,7 +754,7 @@ test "recordJsonRpcError stores message and msg detail" {
 
     const msg_snapshot = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
     defer std.testing.allocator.free(msg_snapshot);
-    try std.testing.expectEqualStrings("gemini-cli: handshake failed", msg_snapshot);
+    try std.testing.expectEqualStrings("antigravity-cli: handshake failed", msg_snapshot);
 }
 
 test "checkCliVersion returns CliNotFound for missing binary" {
@@ -787,7 +817,7 @@ test "cleanupStartupFailure clears provider state" {
     defer provider.read_buffer.deinit(std.testing.allocator);
 
     provider.child_argv = try std.testing.allocator.alloc([]const u8, 2);
-    provider.child_argv.?[0] = try std.testing.allocator.dupe(u8, "gemini");
+    provider.child_argv.?[0] = try std.testing.allocator.dupe(u8, "agy");
     provider.child_argv.?[1] = try std.testing.allocator.dupe(u8, "--experimental-acp");
     provider.session_id = try std.testing.allocator.dupe(u8, "session-123");
     try provider.read_buffer.appendSlice(std.testing.allocator, "partial");
@@ -816,7 +846,7 @@ test "cleanupStartupFailure clears provider state before child allocation" {
     defer provider.read_buffer.deinit(std.testing.allocator);
 
     provider.child_argv = try std.testing.allocator.alloc([]const u8, 2);
-    provider.child_argv.?[0] = try std.testing.allocator.dupe(u8, "gemini");
+    provider.child_argv.?[0] = try std.testing.allocator.dupe(u8, "agy");
     provider.child_argv.?[1] = try std.testing.allocator.dupe(u8, "--experimental-acp");
     provider.session_id = try std.testing.allocator.dupe(u8, "session-123");
     try provider.read_buffer.appendSlice(std.testing.allocator, "partial");

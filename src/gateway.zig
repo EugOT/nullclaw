@@ -1144,8 +1144,6 @@ fn resolveMediaAccessForProvider(
     model: []const u8,
     explicit_audio_endpoint: ?[]const u8,
 ) !?MediaTranscriptionAccess {
-    if (!providers.providerKindAllowedByRuntimePolicy(providers.classifyProvider(provider)) and explicit_audio_endpoint == null) return null;
-
     const api_key = cfg.getProviderKey(provider) orelse return null;
     const endpoint = (try resolveMediaTranscriptionEndpoint(allocator, cfg, provider, explicit_audio_endpoint)) orelse return null;
     errdefer allocator.free(endpoint);
@@ -1173,7 +1171,7 @@ fn resolveMediaTranscriptionAccess(
         return access;
     }
 
-    const primary_candidates = [_][]const u8{ cfg.default_provider, "groq", "telnyx" };
+    const primary_candidates = [_][]const u8{ cfg.default_provider, "openai", "groq", "telnyx" };
     for (primary_candidates) |provider| {
         if (std.ascii.eqlIgnoreCase(provider, configured_provider)) continue;
         const model = if (supportsAudioTranscriptionProvider(provider))
@@ -6414,40 +6412,31 @@ test "media transcription rejects control characters in mime type" {
     try std.testing.expect(!isSafeMediaMimeType("audio/wav\r\nX-Test: injected"));
 }
 
-test "media transcription falls back to keyed provider" {
+test "media transcription does not fall back to direct openai keyed provider" {
     const entries = [_]config_types.ProviderEntry{
-        .{ .name = "groq", .api_key = "gsk-test" },
+        .{ .name = "openai", .api_key = "sk-test" },
     };
     var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
-    cfg.default_provider = "groq";
+    cfg.default_provider = "openai";
     cfg.audio_media.provider = "groq";
     cfg.audio_media.model = "whisper-large-v3";
     cfg.providers = &entries;
 
-    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
-    defer access.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("groq", access.provider);
-    try std.testing.expectEqualStrings("gsk-test", access.api_key);
-    try std.testing.expectEqualStrings("whisper-large-v3", access.model);
-    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1/audio/transcriptions", access.endpoint);
+    try std.testing.expect(try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg) == null);
 }
 
 test "media transcription ignores unsupported configured provider without explicit endpoint" {
     const entries = [_]config_types.ProviderEntry{
         .{ .name = "anthropic", .api_key = "anthropic-test" },
-        .{ .name = "groq", .api_key = "gsk-test" },
+        .{ .name = "openai", .api_key = "sk-test" },
     };
     var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
-    cfg.default_provider = "groq";
+    cfg.default_provider = "openai";
     cfg.audio_media.provider = "anthropic";
     cfg.audio_media.model = "whisper-large-v3";
     cfg.providers = &entries;
 
-    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
-    defer access.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("groq", access.provider);
-    try std.testing.expectEqualStrings("gsk-test", access.api_key);
-    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1/audio/transcriptions", access.endpoint);
+    try std.testing.expect(try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg) == null);
 }
 
 test "media transcription allows custom configured provider with explicit endpoint" {
@@ -6470,18 +6459,18 @@ test "media transcription allows custom configured provider with explicit endpoi
 
 test "media transcription derives endpoint from provider base url" {
     const entries = [_]config_types.ProviderEntry{
-        .{ .name = "custom:https://proxy.example/v1", .api_key = "proxy-test", .base_url = "https://proxy.example/v1" },
+        .{ .name = "openai", .api_key = "sk-test", .base_url = "https://proxy.example/v1" },
     };
     var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
-    cfg.audio_media.provider = "custom:https://proxy.example/v1";
-    cfg.audio_media.model = "whisper-custom";
+    cfg.audio_media.provider = "openai";
+    cfg.audio_media.model = "whisper-1";
     cfg.providers = &entries;
 
     const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
     defer access.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("custom:https://proxy.example/v1", access.provider);
-    try std.testing.expectEqualStrings("proxy-test", access.api_key);
-    try std.testing.expectEqualStrings("whisper-custom", access.model);
+    try std.testing.expectEqualStrings("openai", access.provider);
+    try std.testing.expectEqualStrings("sk-test", access.api_key);
+    try std.testing.expectEqualStrings("whisper-1", access.model);
     try std.testing.expectEqualStrings("https://proxy.example/v1/audio/transcriptions", access.endpoint);
 }
 
