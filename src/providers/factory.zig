@@ -316,6 +316,19 @@ pub fn classifyProvider(name: []const u8) ProviderKind {
     return .unknown;
 }
 
+pub fn providerKindAllowedByRuntimePolicy(kind: ProviderKind) bool {
+    return switch (kind) {
+        .anthropic_provider,
+        .openai_provider,
+        .azure_openai_provider,
+        .gemini_provider,
+        .vertex_provider,
+        .openai_codex_provider,
+        => false,
+        else => true,
+    };
+}
+
 /// Auto-detect provider kind from an API key prefix.
 pub fn detectProviderByApiKey(key: []const u8) ProviderKind {
     if (key.len < 3) return .unknown;
@@ -611,6 +624,23 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("openai-codex") == .openai_codex_provider);
     try std.testing.expect(classifyProvider("gemini-cli") == .gemini_cli_provider);
     try std.testing.expect(classifyProvider("nonexistent") == .unknown);
+}
+
+test "providerKindAllowedByRuntimePolicy blocks direct API providers" {
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.anthropic_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.openai_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.azure_openai_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.gemini_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.vertex_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.openai_codex_provider));
+
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.claude_cli_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.codex_cli_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.gemini_cli_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.ollama_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.compatible_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.openrouter_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.unknown));
 }
 
 test "classifyProvider new providers" {
