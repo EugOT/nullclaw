@@ -117,8 +117,8 @@ pub const OpenAiCodexProvider = struct {
         const body = try buildSimpleCodexBody(allocator, system_prompt, message, normalizeModel(model));
         defer allocator.free(body);
 
-        var auth_hdr_buf: [2048]u8 = undefined;
-        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
+        const auth_hdr = try buildAuthorizationHeader(allocator, token);
+        defer allocator.free(auth_hdr);
 
         return codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, 0);
     }
@@ -136,8 +136,8 @@ pub const OpenAiCodexProvider = struct {
         const body = try buildCodexBody(allocator, null, request.messages, normalizeModel(model), request.reasoning_effort);
         defer allocator.free(body);
 
-        var auth_hdr_buf: [2048]u8 = undefined;
-        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
+        const auth_hdr = try buildAuthorizationHeader(allocator, token);
+        defer allocator.free(auth_hdr);
 
         const content = try codexRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, request.timeout_secs);
 
@@ -162,8 +162,8 @@ pub const OpenAiCodexProvider = struct {
         const body = try buildCodexBody(allocator, null, request.messages, normalizeModel(model), request.reasoning_effort);
         defer allocator.free(body);
 
-        var auth_hdr_buf: [2048]u8 = undefined;
-        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{token}) catch return error.CodexApiError;
+        const auth_hdr = try buildAuthorizationHeader(allocator, token);
+        defer allocator.free(auth_hdr);
 
         return codexStreamRequest(allocator, CODEX_API_URL, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
     }
@@ -233,6 +233,10 @@ pub const OpenAiCodexProvider = struct {
 };
 
 // ── Body Builders ────────────────────────────────────────────────────────
+
+fn buildAuthorizationHeader(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{token});
+}
 
 /// Build a Codex request body from system prompt and messages.
 /// Maps: system → instructions, user → "user" item with input_text, assistant → "assistant" item.
@@ -392,14 +396,6 @@ fn codexStreamRequest(
     argc += 1;
     argv_buf[argc] = "POST";
     argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = auth_header;
-    argc += 1;
 
     // Add proxy from environment if set
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
@@ -434,10 +430,24 @@ fn codexStreamRequest(
     defer if (resolve_entry) |entry| allocator.free(entry);
     http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
+    var header_buf: [16][]const u8 = undefined;
+    var header_count: usize = 0;
+    header_buf[header_count] = "Content-Type: application/json";
+    header_count += 1;
+    header_buf[header_count] = auth_header;
+    header_count += 1;
     for (extra_headers) |hdr| {
+        if (header_count >= header_buf.len) return error.TooManyHeaders;
+        header_buf[header_count] = hdr;
+        header_count += 1;
+    }
+
+    var prepared_headers = try http_util.prepareCurlHeaderArg(allocator, header_buf[0..header_count]);
+    defer prepared_headers.deinit(allocator);
+    if (prepared_headers.arg) |headers_arg| {
         argv_buf[argc] = "-H";
         argc += 1;
-        argv_buf[argc] = hdr;
+        argv_buf[argc] = headers_arg;
         argc += 1;
     }
 
@@ -1054,6 +1064,20 @@ pub fn tryLoadCodexCliToken(allocator: std.mem.Allocator) ?auth.OAuthToken {
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "buildAuthorizationHeader handles long Codex OAuth tokens" {
+    // Regression: ChatGPT OAuth access tokens can exceed the old fixed
+    // 2048-byte stack buffer used for the Authorization header.
+    const token = try std.testing.allocator.alloc(u8, 2104);
+    defer std.testing.allocator.free(token);
+    @memset(token, 'a');
+
+    const header = try buildAuthorizationHeader(std.testing.allocator, token);
+    defer std.testing.allocator.free(header);
+
+    try std.testing.expectEqualStrings("Authorization: Bearer ", header[0.."Authorization: Bearer ".len]);
+    try std.testing.expectEqual(@as(usize, "Authorization: Bearer ".len + token.len), header.len);
+}
 
 test "buildCodexBody with system and user messages" {
     const messages = [_]ChatMessage{

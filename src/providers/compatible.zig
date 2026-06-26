@@ -26,6 +26,11 @@ fn logCompatibleApiError(
     url: []const u8,
     resp_body: []const u8,
 ) void {
+    // NOTE: No unit test for this log-only behavior change.
+    // Tests assert error propagation on these paths; suppress stderr side
+    // effects under zig test so unrelated suites do not fail on expected errors.
+    if (builtin.is_test) return;
+
     const sanitized = root.sanitizeApiError(allocator, resp_body) catch null;
     defer if (sanitized) |body| allocator.free(body);
 
@@ -41,11 +46,7 @@ fn returnLoggedCompatibleApiError(
     url: []const u8,
     resp_body: []const u8,
 ) anyerror!T {
-    // Tests assert error propagation on this path; skip log side effects there
-    // because Zig's test runner treats unexpected stderr logs as failures.
-    if (!builtin.is_test) {
-        logCompatibleApiError(allocator, provider_name, err, url, resp_body);
-    }
+    logCompatibleApiError(allocator, provider_name, err, url, resp_body);
     return err;
 }
 
@@ -308,14 +309,19 @@ pub const OpenAiCompatibleProvider = struct {
 
     /// Backward-compatible model aliases for provider-specific API model ids.
     fn normalizeProviderModel(self: OpenAiCompatibleProvider, model: []const u8) []const u8 {
+        const provider_model = if (model.len > self.name.len + 1 and
+            std.mem.startsWith(u8, model, self.name) and
+            model[self.name.len] == '/')
+            model[self.name.len + 1 ..]
+        else
+            model;
+
         if (std.mem.eql(u8, self.name, "deepseek")) {
-            if (std.mem.eql(u8, model, "deepseek-v3.2") or
-                std.mem.eql(u8, model, "deepseek/deepseek-v3.2"))
-            {
+            if (std.mem.eql(u8, provider_model, "deepseek-v3.2")) {
                 return "deepseek-chat";
             }
         }
-        return model;
+        return provider_model;
     }
 
     fn capNonStreamingMaxTokens(self: OpenAiCompatibleProvider, request: ChatRequest) ChatRequest {
@@ -836,7 +842,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
 
         return parseResponsesResponse(allocator, resp_body) catch |err| {
@@ -909,105 +915,8 @@ pub const OpenAiCompatibleProvider = struct {
         needs_free: bool,
     };
 
-    const ThinkStripStreamCtx = struct {
-        downstream: root.StreamCallback,
-        downstream_ctx: *anyopaque,
-        state: ThinkStripStreamState = .{},
-    };
-
-    const ThinkStripStreamState = struct {
-        depth: usize = 0,
-        pending: [think_close_tag.len]u8 = undefined,
-        pending_len: usize = 0,
-
-        fn feed(self: *ThinkStripStreamState, delta: []const u8, downstream: root.StreamCallback, downstream_ctx: *anyopaque) void {
-            var out_buf: [256]u8 = undefined;
-            var out_len: usize = 0;
-
-            for (delta) |byte| {
-                if (self.pending_len == self.pending.len) {
-                    self.processPending(false, &out_buf, &out_len, downstream, downstream_ctx);
-                }
-                self.pending[self.pending_len] = byte;
-                self.pending_len += 1;
-                self.processPending(false, &out_buf, &out_len, downstream, downstream_ctx);
-            }
-
-            if (out_len > 0) {
-                downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len]));
-            }
-        }
-
-        fn finish(self: *ThinkStripStreamState, downstream: root.StreamCallback, downstream_ctx: *anyopaque) void {
-            var out_buf: [256]u8 = undefined;
-            var out_len: usize = 0;
-            self.processPending(true, &out_buf, &out_len, downstream, downstream_ctx);
-            if (out_len > 0) {
-                downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len]));
-            }
-        }
-
-        fn processPending(
-            self: *ThinkStripStreamState,
-            final: bool,
-            out_buf: *[256]u8,
-            out_len: *usize,
-            downstream: root.StreamCallback,
-            downstream_ctx: *anyopaque,
-        ) void {
-            while (self.pending_len > 0) {
-                const pending = self.pending[0..self.pending_len];
-
-                if (pending.len >= think_open_tag.len and std.mem.eql(u8, pending[0..think_open_tag.len], think_open_tag)) {
-                    self.consumePrefix(think_open_tag.len);
-                    self.depth += 1;
-                    continue;
-                }
-
-                if (pending.len >= think_close_tag.len and std.mem.eql(u8, pending[0..think_close_tag.len], think_close_tag)) {
-                    self.consumePrefix(think_close_tag.len);
-                    if (self.depth > 0) self.depth -= 1;
-                    continue;
-                }
-
-                const maybe_tag_prefix = std.mem.startsWith(u8, think_open_tag, pending) or std.mem.startsWith(u8, think_close_tag, pending);
-                if (!final and maybe_tag_prefix and pending.len < think_close_tag.len) {
-                    break;
-                }
-
-                if (self.depth == 0) {
-                    out_buf[out_len.*] = pending[0];
-                    out_len.* += 1;
-                    if (out_len.* == out_buf.len) {
-                        downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len.*]));
-                        out_len.* = 0;
-                    }
-                }
-                self.consumePrefix(1);
-            }
-        }
-
-        fn consumePrefix(self: *ThinkStripStreamState, n: usize) void {
-            std.debug.assert(n <= self.pending_len);
-            if (n == self.pending_len) {
-                self.pending_len = 0;
-                return;
-            }
-            const remaining = self.pending_len - n;
-            std.mem.copyForwards(u8, self.pending[0..remaining], self.pending[n..self.pending_len]);
-            self.pending_len = remaining;
-        }
-    };
-
-    fn streamThinkSanitizeCallback(ctx_ptr: *anyopaque, chunk: root.StreamChunk) void {
-        const ctx: *ThinkStripStreamCtx = @ptrCast(@alignCast(ctx_ptr));
-        if (chunk.is_final) {
-            ctx.state.finish(ctx.downstream, ctx.downstream_ctx);
-            ctx.downstream(ctx.downstream_ctx, root.StreamChunk.finalChunk());
-            return;
-        }
-        ctx.state.feed(chunk.delta, ctx.downstream, ctx.downstream_ctx);
-    }
+    // NOTE: ThinkStripStreamCtx removed.
+    // Stripping/formatting is now handled by streaming.zig filters.
 
     fn extractMessageText(allocator: std.mem.Allocator, msg_obj: std.json.ObjectMap) !?[]const u8 {
         const content = msg_obj.get("content") orelse return null;
@@ -1340,11 +1249,6 @@ pub const OpenAiCompatibleProvider = struct {
             extra_header_count += 1;
         }
 
-        var sanitize_ctx = ThinkStripStreamCtx{
-            .downstream = callback,
-            .downstream_ctx = callback_ctx,
-        };
-
         var result = sse.curlStream(
             allocator,
             url,
@@ -1352,8 +1256,8 @@ pub const OpenAiCompatibleProvider = struct {
             auth_hdr,
             extra_headers[0..extra_header_count],
             request.timeout_secs,
-            streamThinkSanitizeCallback,
-            @ptrCast(&sanitize_ctx),
+            callback,
+            callback_ctx,
         ) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
@@ -1376,8 +1280,19 @@ pub const OpenAiCompatibleProvider = struct {
                 result.usage.completion_tokens = 0;
             } else {
                 result.content = cleaned;
-                result.usage.completion_tokens = @intCast((cleaned.len + 3) / 4);
+                // Only fall back to byte-count estimate when the API did not
+                // supply a real token count (e.g. provider that ignores
+                // include_usage). Preserving the real count matters for /cost.
+                if (result.usage.completion_tokens == 0) {
+                    result.usage.completion_tokens = @intCast((cleaned.len + 3) / 4);
+                }
             }
+        }
+        // Recompute total in case only prompt or only completion was received.
+        if (result.usage.total_tokens == 0 and
+            (result.usage.prompt_tokens > 0 or result.usage.completion_tokens > 0))
+        {
+            result.usage.total_tokens = result.usage.prompt_tokens +| result.usage.completion_tokens;
         }
 
         return result;
@@ -1475,7 +1390,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], 0) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body) catch |err| {
@@ -1567,7 +1482,7 @@ pub const OpenAiCompatibleProvider = struct {
             header_count += 1;
         }
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch return error.CompatibleApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.CompatibleApiError);
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body) catch |err| {
@@ -2222,78 +2137,6 @@ test "buildChatRequestBody appends session_id and extra_body_params" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"metadata\":{\"tier\":\"team\"}") != null);
 }
 
-test "streamThinkSanitizeCallback strips think blocks across chunk boundaries" {
-    const Collector = struct {
-        allocator: std.mem.Allocator,
-        buf: std.ArrayListUnmanaged(u8) = .empty,
-        saw_final: bool = false,
-
-        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (chunk.is_final) {
-                self.saw_final = true;
-                return;
-            }
-            self.buf.appendSlice(self.allocator, chunk.delta) catch unreachable;
-        }
-
-        fn deinit(self: *@This()) void {
-            self.buf.deinit(self.allocator);
-        }
-    };
-
-    var collector = Collector{ .allocator = std.testing.allocator };
-    defer collector.deinit();
-
-    var sanitize_ctx = OpenAiCompatibleProvider.ThinkStripStreamCtx{
-        .downstream = Collector.callback,
-        .downstream_ctx = @ptrCast(&collector),
-    };
-
-    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("<thi"));
-    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("nk>private reasoning"));
-    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("</think>\nVisible answer"));
-    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.finalChunk());
-
-    try std.testing.expect(collector.saw_final);
-    try std.testing.expectEqualStrings("\nVisible answer", collector.buf.items);
-}
-
-test "streamThinkSanitizeCallback preserves incomplete think tag literals" {
-    const Collector = struct {
-        allocator: std.mem.Allocator,
-        buf: std.ArrayListUnmanaged(u8) = .empty,
-        saw_final: bool = false,
-
-        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (chunk.is_final) {
-                self.saw_final = true;
-                return;
-            }
-            self.buf.appendSlice(self.allocator, chunk.delta) catch unreachable;
-        }
-
-        fn deinit(self: *@This()) void {
-            self.buf.deinit(self.allocator);
-        }
-    };
-
-    var collector = Collector{ .allocator = std.testing.allocator };
-    defer collector.deinit();
-
-    var sanitize_ctx = OpenAiCompatibleProvider.ThinkStripStreamCtx{
-        .downstream = Collector.callback,
-        .downstream_ctx = @ptrCast(&collector),
-    };
-
-    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("literal <thi"));
-    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.finalChunk());
-
-    try std.testing.expect(collector.saw_final);
-    try std.testing.expectEqualStrings("literal <thi", collector.buf.items);
-}
-
 test "parseTextResponse empty choices" {
     const body =
         \\{"choices":[]}
@@ -2369,6 +2212,14 @@ test "normalizeProviderModel maps DeepSeek v3.2 aliases to deepseek-chat" {
     try std.testing.expectEqualStrings("deepseek-chat", deepseek.normalizeProviderModel("deepseek-v3.2"));
     try std.testing.expectEqualStrings("deepseek-chat", deepseek.normalizeProviderModel("deepseek/deepseek-v3.2"));
     try std.testing.expectEqualStrings("deepseek-reasoner", deepseek.normalizeProviderModel("deepseek-reasoner"));
+}
+
+test "normalizeProviderModel strips own compatible provider prefix" {
+    const atlas = OpenAiCompatibleProvider.init(std.testing.allocator, "atlas-cloud", "https://api.atlascloud.ai/v1", null, .bearer, null);
+    // Regression: interactive model choices submit provider-qualified refs so
+    // namespaced model IDs like qwen/... keep routing through Atlas Cloud.
+    try std.testing.expectEqualStrings("qwen/qwen3-32b", atlas.normalizeProviderModel("atlas-cloud/qwen/qwen3-32b"));
+    try std.testing.expectEqualStrings("qwen/qwen3-32b", atlas.normalizeProviderModel("qwen/qwen3-32b"));
 }
 
 test "normalizeProviderModel leaves other providers unchanged" {

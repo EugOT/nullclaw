@@ -12,6 +12,7 @@ const std_compat = @import("compat");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
 const fs_compat = @import("fs_compat.zig");
+const json_object_map = @import("json_object_map.zig");
 const memory_root = @import("memory/root.zig");
 const migrate_mod = @import("memory/lifecycle/migrate.zig");
 
@@ -275,12 +276,12 @@ fn normalizeJsonValueKeys(allocator: std.mem.Allocator, value: std.json.Value) !
             break :blk .{ .array = out };
         },
         .object => blk: {
-            var out: std.json.ObjectMap = .empty;
+            var out = try json_object_map.init(allocator);
             var it = value.object.iterator();
             while (it.next()) |entry| {
                 const key = try camelToSnakeKey(allocator, entry.key_ptr.*);
                 const nested = try normalizeJsonValueKeys(allocator, entry.value_ptr.*);
-                try out.put(allocator, key, nested);
+                try json_object_map.put(&out, allocator, key, nested);
             }
             break :blk .{ .object = out };
         },

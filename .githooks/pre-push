@@ -3,6 +3,13 @@
 # Activate: git config core.hooksPath .githooks
 
 echo "Running tests..."
+# Git hooks export GIT_* variables for the parent repository. The test suite
+# creates temporary repositories, so clear those variables before running it.
+git_env_names=$(git rev-parse --local-env-vars)
+if [ -n "$git_env_names" ]; then
+    unset $git_env_names
+fi
+
 zig build test --summary all 2>&1
 if [ $? -ne 0 ]; then
     echo "Tests failed. Fix before pushing."

@@ -12,8 +12,13 @@ const agent_routing = @import("agent_routing.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
 const Config = @import("config.zig").Config;
+const process_util = @import("tools/process_util.zig");
+const security_policy = @import("security/policy.zig");
 
 const log = std.log.scoped(.cron);
+const DEFAULT_CRON_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
+const DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
+const safe_env_vars = [_][]const u8{ "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR" };
 
 pub const JobType = enum {
     shell,
@@ -475,6 +480,9 @@ pub const CronScheduler = struct {
     allocator: std.mem.Allocator,
     shell_cwd: ?[]const u8 = null,
     agent_timeout_secs: u64 = 0,
+    shell_timeout_ns: u64 = DEFAULT_CRON_SHELL_TIMEOUT_NS,
+    shell_max_output_bytes: usize = DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES,
+    shell_policy: security_policy.SecurityPolicy = .{},
     observer: ?observability.Observer = null,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
@@ -485,6 +493,9 @@ pub const CronScheduler = struct {
             .allocator = allocator,
             .shell_cwd = null,
             .agent_timeout_secs = 0,
+            .shell_timeout_ns = DEFAULT_CRON_SHELL_TIMEOUT_NS,
+            .shell_max_output_bytes = DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES,
+            .shell_policy = .{},
         };
     }
 
@@ -494,6 +505,19 @@ pub const CronScheduler = struct {
 
     pub fn setAgentTimeoutSecs(self: *CronScheduler, timeout_secs: u64) void {
         self.agent_timeout_secs = timeout_secs;
+    }
+
+    pub fn setShellPolicy(self: *CronScheduler, policy: security_policy.SecurityPolicy) void {
+        self.shell_policy = policy;
+    }
+
+    pub fn setShellLimits(self: *CronScheduler, timeout_ns: u64, max_output_bytes: usize) void {
+        self.shell_timeout_ns = timeout_ns;
+        self.shell_max_output_bytes = max_output_bytes;
+    }
+
+    fn validateShellCommand(self: *const CronScheduler, command: []const u8) !void {
+        _ = try self.shell_policy.validateCommandExecution(command, false);
     }
 
     fn freeJobOwned(self: *CronScheduler, job: CronJob) void {
@@ -554,6 +578,7 @@ pub const CronScheduler = struct {
     /// Add a recurring cron job.
     pub fn addJob(self: *CronScheduler, expression: []const u8, command: []const u8) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+        try self.validateShellCommand(command);
 
         // Validate expression
         _ = try normalizeExpression(expression);
@@ -576,6 +601,7 @@ pub const CronScheduler = struct {
     /// Add a one-shot delayed task.
     pub fn addOnce(self: *CronScheduler, delay: []const u8, command: []const u8) !*CronJob {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+        try self.validateShellCommand(command);
 
         const delay_secs = try parseDuration(delay);
         const now = std_compat.time.timestamp();
@@ -710,6 +736,7 @@ pub const CronScheduler = struct {
             job.next_run_secs = next_run_secs;
         }
         if (patch.command) |cmd| {
+            if (job.job_type == .shell) self.validateShellCommand(cmd) catch return false;
             const new_cmd = allocator.dupe(u8, cmd) catch return false;
             allocator.free(job.command);
             job.command = new_cmd;
@@ -889,12 +916,25 @@ pub const CronScheduler = struct {
 
             switch (job.job_type) {
                 .shell => {
-                    // Execute shell command via child process
-                    const result = std_compat.process.Child.run(.{
-                        .allocator = self.allocator,
-                        .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
-                        .cwd = self.shell_cwd,
-                    }) catch |err| {
+                    self.validateShellCommand(job.command) catch |err| {
+                        log.warn("cron shell job '{s}' blocked by security policy: {s}", .{ job.id, @errorName(err) });
+                        job.last_status = "error";
+                        job.last_run_secs = now;
+                        if (job.last_output) |old| self.allocator.free(old);
+                        job.last_output = self.allocator.dupe(u8, "cron shell command blocked by security policy") catch null;
+                        if (out_bus) |b| {
+                            _ = deliverResult(self.allocator, job.delivery, "cron shell command blocked by security policy", false, b) catch {};
+                        }
+                        continue;
+                    };
+
+                    const result = runShellJob(
+                        self.allocator,
+                        self.shell_cwd,
+                        job.command,
+                        self.shell_timeout_ns,
+                        self.shell_max_output_bytes,
+                    ) catch |err| {
                         log.err("cron job '{s}' failed to start: {}", .{ job.id, err });
                         job.last_status = "error";
                         job.last_run_secs = now;
@@ -907,12 +947,9 @@ pub const CronScheduler = struct {
                     };
                     defer self.allocator.free(result.stderr);
 
-                    const success = switch (result.term) {
-                        .exited => |code| code == 0,
-                        else => false,
-                    };
+                    const success = result.success;
                     job.last_run_secs = now;
-                    job.last_status = if (success) "ok" else "error";
+                    job.last_status = if (success) "ok" else if (result.timed_out) "timeout" else "error";
 
                     // Store and deliver stdout
                     if (job.last_output) |old| self.allocator.free(old);
@@ -1006,6 +1043,42 @@ pub const CronScheduler = struct {
 
 const agent_runner = @import("agent_runner.zig");
 const AgentRunResult = agent_runner.AgentRunResult;
+
+fn buildSafeShellEnv(allocator: std.mem.Allocator) !std_compat.process.EnvMap {
+    var env = std_compat.process.EnvMap.init(allocator);
+    errdefer env.deinit();
+
+    for (safe_env_vars) |key| {
+        if (platform.getEnvOrNull(allocator, key)) |val| {
+            defer allocator.free(val);
+            try env.put(key, val);
+        }
+    }
+
+    return env;
+}
+
+fn runShellJob(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    command: []const u8,
+    timeout_ns: u64,
+    max_output_bytes: usize,
+) !process_util.RunResult {
+    var env = try buildSafeShellEnv(allocator);
+    defer env.deinit();
+
+    return process_util.run(
+        allocator,
+        &.{ platform.getShell(), platform.getShellFlag(), command },
+        .{
+            .cwd = resolveRunnableCwd(cwd),
+            .env_map = &env,
+            .timeout_ns = timeout_ns,
+            .max_output_bytes = max_output_bytes,
+        },
+    );
+}
 
 fn runAgentJob(
     allocator: std.mem.Allocator,
@@ -1458,6 +1531,13 @@ fn cronJsonPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]
 fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
     const dir = try config_paths.defaultConfigDir(allocator);
     defer allocator.free(dir);
+
+    if (builtin.is_test) {
+        const leaf = try std.fmt.allocPrint(allocator, "cron-{d}.json", .{std.Thread.getCurrentId()});
+        defer allocator.free(leaf);
+        return config_paths.pathFromConfigDir(allocator, dir, leaf);
+    }
+
     return cronJsonPathFromDir(allocator, dir);
 }
 
@@ -2307,28 +2387,37 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
         const run_at = std_compat.time.timestamp();
         switch (job.job_type) {
             .shell => {
-                const result = std_compat.process.Child.run(.{
-                    .allocator = allocator,
-                    .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
-                    .cwd = run_cwd,
-                }) catch |err| {
+                scheduler.validateShellCommand(job.command) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    try saveJobs(&scheduler);
+                    log.err("Job '{s}' blocked by security policy: {s}", .{ id, @errorName(err) });
+                    return;
+                };
+
+                const result = runShellJob(
+                    allocator,
+                    run_cwd,
+                    job.command,
+                    scheduler.shell_timeout_ns,
+                    scheduler.shell_max_output_bytes,
+                ) catch |err| {
                     job.last_run_secs = run_at;
                     job.last_status = "error";
                     try saveJobs(&scheduler);
                     log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
                     return;
                 };
-                defer allocator.free(result.stdout);
-                defer allocator.free(result.stderr);
+                defer result.deinit(allocator);
                 if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
-                const exit_code: u8 = switch (result.term) {
-                    .exited => |code| code,
-                    else => 1,
-                };
                 job.last_run_secs = run_at;
-                job.last_status = if (exit_code == 0) "ok" else "error";
+                job.last_status = if (result.success) "ok" else if (result.timed_out) "timeout" else "error";
                 try saveJobs(&scheduler);
-                log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
+                if (result.success) {
+                    log.info("Job '{s}' completed.", .{id});
+                } else {
+                    log.err("Job '{s}' failed.", .{id});
+                }
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
@@ -2489,6 +2578,25 @@ fn formatUnixTimestamp(secs: i64, buf: []u8) []const u8 {
 pub const Task = CronJob;
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+var cron_store_test_mutex: std_compat.sync.Mutex = .{};
+
+fn resetCronStoreForTest(allocator: std.mem.Allocator) !void {
+    const path = try cronJsonPath(allocator);
+    defer allocator.free(path);
+
+    std_compat.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    std_compat.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
 
 test "parseDuration minutes" {
     try std.testing.expectEqual(@as(i64, 1800), try parseDuration("30m"));
@@ -2680,6 +2788,11 @@ test "CronScheduler getJob found and missing" {
 }
 
 test "save and load roundtrip" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2712,6 +2825,11 @@ test "save and load roundtrip" {
 }
 
 test "load agent job without command field falls back to prompt" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2734,6 +2852,11 @@ test "load agent job without command field falls back to prompt" {
 }
 
 test "load agent job without prompt field falls back to command" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2764,6 +2887,11 @@ test "trimOwnedRight duplicates trimmed allocation" {
 }
 
 test "save and load roundtrip keeps delivery account routing" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2800,6 +2928,11 @@ test "save and load roundtrip keeps delivery account routing" {
 }
 
 test "cliRunJob persists last status and timestamp" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2832,6 +2965,11 @@ test "resolveRunnableCwd returns null for missing cwd" {
 }
 
 test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
     _ = try scheduler.addJob("*/10 * * * *", "echo keep");
@@ -2859,8 +2997,14 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
 }
 
 test "save and load roundtrip with JSON-sensitive command characters" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
+    scheduler.setShellPolicy(.{ .autonomy = .yolo, .allowed_commands = &.{"*"} });
 
     const cmd = "printf \"line1\\nline2\" && echo \\\"ok\\\"";
     _ = try scheduler.addJob("*/5 * * * *", cmd);
@@ -2875,6 +3019,11 @@ test "save and load roundtrip with JSON-sensitive command characters" {
 }
 
 test "save and load roundtrip keeps agent fields" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
@@ -2981,6 +3130,49 @@ test "updateJob modifies job fields" {
     try std.testing.expect(!updated.enabled);
     try std.testing.expect(updated.paused);
     try std.testing.expectEqual(SessionTarget.main, updated.session_target);
+}
+
+test "cron shell add rejects command blocked by security policy" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    const allowed = [_][]const u8{"cat"};
+    scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
+
+    try std.testing.expectError(error.CommandNotAllowed, scheduler.addJob("* * * * *", "echo blocked"));
+}
+
+test "cron shell update rejects command blocked by security policy" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("* * * * *", "echo original");
+    const id = scheduler.listJobs()[0].id;
+
+    const allowed = [_][]const u8{"cat"};
+    scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
+
+    try std.testing.expect(!scheduler.updateJob(allocator, id, .{ .command = "echo blocked" }));
+    try std.testing.expectEqualStrings("echo original", scheduler.getJob(id).?.command);
+}
+
+test "cron shell tick blocks previously stored command when policy changes" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("* * * * *", "echo stored");
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    const allowed = [_][]const u8{"cat"};
+    scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
+
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
+
+    try std.testing.expectEqualStrings("error", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expectEqualStrings("cron shell command blocked by security policy", scheduler.jobs.items[0].last_output.?);
 }
 
 test "updateJob keeps agent command and prompt in sync" {
@@ -3339,6 +3531,7 @@ test "shell job uses configured cwd for relative output paths" {
 
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     scheduler.setShellCwd(workspace);
+    scheduler.setShellPolicy(.{ .autonomy = .yolo, .allowed_commands = &.{"*"} });
     defer scheduler.deinit();
 
     _ = try scheduler.addOnce("1s", "echo cwd_ok > cwd_proof.txt");
@@ -3657,4 +3850,100 @@ test "buildSchedulerStatusJson reports scheduler summary" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"job_count\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"active_jobs\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paused_jobs\":1") != null);
+}
+
+test "cron register + cancel leaks zero bytes for every job kind" {
+    // Uses the leak-detecting GPA (std.testing.allocator). Any allocation
+    // in addJob / addOnce / addAgentJob / addAgentOnce that is not freed
+    // by removeJob will be reported as a leak when the test runner tears
+    // down the allocator.
+    //
+    // The agent-job path is the most leak-prone — it allocates id,
+    // expression, command, prompt, model (optional), delivery.channel,
+    // delivery.account_id, delivery.to, delivery.peer_id, and
+    // delivery.thread_id, each behind its own _owned flag in freeJobOwned.
+    // The original new test only covered addJob + addOnce and would have
+    // missed a regression in any of those agent-only fields.
+    const alloc = std.testing.allocator;
+
+    var sched = CronScheduler.init(alloc, 10, true);
+    defer sched.deinit();
+
+    // Recurring shell job.
+    const recurring = try sched.addJob("*/5 * * * *", "echo recurring");
+    // dupe the id because removeJob takes ownership of (frees) the matched
+    // job's heap-owned id; passing the original `recurring.id` slice would
+    // be a use-after-free pattern.
+    const recurring_id = try alloc.dupe(u8, recurring.id);
+    defer alloc.free(recurring_id);
+    try std.testing.expect(sched.removeJob(recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot shell job: extra `@once:<delay>` expression allocation.
+    const once = try sched.addOnce("10m", "echo once");
+    const once_id = try alloc.dupe(u8, once.id);
+    defer alloc.free(once_id);
+    try std.testing.expect(sched.removeJob(once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // Recurring agent job: every delivery field non-null to exercise the
+    // full _owned-flag matrix in freeJobOwned.
+    const agent_recurring = try sched.addAgentJob("*/15 * * * *", "be helpful", "claude-sonnet", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "12345",
+        .peer_kind = .direct,
+        .peer_id = "user-99",
+        .thread_id = "topic-7",
+        .best_effort = false,
+    });
+    const agent_recurring_id = try alloc.dupe(u8, agent_recurring.id);
+    defer alloc.free(agent_recurring_id);
+    try std.testing.expect(sched.removeJob(agent_recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot agent job: same field matrix, plus the `@once:<delay>` expr.
+    // Pass `null` for model to exercise the optional-skip path.
+    const agent_once = try sched.addAgentOnce("5m", "remind me", null, .{
+        .mode = .on_success,
+        .channel = "discord",
+        .account_id = "guild-42",
+        .to = "channel-7",
+        .peer_kind = .group,
+        .peer_id = "guild-42",
+        .thread_id = null,
+        .best_effort = true,
+    });
+    const agent_once_id = try alloc.dupe(u8, agent_once.id);
+    defer alloc.free(agent_once_id);
+    try std.testing.expect(sched.removeJob(agent_once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // removeJob on an unknown id must return false without leaking or
+    // crashing, regardless of whether jobs are present.
+    try std.testing.expect(!sched.removeJob("nonexistent-id"));
+}
+
+test "cron rejects obviously malformed expressions" {
+    // Each input exercises a distinct branch in parseCronExpression /
+    // parseCronField. Note: "* * * * * * *" (7 fields) is valid per the
+    // spec and is excluded.
+    const malformed = [_][]const u8{
+        "", // empty
+        "garbage", // single non-cron token
+        "* * *", // wrong field count (3, not 5/6/7)
+        "60 * * * *", // minute out of range
+        "* 24 * * *", // hour out of range
+        "* * 32 * *", // day-of-month out of range
+        "* * * 13 *", // month out of range
+        "* * * * 8", // day-of-week out of range (allow_sunday_7 caps at 7)
+        "*/0 * * * *", // step = 0 — divide-by-zero classic
+        "5-3 * * * *", // reversed range (start > end)
+        "abc * * * *", // alphabetic in numeric field
+    };
+    for (malformed) |input| {
+        const result = nextRunForCronExpression(input, 0);
+        try std.testing.expect(std.meta.isError(result));
+    }
 }

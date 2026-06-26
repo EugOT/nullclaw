@@ -27,6 +27,8 @@ const OllamaMessage = struct {
 
 const OllamaChatResponse = struct {
     message: OllamaMessage = .{},
+    prompt_eval_count: ?u32 = null,
+    eval_count: ?u32 = null,
 };
 
 // ─── Tool Call Helpers ───────────────────────────────────────────────────────
@@ -66,11 +68,9 @@ fn normalizeToolName(name: []const u8) []const u8 {
 }
 
 fn extractToolNameAndArgs(
-    allocator: std.mem.Allocator,
     name: []const u8,
     arguments: std.json.Value,
 ) struct { name: []const u8, args: std.json.Value } {
-    _ = allocator;
     const stripped_name = stripToolPrefixes(name);
 
     // Pattern 1: Nested tool_call wrapper
@@ -82,7 +82,7 @@ fn extractToolNameAndArgs(
         if (arguments == .object) {
             if (arguments.object.get("name")) |nested_name_val| {
                 if (nested_name_val == .string) {
-                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = .empty };
+                    const nested_args = arguments.object.get("arguments") orelse std.json.Value{ .null = {} };
                     return .{ .name = normalizeToolName(nested_name_val.string), .args = nested_args };
                 }
             }
@@ -111,7 +111,7 @@ fn formatToolCallsForLoop(
     for (tool_calls, 0..) |tc, i| {
         if (i > 0) try result.append(allocator, ',');
 
-        const extracted = extractToolNameAndArgs(allocator, tc.function.name, tc.function.arguments);
+        const extracted = extractToolNameAndArgs(tc.function.name, tc.function.arguments);
 
         // Serialize arguments to string
         const args_str = if (extracted.args == .null)
@@ -288,35 +288,48 @@ pub const OllamaProvider = struct {
     }
 
     /// Parse an Ollama response, handling tool calls, thinking-only, and plain text.
-    pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+    pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
         const parsed = try std.json.parseFromSlice(OllamaChatResponse, allocator, body, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
         const message = parsed.value.message;
 
+        const usage = root.TokenUsage{
+            .prompt_tokens = parsed.value.prompt_eval_count orelse 0,
+            .completion_tokens = parsed.value.eval_count orelse 0,
+            .total_tokens = (parsed.value.prompt_eval_count orelse 0) +| (parsed.value.eval_count orelse 0),
+        };
+
         // If model returned tool calls, format them for the agent loop
         if (message.tool_calls) |tcs| {
             if (tcs.len > 0) {
-                return formatToolCallsForLoop(allocator, message);
+                const text = try formatToolCallsForLoop(allocator, message);
+                return ChatResponse{ .content = text, .usage = usage };
             }
         }
 
         // Plain text response
         if (message.content) |content| {
             if (content.len > 0) {
-                return try allocator.dupe(u8, content);
+                return ChatResponse{
+                    .content = try allocator.dupe(u8, content),
+                    .usage = usage,
+                };
             }
         }
 
         // Thinking-only response (model reasoned but produced no output)
         if (message.thinking) |thinking| {
             const preview_len = @min(thinking.len, 200);
-            return try std.fmt.allocPrint(
-                allocator,
-                "I was thinking about this: {s}... but I didn't complete my response. Could you try asking again?",
-                .{thinking[0..preview_len]},
-            );
+            return ChatResponse{
+                .content = try std.fmt.allocPrint(
+                    allocator,
+                    "I was thinking about this: {s}... but I didn't complete my response. Could you try asking again?",
+                    .{thinking[0..preview_len]},
+                ),
+                .usage = usage,
+            };
         }
 
         // Empty response
@@ -331,10 +344,12 @@ pub const OllamaProvider = struct {
         };
     }
 
-    const vtable = Provider.VTable{
+    pub const vtable = Provider.VTable{
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
+        .stream_chat = streamChatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supports_streaming = supportsStreamingImpl,
         .supports_vision = supportsVisionImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -360,10 +375,12 @@ pub const OllamaProvider = struct {
         var auth_hdr_buf: [512]u8 = undefined;
         const headers = self.buildAuthHeaders(&headers_buf, &auth_hdr_buf) catch return error.OllamaApiError;
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers, 0) catch return error.OllamaApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers, 0) catch |err| return root.preserveCurlTransportError(err, error.OllamaApiError);
         defer allocator.free(resp_body);
 
-        return parseResponse(allocator, resp_body);
+        var response = try parseResponse(allocator, resp_body);
+        defer response.deinit(allocator);
+        return try allocator.dupe(u8, response.content orelse "");
     }
 
     fn chatImpl(
@@ -378,18 +395,58 @@ pub const OllamaProvider = struct {
         var url_buf: [2048]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/api/chat", .{self.base_url}) catch return error.OllamaApiError;
 
-        const body = try buildChatRequestBody(allocator, request, model, temperature);
+        const body = try buildChatRequestBody(allocator, request, model, temperature, false);
         defer allocator.free(body);
 
         var headers_buf: [1][]const u8 = undefined;
         var auth_hdr_buf: [512]u8 = undefined;
         const headers = self.buildAuthHeaders(&headers_buf, &auth_hdr_buf) catch return error.OllamaApiError;
 
-        const resp_body = root.curlPostTimed(allocator, url, body, headers, request.timeout_secs) catch return error.OllamaApiError;
+        const resp_body = root.curlPostTimed(allocator, url, body, headers, request.timeout_secs) catch |err| return root.preserveCurlTransportError(err, error.OllamaApiError);
         defer allocator.free(resp_body);
 
-        const text = try parseResponse(allocator, resp_body);
-        return ChatResponse{ .content = text };
+        return parseResponse(allocator, resp_body);
+    }
+
+    fn streamChatImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+        temperature: f64,
+        callback: root.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!root.StreamChatResult {
+        const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
+        var url_buf: [2048]u8 = undefined;
+        // Use OpenAI-compatible endpoint for reasoning support via SSE
+        const url = try std.fmt.bufPrint(&url_buf, "{s}/v1/chat/completions", .{self.base_url});
+
+        var headers_buf: [1][]const u8 = undefined;
+        var auth_hdr_buf: [512]u8 = undefined;
+        const headers = self.buildAuthHeaders(&headers_buf, &auth_hdr_buf) catch return error.OllamaApiError;
+
+        const body = try buildChatRequestBody(allocator, request, model, temperature, true);
+        defer allocator.free(body);
+
+        return root.sse.curlStream(
+            allocator,
+            url,
+            body,
+            null,
+            headers,
+            request.timeout_secs,
+            callback,
+            callback_ctx,
+        );
+    }
+
+    fn supportsStreamingImpl(ptr: *anyopaque) bool {
+        const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
+        // Streaming uses Ollama's OpenAI-compatible endpoint, while native tool
+        // calls use /api/chat. Prefer tool correctness by default; users can set
+        // provider native_tools=false to opt into live reasoning streaming.
+        return !self.native_tools;
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
@@ -414,6 +471,7 @@ fn buildChatRequestBody(
     request: ChatRequest,
     model: []const u8,
     temperature: f64,
+    stream: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -465,7 +523,9 @@ fn buildChatRequestBody(
         }
     }
 
-    try buf.appendSlice(allocator, ",\"stream\":false,\"options\":{\"temperature\":");
+    try buf.appendSlice(allocator, ",\"stream\":");
+    try buf.appendSlice(allocator, if (stream) "true" else "false");
+    try buf.appendSlice(allocator, ",\"options\":{\"temperature\":");
     var temp_buf: [16]u8 = undefined;
     const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.OllamaApiError;
     try buf.appendSlice(allocator, temp_str);
@@ -516,9 +576,9 @@ test "parseResponse extracts content" {
     const body =
         \\{"message":{"role":"assistant","content":"Hello from Ollama!"}}
     ;
-    const result = try OllamaProvider.parseResponse(std.testing.allocator, body);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("Hello from Ollama!", result);
+    var result = try OllamaProvider.parseResponse(std.testing.allocator, body);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Hello from Ollama!", result.content.?);
 }
 
 test "parseResponse empty content returns NoResponseContent" {
@@ -532,6 +592,16 @@ test "supportsNativeTools returns true" {
     var p = OllamaProvider.init(std.testing.allocator, null, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+test "supportsStreaming is opt-in when native tools are disabled" {
+    var p = OllamaProvider.init(std.testing.allocator, null, null);
+    var prov = p.provider();
+    try std.testing.expect(!prov.supportsStreaming());
+
+    p.native_tools = false;
+    prov = p.provider();
+    try std.testing.expect(prov.supportsStreaming());
 }
 
 test "init stores api_key" {
@@ -573,32 +643,32 @@ test "buildAuthHeaders errors when api_key exceeds header buffer" {
 // ─── Tool Call Tests ─────────────────────────────────────────────────────────
 
 test "extractToolNameAndArgs with normal name" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "shell", .null);
+    const result = extractToolNameAndArgs("shell", .null);
     try std.testing.expectEqualStrings("shell", result.name);
 }
 
 test "extractToolNameAndArgs with tool. prefix" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.shell", .null);
+    const result = extractToolNameAndArgs("tool.shell", .null);
     try std.testing.expectEqualStrings("shell", result.name);
 }
 
 test "extractToolNameAndArgs with tools. prefix" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "tools.file_read", .null);
+    const result = extractToolNameAndArgs("tools.file_read", .null);
     try std.testing.expectEqualStrings("file_read", result.name);
 }
 
 test "extractToolNameAndArgs normalizes scheduler_tool alias" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "scheduler_tool", .null);
+    const result = extractToolNameAndArgs("scheduler_tool", .null);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
 test "extractToolNameAndArgs normalizes schedule_tool alias" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "schedule_tool", .null);
+    const result = extractToolNameAndArgs("schedule_tool", .null);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
 test "extractToolNameAndArgs normalizes prefixed schedule alias" {
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.schedule_tool", .null);
+    const result = extractToolNameAndArgs("tool.schedule_tool", .null);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
@@ -611,7 +681,7 @@ test "ollama buildChatRequestBody with images" {
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "Describe this image", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7, false);
     defer alloc.free(body);
     // Verify valid JSON and images array present
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -630,7 +700,7 @@ test "ollama buildChatRequestBody without content_parts" {
     var msgs = [_]root.ChatMessage{
         root.ChatMessage.user("Hello"),
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -648,7 +718,7 @@ test "ollama buildChatRequestBody with data URI image_url extracts base64 payloa
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "Describe", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -666,7 +736,7 @@ test "ollama buildChatRequestBody skips HTTP URL image_url" {
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "Describe", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llava" }, "llava", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -691,7 +761,7 @@ test "ollama buildChatRequestBody includes native tools" {
         .messages = &msgs,
         .model = "qwen3",
         .tools = tools,
-    }, "qwen3", 0.7);
+    }, "qwen3", 0.7, false);
     defer alloc.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -712,7 +782,7 @@ test "ollama buildChatRequestBody sends think disabled by default" {
     var msgs = [_]root.ChatMessage{
         root.ChatMessage.user("Hello"),
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs, .model = "llama3" }, "llama3", 0.7, false);
     defer alloc.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"think\":false") != null);
 }
@@ -726,7 +796,7 @@ test "ollama buildChatRequestBody enables think for standard thinking models" {
         .messages = &msgs,
         .model = "qwen3",
         .reasoning_effort = "high",
-    }, "qwen3", 0.7);
+    }, "qwen3", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -744,7 +814,7 @@ test "ollama buildChatRequestBody maps reasoning_effort to think level for gpt-o
         .messages = &msgs,
         .model = "gpt-oss:20b",
         .reasoning_effort = "xhigh",
-    }, "gpt-oss:20b", 0.7);
+    }, "gpt-oss:20b", 0.7, false);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -761,7 +831,7 @@ test "extractToolNameAndArgs with nested tool_call wrapper" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool_call", parsed.value);
+    const result = extractToolNameAndArgs("tool_call", parsed.value);
     try std.testing.expectEqualStrings("shell", result.name);
     // The inner arguments should contain "command"
     try std.testing.expect(result.args == .object);
@@ -777,7 +847,7 @@ test "extractToolNameAndArgs with tool.call wrapper" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.call", parsed.value);
+    const result = extractToolNameAndArgs("tool.call", parsed.value);
     try std.testing.expectEqualStrings("file_read", result.name);
 }
 
@@ -789,7 +859,7 @@ test "extractToolNameAndArgs with tool.call wrapper normalizes scheduler alias" 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.call", parsed.value);
+    const result = extractToolNameAndArgs("tool.call", parsed.value);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
@@ -801,7 +871,7 @@ test "extractToolNameAndArgs with prefixed tool_call wrapper normalizes schedule
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
     defer parsed.deinit();
 
-    const result = extractToolNameAndArgs(std.testing.allocator, "tool.tool_call", parsed.value);
+    const result = extractToolNameAndArgs("tool.tool_call", parsed.value);
     try std.testing.expectEqualStrings("schedule", result.name);
 }
 
@@ -835,6 +905,29 @@ test "formatToolCallsForLoop with single tool call" {
 
     // Check ID
     try std.testing.expectEqualStrings("call_abc", tool_calls.items[0].object.get("id").?.string);
+}
+
+test "formatToolCallsForLoop wrapped tool_call missing arguments uses empty object" {
+    const alloc = std.testing.allocator;
+    // Regression: wrapped tool_call payloads with no nested arguments must
+    // serialize downstream as an empty JSON object, not null.
+    const json_str =
+        \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"shell"}}}]}}
+    ;
+    const parsed = try std.json.parseFromSlice(OllamaChatResponse, alloc, json_str, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const result = try formatToolCallsForLoop(alloc, parsed.value.message);
+    defer alloc.free(result);
+
+    const verify = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer verify.deinit();
+    const tool_calls = verify.value.object.get("tool_calls").?.array;
+    const func = tool_calls.items[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings("shell", func.get("name").?.string);
+    try std.testing.expectEqualStrings("{}", func.get("arguments").?.string);
 }
 
 test "formatToolCallsForLoop with no tool calls returns content" {
@@ -884,11 +977,11 @@ test "parseResponse with tool calls produces formatted JSON" {
     const body =
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"shell","arguments":{"command":"ls"}}}]}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    var result = try OllamaProvider.parseResponse(alloc, body);
+    defer result.deinit(alloc);
 
     // Should be valid JSON with tool_calls
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.content.?, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("tool_calls") != null);
 }
@@ -898,11 +991,11 @@ test "parseResponse thinking-only returns fallback message" {
     const body =
         \\{"message":{"role":"assistant","content":"","thinking":"Let me reason about this carefully..."}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    var result = try OllamaProvider.parseResponse(alloc, body);
+    defer result.deinit(alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "I was thinking about this") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Let me reason") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "I was thinking about this") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "Let me reason") != null);
 }
 
 test "parseResponse with tool_call nested wrapper unwraps correctly" {
@@ -910,13 +1003,13 @@ test "parseResponse with tool_call nested wrapper unwraps correctly" {
     const body =
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"shell","arguments":{"command":"whoami"}}}}]}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    var result = try OllamaProvider.parseResponse(alloc, body);
+    defer result.deinit(alloc);
 
     // The formatted output should contain the unwrapped tool name "shell"
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"shell\"") != null);
     // And should NOT have "tool_call" as the function name
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"tool_call\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"tool_call\"") == null);
 }
 
 test "parseResponse normalizes scheduler_tool alias to schedule" {
@@ -924,11 +1017,11 @@ test "parseResponse normalizes scheduler_tool alias to schedule" {
     const body =
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"scheduler_tool","arguments":{"action":"list"}}}]}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    var result = try OllamaProvider.parseResponse(alloc, body);
+    defer result.deinit(alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"schedule\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"scheduler_tool\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"schedule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"scheduler_tool\"") == null);
 }
 
 test "parseResponse normalizes wrapped scheduler_tool alias to schedule" {
@@ -936,11 +1029,11 @@ test "parseResponse normalizes wrapped scheduler_tool alias to schedule" {
     const body =
         \\{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"tool_call","arguments":{"name":"scheduler_tool","arguments":{"action":"list"}}}}]}}
     ;
-    const result = try OllamaProvider.parseResponse(alloc, body);
-    defer alloc.free(result);
+    var result = try OllamaProvider.parseResponse(alloc, body);
+    defer result.deinit(alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"schedule\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"scheduler_tool\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"schedule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "\"name\":\"scheduler_tool\"") == null);
 }
 
 test "jsonEscapeString escapes quotes and backslashes" {
