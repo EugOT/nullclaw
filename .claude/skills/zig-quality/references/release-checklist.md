@@ -34,8 +34,8 @@ did not pass.
 4. **Deep fuzz, gated.** If `zig build -l` lists a `fuzz` step and
    the runtime reports `zig_supports_fuzz() == true`:
    - Run `zig build fuzz --summary failures --fuzz=<limit> -j<N>`
-     wrapped in a real-time budget (`$FUZZ_BUDGET`, default `2h`;
-     tag-day runs use `72h`).
+     wrapped in a real-time budget (`$FUZZ_BUDGET_SECONDS`, default
+     `7200` = 2h; tag-day runs use `259200` = 72h).
    - Treat exit code 124 from the timeout wrapper as "budget elapsed,
      no crashes" — **not** a failure. Any other non-zero exit is a
      fuzz crash and aborts the release.
@@ -80,8 +80,9 @@ did not pass.
 
 ## Environment variables the runtime honors
 
-- `FUZZ_BUDGET_SECONDS` — wallclock budget for the deep fuzz step
-  (default `2h`; override to `72h` for tag-day runs).
+- `FUZZ_BUDGET_SECONDS` — wallclock budget in seconds for the deep
+  fuzz step (default `7200` = 2h; override to `259200` = 72h for
+  tag-day runs).
 - `RELEASE_FUZZ_LIMIT` — the `--fuzz=<limit>` value passed through to
   `zig build fuzz` (default `1G`).
 

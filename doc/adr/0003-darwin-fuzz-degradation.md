@@ -77,7 +77,7 @@ of either failing or silently passing:
 ## Validation
 
 - `bun scripts/verify-pr.ts` emits `status: "degraded"` with
-  `reason: "darwin-fuzz-upstream"` on Darwin hosts.
+  `reason: "darwin-zig-016-fuzz"` on Darwin hosts.
 - The manifest at `.agent/baseline.json` records the last successful
   Linux fuzz run so the degradation is not an indefinite free pass.
 - A Linux CI lane (either Forgejo runner or container-based job)

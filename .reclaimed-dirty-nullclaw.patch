@@ -1,0 +1,1508 @@
+diff --git a/src/agent/prompt.zig b/src/agent/prompt.zig
+index ea3106b3..1b9ffaf0 100644
+--- a/src/agent/prompt.zig
++++ b/src/agent/prompt.zig
+@@ -1,6 +1,7 @@
+ const std = @import("std");
+ const std_compat = @import("compat");
+ const builtin = @import("builtin");
++const build_options = @import("build_options");
+ const config_paths = @import("../config_paths.zig");
+ const config_types = @import("../config_types.zig");
+ const fs_compat = @import("../fs_compat.zig");
+@@ -1489,6 +1490,8 @@ test "buildSystemPrompt injects BOOTSTRAP.md when present" {
+ }
+ 
+ test "buildSystemPrompt reads bootstrap docs from sqlite provider when workspace files are absent" {
++    if (!build_options.enable_sqlite) return error.SkipZigTest;
++
+     var tmp = std.testing.tmpDir(.{});
+     defer tmp.cleanup();
+ 
+@@ -1534,6 +1537,8 @@ test "buildSystemPrompt project context stays equivalent across markdown hybrid
+     defer if (expected_project_context) |value| std.testing.allocator.free(value);
+ 
+     for (backends) |backend| {
++        if (!build_options.enable_sqlite and !bootstrap_mod.backendUsesFiles(backend)) continue;
++
+         var tmp = std.testing.tmpDir(.{});
+         defer tmp.cleanup();
+ 
+diff --git a/src/channels/root.zig b/src/channels/root.zig
+index 311037b0..fa5cf384 100644
+--- a/src/channels/root.zig
++++ b/src/channels/root.zig
+@@ -306,14 +306,26 @@ pub const web = if (@import("build_options").enable_channel_web)
+     @import("web.zig")
+ else
+     struct {
++        const bus_mod = @import("../bus.zig");
++        const config_types = @import("../config_types.zig");
++
+         pub const WebChannel = struct {
+-            pub fn initFromConfig(_: @import("std").mem.Allocator, _: anytype) @This() {
+-                return .{};
++            ws_path: []const u8,
++            configured_auth_token: ?[]const u8,
++            bus: ?*bus_mod.Bus = null,
++
++            pub fn initFromConfig(_: @import("std").mem.Allocator, cfg: config_types.WebConfig) @This() {
++                return .{
++                    .ws_path = config_types.WebConfig.normalizePath(cfg.path),
++                    .configured_auth_token = cfg.auth_token,
++                };
+             }
+             pub fn channel(_: *@This()) Channel {
+                 unreachable;
+             }
+-            pub fn setBus(_: *@This(), _: anytype) void {}
++            pub fn setBus(self: *@This(), b: *bus_mod.Bus) void {
++                self.bus = b;
++            }
+         };
+     };
+ pub const max = if (@import("build_options").enable_channel_max)
+diff --git a/src/daemon.zig b/src/daemon.zig
+index 11ec83ab..4e3f82ea 100644
+--- a/src/daemon.zig
++++ b/src/daemon.zig
+@@ -9,6 +9,7 @@
+ const std = @import("std");
+ const std_compat = @import("compat");
+ const builtin = @import("builtin");
++const build_options = @import("build_options");
+ const health = @import("health.zig");
+ const Config = @import("config.zig").Config;
+ const CronScheduler = @import("cron.zig").CronScheduler;
+@@ -3101,6 +3102,8 @@ test "markInboundMessageRead dispatches through channel vtable" {
+ }
+ 
+ test "hasSupervisedChannels true for nostr" {
++    if (!build_options.enable_channel_nostr) return error.SkipZigTest;
++
+     const config_types = @import("config_types.zig");
+     var config = Config{
+         .workspace_dir = "/tmp",
+diff --git a/src/gateway.zig b/src/gateway.zig
+index e8a8c5df..ded35830 100644
+--- a/src/gateway.zig
++++ b/src/gateway.zig
+@@ -1104,17 +1104,25 @@ const MediaTranscriptionAccess = struct {
+ };
+ 
+ fn supportsAudioTranscriptionProvider(provider: []const u8) bool {
+-    return std.ascii.eqlIgnoreCase(provider, "openai") or
+-        std.ascii.eqlIgnoreCase(provider, "groq") or
++    return std.ascii.eqlIgnoreCase(provider, "groq") or
+         std.ascii.eqlIgnoreCase(provider, "telnyx");
+ }
+ 
+ fn defaultAudioTranscriptionModel(provider: []const u8) []const u8 {
+-    if (std.ascii.eqlIgnoreCase(provider, "openai")) return "whisper-1";
+     if (std.ascii.eqlIgnoreCase(provider, "telnyx")) return "distil-whisper/distil-large-v2";
+     return "whisper-large-v3";
+ }
+ 
++fn isForbiddenDirectMediaProvider(provider: []const u8) bool {
++    return std.ascii.eqlIgnoreCase(provider, "openai") or
++        std.ascii.eqlIgnoreCase(provider, "anthropic") or
++        std.ascii.eqlIgnoreCase(provider, "gemini") or
++        std.ascii.eqlIgnoreCase(provider, "google") or
++        std.ascii.eqlIgnoreCase(provider, "vertex") or
++        std.ascii.eqlIgnoreCase(provider, "vertex-ai") or
++        std.ascii.eqlIgnoreCase(provider, "google-vertex");
++}
++
+ fn customProviderBaseUrl(provider: []const u8) ?[]const u8 {
+     if (std.mem.startsWith(u8, provider, "custom:")) return provider["custom:".len..];
+     return null;
+@@ -1146,6 +1154,7 @@ fn resolveMediaAccessForProvider(
+     model: []const u8,
+     explicit_audio_endpoint: ?[]const u8,
+ ) !?MediaTranscriptionAccess {
++    if (isForbiddenDirectMediaProvider(provider)) return null;
+     const api_key = cfg.getProviderKey(provider) orelse return null;
+     const endpoint = (try resolveMediaTranscriptionEndpoint(allocator, cfg, provider, explicit_audio_endpoint)) orelse return null;
+     errdefer allocator.free(endpoint);
+@@ -1173,7 +1182,7 @@ fn resolveMediaTranscriptionAccess(
+         return access;
+     }
+ 
+-    const primary_candidates = [_][]const u8{ cfg.default_provider, "openai", "groq", "telnyx" };
++    const primary_candidates = [_][]const u8{ cfg.default_provider, "groq", "telnyx" };
+     for (primary_candidates) |provider| {
+         if (std.ascii.eqlIgnoreCase(provider, configured_provider)) continue;
+         const model = if (supportsAudioTranscriptionProvider(provider))
+@@ -5239,6 +5248,8 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
+ }
+ 
+ test "handleWhatsAppWebhookRoute rejects malformed JSON before sender extraction" {
++    if (!build_options.enable_channel_whatsapp) return error.SkipZigTest;
++
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+     defer arena.deinit();
+     const allocator = arena.allocator();
+@@ -6416,7 +6427,7 @@ test "media transcription rejects control characters in mime type" {
+ 
+ test "media transcription falls back to keyed provider" {
+     const entries = [_]config_types.ProviderEntry{
+-        .{ .name = "openai", .api_key = "sk-test" },
++        .{ .name = "groq", .api_key = "gsk-test" },
+     };
+     var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+     cfg.default_provider = "openai";
+@@ -6426,16 +6437,16 @@ test "media transcription falls back to keyed provider" {
+ 
+     const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+     defer access.deinit(std.testing.allocator);
+-    try std.testing.expectEqualStrings("openai", access.provider);
+-    try std.testing.expectEqualStrings("sk-test", access.api_key);
+-    try std.testing.expectEqualStrings("whisper-1", access.model);
+-    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", access.endpoint);
++    try std.testing.expectEqualStrings("groq", access.provider);
++    try std.testing.expectEqualStrings("gsk-test", access.api_key);
++    try std.testing.expectEqualStrings("whisper-large-v3", access.model);
++    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1/audio/transcriptions", access.endpoint);
+ }
+ 
+ test "media transcription ignores unsupported configured provider without explicit endpoint" {
+     const entries = [_]config_types.ProviderEntry{
+         .{ .name = "anthropic", .api_key = "anthropic-test" },
+-        .{ .name = "openai", .api_key = "sk-test" },
++        .{ .name = "groq", .api_key = "gsk-test" },
+     };
+     var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+     cfg.default_provider = "openai";
+@@ -6445,9 +6456,9 @@ test "media transcription ignores unsupported configured provider without explic
+ 
+     const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+     defer access.deinit(std.testing.allocator);
+-    try std.testing.expectEqualStrings("openai", access.provider);
+-    try std.testing.expectEqualStrings("sk-test", access.api_key);
+-    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", access.endpoint);
++    try std.testing.expectEqualStrings("groq", access.provider);
++    try std.testing.expectEqualStrings("gsk-test", access.api_key);
++    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1/audio/transcriptions", access.endpoint);
+ }
+ 
+ test "media transcription allows custom configured provider with explicit endpoint" {
+@@ -6470,18 +6481,18 @@ test "media transcription allows custom configured provider with explicit endpoi
+ 
+ test "media transcription derives endpoint from provider base url" {
+     const entries = [_]config_types.ProviderEntry{
+-        .{ .name = "openai", .api_key = "sk-test", .base_url = "https://proxy.example/v1" },
++        .{ .name = "local-stt", .api_key = "local-key", .base_url = "https://proxy.example/v1" },
+     };
+     var cfg = Config{ .workspace_dir = ".", .config_path = "config.json", .allocator = std.testing.allocator };
+-    cfg.audio_media.provider = "openai";
+-    cfg.audio_media.model = "whisper-1";
++    cfg.audio_media.provider = "local-stt";
++    cfg.audio_media.model = "whisper-custom";
+     cfg.providers = &entries;
+ 
+     const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
+     defer access.deinit(std.testing.allocator);
+-    try std.testing.expectEqualStrings("openai", access.provider);
+-    try std.testing.expectEqualStrings("sk-test", access.api_key);
+-    try std.testing.expectEqualStrings("whisper-1", access.model);
++    try std.testing.expectEqualStrings("local-stt", access.provider);
++    try std.testing.expectEqualStrings("local-key", access.api_key);
++    try std.testing.expectEqualStrings("whisper-custom", access.model);
+     try std.testing.expectEqualStrings("https://proxy.example/v1/audio/transcriptions", access.endpoint);
+ }
+ 
+diff --git a/src/main.zig b/src/main.zig
+index 0b054b81..b5b27574 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -6419,13 +6419,13 @@ test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled
+ 
+ test "hasStartupProviderCredentials accepts configured primary key" {
+     const providers_cfg = [_]yc.config.ProviderEntry{
+-        .{ .name = "anthropic", .api_key = "sk-test" },
++        .{ .name = "groq", .api_key = "gsk-test" },
+     };
+     const cfg = yc.config.Config{
+         .workspace_dir = "/tmp/nullclaw-test",
+         .config_path = "/tmp/nullclaw-test/config.json",
+-        .default_provider = "anthropic",
+-        .default_model = "anthropic/claude-3-7-sonnet",
++        .default_provider = "groq",
++        .default_model = "groq/llama-3.3-70b-versatile",
+         .allocator = std.testing.allocator,
+         .providers = &providers_cfg,
+     };
+@@ -6445,23 +6445,11 @@ test "hasStartupProviderCredentials accepts local compatible provider without ap
+     try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+ }
+ 
+-test "hasStartupProviderCredentials accepts gemini oauth env token" {
+-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+-    const c = @cImport({
+-        @cInclude("stdlib.h");
+-    });
+-
+-    const env_name = try std.testing.allocator.dupeZ(u8, "GEMINI_OAUTH_TOKEN");
+-    defer std.testing.allocator.free(env_name);
+-    const env_value = try std.testing.allocator.dupeZ(u8, "ya29.test-oauth-token");
+-    defer std.testing.allocator.free(env_value);
+-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, env_value.ptr, 1));
+-    defer _ = c.unsetenv(env_name.ptr);
+-
++test "hasStartupProviderCredentials accepts approved gemini cli runtime" {
+     const cfg = yc.config.Config{
+         .workspace_dir = "/tmp/nullclaw-test",
+         .config_path = "/tmp/nullclaw-test/config.json",
+-        .default_provider = "gemini",
++        .default_provider = "gemini-cli",
+         .default_model = "gemini/gemini-2.5-pro",
+         .allocator = std.testing.allocator,
+     };
+@@ -6485,13 +6473,13 @@ test "hasStartupProviderCredentials accepts reliability fallback credentials" {
+ test "hasStartupProviderCredentials rejects blank configured key" {
+     // Regression: blank API keys must not bypass channel startup credential checks.
+     const providers_cfg = [_]yc.config.ProviderEntry{
+-        .{ .name = "anthropic", .api_key = "   " },
++        .{ .name = "groq", .api_key = "   " },
+     };
+     const cfg = yc.config.Config{
+         .workspace_dir = "/tmp/nullclaw-test",
+         .config_path = "/tmp/nullclaw-test/config.json",
+-        .default_provider = "anthropic",
+-        .default_model = "anthropic/claude-3-7-sonnet",
++        .default_provider = "groq",
++        .default_model = "groq/llama-3.3-70b-versatile",
+         .allocator = std.testing.allocator,
+         .providers = &providers_cfg,
+     };
+@@ -6504,8 +6492,8 @@ test "hasStartupProviderCredentials rejects missing provider and fallback creden
+     const cfg = yc.config.Config{
+         .workspace_dir = "/tmp/nullclaw-test",
+         .config_path = "/tmp/nullclaw-test/config.json",
+-        .default_provider = "anthropic",
+-        .default_model = "anthropic/claude-3-7-sonnet",
++        .default_provider = "groq",
++        .default_model = "groq/llama-3.3-70b-versatile",
+         .allocator = std.testing.allocator,
+     };
+ 
+diff --git a/src/memory/engines/sqlite_disabled.zig b/src/memory/engines/sqlite_disabled.zig
+index d5d2bd31..d108e987 100644
+--- a/src/memory/engines/sqlite_disabled.zig
++++ b/src/memory/engines/sqlite_disabled.zig
+@@ -57,6 +57,14 @@ pub const c = struct {
+         return SQLITE_DONE;
+     }
+ 
++    pub fn sqlite3_reset(_: ?*sqlite3_stmt) c_int {
++        return SQLITE_OK;
++    }
++
++    pub fn sqlite3_clear_bindings(_: ?*sqlite3_stmt) c_int {
++        return SQLITE_OK;
++    }
++
+     pub fn sqlite3_finalize(_: ?*sqlite3_stmt) c_int {
+         return SQLITE_OK;
+     }
+diff --git a/src/memory/vector/embeddings.zig b/src/memory/vector/embeddings.zig
+index 3da8757e..3dd2af76 100644
+--- a/src/memory/vector/embeddings.zig
++++ b/src/memory/vector/embeddings.zig
+@@ -3,7 +3,7 @@
+ //! Mirrors ZeroClaw's embeddings module:
+ //!   - EmbeddingProvider vtable interface
+ //!   - NoopEmbedding (returns empty/zero vectors, keyword-only fallback)
+-//!   - OpenAiEmbedding (HTTP POST to /v1/embeddings)
++//!   - OpenAI-compatible embeddings for non-forbidden compatible/local endpoints
+ //!   - Factory function: createEmbeddingProvider()
+ 
+ const std = @import("std");
+@@ -11,7 +11,6 @@ const std_compat = @import("compat");
+ const build_options = @import("build_options");
+ const http_util = @import("../../http_util.zig");
+ const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
+-const GeminiEmbedding = @import("embeddings_gemini.zig").GeminiEmbedding;
+ const VoyageEmbedding = @import("embeddings_voyage.zig").VoyageEmbedding;
+ const OllamaEmbedding = @import("embeddings_ollama.zig").OllamaEmbedding;
+ const net_security = @import("../../net_security.zig");
+@@ -461,26 +460,8 @@ pub fn createEmbeddingProvider(
+     model: []const u8,
+     dims: u32,
+ ) !EmbeddingProvider {
+-    if (std.mem.eql(u8, provider_name, "openai")) {
+-        var impl_ = try OpenAiEmbedding.init(
+-            allocator,
+-            "https://api.openai.com",
+-            api_key orelse "",
+-            model,
+-            dims,
+-        );
+-        return impl_.provider();
+-    }
+-
+-    if (std.mem.eql(u8, provider_name, "gemini")) {
+-        var impl_ = try GeminiEmbedding.init(
+-            allocator,
+-            api_key orelse "",
+-            if (model.len > 0) model else null,
+-            null,
+-            if (dims > 0) dims else null,
+-        );
+-        return impl_.provider();
++    if (std.mem.eql(u8, provider_name, "openai") or std.mem.eql(u8, provider_name, "gemini")) {
++        return createNoopEmbedding(allocator);
+     }
+ 
+     if (std.mem.eql(u8, provider_name, "voyage")) {
+@@ -506,6 +487,9 @@ pub fn createEmbeddingProvider(
+ 
+     if (std.mem.startsWith(u8, provider_name, "custom:")) {
+         const base_url = provider_name[7..];
++        if (isForbiddenDirectEmbeddingBaseUrl(base_url)) {
++            return createNoopEmbedding(allocator);
++        }
+         var impl_ = try OpenAiEmbedding.init(
+             allocator,
+             base_url,
+@@ -517,11 +501,22 @@ pub fn createEmbeddingProvider(
+     }
+ 
+     // Default: noop (keyword-only search) — heap-allocate so the vtable pointer stays valid.
++    return createNoopEmbedding(allocator);
++}
++
++fn createNoopEmbedding(allocator: std.mem.Allocator) !EmbeddingProvider {
+     const noop_inst = try allocator.create(NoopEmbedding);
+     noop_inst.* = .{ .allocator = allocator };
+     return noop_inst.provider();
+ }
+ 
++fn isForbiddenDirectEmbeddingBaseUrl(base_url: []const u8) bool {
++    return std.mem.indexOf(u8, base_url, "api.openai.com") != null or
++        std.mem.indexOf(u8, base_url, "openai.azure.com") != null or
++        std.mem.indexOf(u8, base_url, "generativelanguage.googleapis.com") != null or
++        std.mem.indexOf(u8, base_url, "aiplatform.googleapis.com") != null;
++}
++
+ // ── Tests ─────────────────────────────────────────────────────────
+ 
+ test "hasExplicitApiPath" {
+@@ -666,25 +661,24 @@ test "createEmbeddingProvider noop is heap allocated and deinit frees memory" {
+     p.deinit();
+ }
+ 
+-test "createEmbeddingProvider openai is heap allocated and deinit frees memory" {
++test "createEmbeddingProvider openai is disabled by runtime policy" {
+     const p = try createEmbeddingProvider(std.testing.allocator, "openai", "test-key", "text-embedding-3-small", 1536);
+-    try std.testing.expectEqualStrings("openai", p.getName());
+-    try std.testing.expectEqual(@as(u32, 1536), p.getDimensions());
+-    // deinit must free all allocations without crashing.
++    try std.testing.expectEqualStrings("none", p.getName());
++    try std.testing.expectEqual(@as(u32, 0), p.getDimensions());
+     p.deinit();
+ }
+ 
+-test "createEmbeddingProvider gemini" {
++test "createEmbeddingProvider gemini is disabled by runtime policy" {
+     const p = try createEmbeddingProvider(std.testing.allocator, "gemini", "test-key", "", 0);
+-    try std.testing.expectEqualStrings("gemini", p.getName());
+-    try std.testing.expectEqual(@as(u32, 768), p.getDimensions());
++    try std.testing.expectEqualStrings("none", p.getName());
++    try std.testing.expectEqual(@as(u32, 0), p.getDimensions());
+     p.deinit();
+ }
+ 
+-test "createEmbeddingProvider gemini with custom model" {
+-    const p = try createEmbeddingProvider(std.testing.allocator, "gemini", "test-key", "gemini-embedding-001", 1024);
+-    try std.testing.expectEqualStrings("gemini", p.getName());
+-    try std.testing.expectEqual(@as(u32, 1024), p.getDimensions());
++test "createEmbeddingProvider forbidden custom endpoint is disabled by runtime policy" {
++    const p = try createEmbeddingProvider(std.testing.allocator, "custom:https://api.openai.com/v1", "test-key", "text-embedding-3-small", 1536);
++    try std.testing.expectEqualStrings("none", p.getName());
++    try std.testing.expectEqual(@as(u32, 0), p.getDimensions());
+     p.deinit();
+ }
+ 
+diff --git a/src/onboard.zig b/src/onboard.zig
+index 13db20fd..63bc8dfe 100644
+--- a/src/onboard.zig
++++ b/src/onboard.zig
+@@ -101,13 +101,13 @@ pub const ProviderInfo = struct {
+ pub const known_providers = [_]ProviderInfo{
+     // --- Tier 1: Major multi-provider gateways ---
+     .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "OPENROUTER_API_KEY" },
+-    .{ .key = "anthropic", .label = "Anthropic (Claude direct)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
+-    .{ .key = "openai", .label = "OpenAI (GPT direct)", .default_model = "gpt-5.2", .env_var = "OPENAI_API_KEY" },
+-    .{ .key = "azure", .label = "Azure OpenAI (GPT via Azure)", .default_model = "gpt-5.2-chat", .env_var = "AZURE_OPENAI_API_KEY" },
++    .{ .key = "anthropic", .label = "Claude via approved Claude CLI runtime", .default_model = "claude-opus-4-6", .env_var = "" },
++    .{ .key = "openai", .label = "GPT via approved Codex CLI runtime", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
++    .{ .key = "azure", .label = "Azure OpenAI disabled by runtime policy; use Codex CLI", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
+ 
+     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
+-    .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
+-    .{ .key = "vertex", .label = "Google Vertex AI (Gemini)", .default_model = "gemini-2.5-pro", .env_var = "VERTEX_API_KEY" },
++    .{ .key = "gemini", .label = "Gemini via approved Antigravity runtime", .default_model = "gemini-2.5-pro", .env_var = "" },
++    .{ .key = "vertex", .label = "Vertex AI disabled by runtime policy; use Antigravity", .default_model = "gemini-2.5-pro", .env_var = "" },
+     .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-chat", .env_var = "DEEPSEEK_API_KEY" },
+     .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "llama-3.3-70b-versatile", .env_var = "GROQ_API_KEY" },
+ 
+@@ -155,10 +155,10 @@ pub const known_providers = [_]ProviderInfo{
+     .{ .key = "lm-studio", .label = "LM Studio (local GUI)", .default_model = "local-model", .env_var = "API_KEY" },
+ 
+     // --- Tier 10: CLI-based providers ---
+-    .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
+-    .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "OPENAI_API_KEY" },
++    .{ .key = "claude-cli", .label = "Claude CLI (Claude Code, local)", .default_model = "claude-opus-4-6", .env_var = "" },
++    .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
+     .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT login)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
+-    .{ .key = "gemini-cli", .label = "Gemini CLI (Google Gemini, local)", .default_model = "gemini-2.0-flash", .env_var = "GEMINI_API_KEY" },
++    .{ .key = "gemini-cli", .label = "Antigravity CLI (Gemini, local)", .default_model = "gemini-2.0-flash", .env_var = "" },
+ };
+ 
+ /// Canonicalize provider name (handle aliases).
+@@ -191,6 +191,11 @@ fn providerRequiresApiKeyForSetup(provider: []const u8, base_url: ?[]const u8) b
+     if (std.mem.eql(u8, canonical, "ollama") or
+         std.mem.eql(u8, canonical, "lm-studio") or
+         std.mem.eql(u8, canonical, "lmstudio") or
++        std.mem.eql(u8, canonical, "anthropic") or
++        std.mem.eql(u8, canonical, "openai") or
++        std.mem.eql(u8, canonical, "azure") or
++        std.mem.eql(u8, canonical, "gemini") or
++        std.mem.eql(u8, canonical, "vertex") or
+         std.mem.eql(u8, canonical, "claude-cli") or
+         std.mem.eql(u8, canonical, "codex-cli") or
+         std.mem.eql(u8, canonical, "gemini-cli") or
+@@ -246,15 +251,35 @@ fn printProviderNextSteps(
+         return;
+     }
+ 
++    if (std.mem.eql(u8, canonical, "openai") or std.mem.eql(u8, canonical, "azure")) {
++        try out.writeAll("    1. Authenticate:  codex login\n");
++        try out.writeAll("    2. Use provider:  codex-cli\n");
++        try out.writeAll("    3. Gateway:       nullclaw gateway\n");
++        return;
++    }
++
++    if (std.mem.eql(u8, canonical, "anthropic")) {
++        try out.writeAll("    1. Authenticate:  claude login\n");
++        try out.writeAll("    2. Use provider:  claude-cli\n");
++        try out.writeAll("    3. Gateway:       nullclaw gateway\n");
++        return;
++    }
++
+     if (std.mem.eql(u8, canonical, "gemini-cli")) {
+-        try out.writeAll("    1. Authenticate:  gemini\n");
+-        try out.writeAll("       Then choose:   Login with Google\n");
++        try out.writeAll("    1. Verify CLI:    agy --version\n");
+         try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
+         try out.writeAll("       Then type:         Hello!\n");
+         try out.writeAll("    3. Gateway:       nullclaw gateway\n");
+         return;
+     }
+ 
++    if (std.mem.eql(u8, canonical, "gemini") or std.mem.eql(u8, canonical, "vertex")) {
++        try out.writeAll("    1. Verify CLI:    agy --version\n");
++        try out.writeAll("    2. Use provider:  gemini-cli\n");
++        try out.writeAll("    3. Gateway:       nullclaw gateway\n");
++        return;
++    }
++
+     try out.writeAll("    1. Interactive chat:  nullclaw agent\n");
+     try out.writeAll("       Then type:         Hello!\n");
+     try out.writeAll("    2. Gateway:           nullclaw gateway\n");
+@@ -348,7 +373,7 @@ const gemini_cli_fallback = [_][]const u8{
+ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
+     const canonical = canonicalProviderName(provider);
+     if (std.mem.eql(u8, canonical, "openrouter")) return &openrouter_fallback;
+-    if (std.mem.eql(u8, canonical, "openai")) return &openai_fallback;
++    if (std.mem.eql(u8, canonical, "openai")) return &codex_support.codex_model_fallbacks;
+     if (std.mem.eql(u8, canonical, "groq")) return &groq_fallback;
+     if (std.mem.eql(u8, canonical, "anthropic")) return &anthropic_fallback;
+     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
+@@ -675,12 +700,6 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
+ fn staticNativeModelCatalogForProvider(canonical: []const u8) ?NativeModelCatalog {
+     if (std.mem.eql(u8, canonical, "openrouter")) {
+         return .{ .url = "https://openrouter.ai/api/v1/models" };
+-    } else if (std.mem.eql(u8, canonical, "openai")) {
+-        return .{
+-            .url = "https://api.openai.com/v1/models",
+-            .needs_auth = true,
+-            .parse_options = .{ .prefix_filter = "gpt-" },
+-        };
+     } else if (std.mem.eql(u8, canonical, "groq")) {
+         return .{
+             .url = "https://api.groq.com/openai/v1/models",
+@@ -2723,7 +2742,6 @@ const ModelsCatalogProvider = struct {
+ };
+ 
+ const catalog_providers = [_]ModelsCatalogProvider{
+-    .{ .name = "openai", .url = "https://api.openai.com/v1/models", .models_path = "data", .id_field = "id" },
+     .{ .name = "openrouter", .url = "https://openrouter.ai/api/v1/models", .models_path = "data", .id_field = "id" },
+ };
+ 
+@@ -3518,8 +3536,8 @@ test "canonicalProviderName handles aliases" {
+ 
+ test "defaultModelForProvider returns known models" {
+     try std.testing.expectEqualStrings("claude-opus-4-6", defaultModelForProvider("anthropic"));
+-    try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
+-    try std.testing.expectEqualStrings("gpt-5.2-chat", defaultModelForProvider("azure"));
++    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("openai"));
++    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("azure"));
+     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
+     try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", defaultModelForProvider("nearai"));
+     try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlas-cloud"));
+@@ -3539,9 +3557,9 @@ test "defaultModelForProvider falls back for unknown" {
+ 
+ test "providerEnvVar known providers" {
+     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", providerEnvVar("openrouter"));
+-    try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
+-    try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
+-    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
++    try std.testing.expectEqualStrings("", providerEnvVar("anthropic"));
++    try std.testing.expectEqualStrings("", providerEnvVar("openai"));
++    try std.testing.expectEqualStrings("", providerEnvVar("azure"));
+     try std.testing.expectEqualStrings("NEARAI_API_KEY", providerEnvVar("nearai"));
+     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas-cloud"));
+     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas"));
+@@ -3575,7 +3593,7 @@ test "providerRequiresApiKeyForSetup marks local and OAuth providers as keyless"
+     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://100.64.0.1:8080/v1", "http://100.64.0.1:8080/v1"));
+     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://model.local:8080/v1", "http://model.local:8080/v1"));
+     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://[fd00::1]:8080/v1", "http://[fd00::1]:8080/v1"));
+-    try std.testing.expect(providerRequiresApiKeyForSetup("openai", null));
++    try std.testing.expect(!providerRequiresApiKeyForSetup("openai", null));
+ }
+ 
+ test "known_providers has entries" {
+@@ -4087,6 +4105,8 @@ test "scaffoldWorkspace handles trailing native separator on Windows paths" {
+ }
+ 
+ test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace files" {
++    if (!build_options.enable_sqlite) return error.SkipZigTest;
++
+     var tmp = std.testing.tmpDir(.{});
+     defer tmp.cleanup();
+ 
+@@ -4133,6 +4153,8 @@ test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace
+ }
+ 
+ test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touching workspace markdown files" {
++    if (!build_options.enable_sqlite) return error.SkipZigTest;
++
+     var tmp = std.testing.tmpDir(.{});
+     defer tmp.cleanup();
+ 
+@@ -4190,6 +4212,8 @@ test "bootstrap lifecycle stays equivalent across markdown hybrid and sqlite bac
+     defer if (expected_bootstrap) |value| std.testing.allocator.free(value);
+ 
+     for (backends) |backend| {
++        if (!build_options.enable_sqlite and !bootstrap_mod.backendUsesFiles(backend)) continue;
++
+         var tmp = std.testing.tmpDir(.{});
+         defer tmp.cleanup();
+ 
+@@ -4396,7 +4420,7 @@ test "printProviderNextSteps prefers interactive chat when api key is already se
+     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+     defer aw.deinit();
+ 
+-    try printProviderNextSteps(&aw.writer, "openai", "OPENAI_API_KEY", true, true);
++    try printProviderNextSteps(&aw.writer, "groq", "GROQ_API_KEY", true, true);
+ 
+     const rendered = aw.writer.buffer[0..aw.writer.end];
+     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
+@@ -4409,10 +4433,10 @@ test "printProviderNextSteps includes env hint before interactive chat" {
+     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+     defer aw.deinit();
+ 
+-    try printProviderNextSteps(&aw.writer, "openai", "OPENAI_API_KEY", true, false);
++    try printProviderNextSteps(&aw.writer, "groq", "GROQ_API_KEY", true, false);
+ 
+     const rendered = aw.writer.buffer[0..aw.writer.end];
+-    try std.testing.expect(std.mem.indexOf(u8, rendered, "export OPENAI_API_KEY=\"sk-...\"") != null);
++    try std.testing.expect(std.mem.indexOf(u8, rendered, "export GROQ_API_KEY=\"sk-...\"") != null);
+     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
+     try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
+     try std.testing.expect(std.mem.indexOf(u8, rendered, "Gateway:           nullclaw gateway") != null);
+@@ -4446,7 +4470,7 @@ test "printProviderNextSteps keeps codex-cli auth flow and interactive chat" {
+     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+     defer aw.deinit();
+ 
+-    try printProviderNextSteps(&aw.writer, "codex-cli", "OPENAI_API_KEY", false, false);
++    try printProviderNextSteps(&aw.writer, "codex-cli", "", false, false);
+ 
+     const rendered = aw.writer.buffer[0..aw.writer.end];
+     try std.testing.expect(std.mem.indexOf(u8, rendered, "codex login") != null);
+@@ -4458,25 +4482,24 @@ test "printProviderNextSteps keeps gemini-cli auth flow and interactive chat" {
+     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+     defer aw.deinit();
+ 
+-    try printProviderNextSteps(&aw.writer, "gemini-cli", "GEMINI_API_KEY", false, false);
++    try printProviderNextSteps(&aw.writer, "gemini-cli", "", false, false);
+ 
+     const rendered = aw.writer.buffer[0..aw.writer.end];
+-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Authenticate:  gemini") != null);
+-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Login with Google") != null);
++    try std.testing.expect(std.mem.indexOf(u8, rendered, "Verify CLI:    agy --version") != null);
+     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
+     try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
+ }
+ 
+ test "providerEnvVar gemini aliases" {
+-    try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("gemini"));
+-    try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google"));
+-    try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google-gemini"));
++    try std.testing.expectEqualStrings("", providerEnvVar("gemini"));
++    try std.testing.expectEqualStrings("", providerEnvVar("google"));
++    try std.testing.expectEqualStrings("", providerEnvVar("google-gemini"));
+ }
+ 
+ test "providerEnvVar vertex aliases" {
+-    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex"));
+-    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex-ai"));
+-    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("google-vertex"));
++    try std.testing.expectEqualStrings("", providerEnvVar("vertex"));
++    try std.testing.expectEqualStrings("", providerEnvVar("vertex-ai"));
++    try std.testing.expectEqualStrings("", providerEnvVar("google-vertex"));
+ }
+ 
+ test "providerEnvVar deepseek" {
+@@ -4592,9 +4615,8 @@ test "autonomy_options has 4 entries" {
+ }
+ 
+ test "catalog_providers has entries" {
+-    try std.testing.expect(catalog_providers.len >= 2);
+-    try std.testing.expectEqualStrings("openai", catalog_providers[0].name);
+-    try std.testing.expectEqualStrings("openrouter", catalog_providers[1].name);
++    try std.testing.expect(catalog_providers.len >= 1);
++    try std.testing.expectEqualStrings("openrouter", catalog_providers[0].name);
+ }
+ 
+ test "catalog_providers all have valid fields" {
+@@ -5213,7 +5235,7 @@ test "loadModelsWithCache falls back on fetch failure" {
+         std.testing.allocator.free(models);
+     }
+     try std.testing.expect(models.len >= 3);
+-    try std.testing.expectEqualStrings("gpt-5.2", models[0]);
++    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, models[0]);
+ }
+ 
+ test "loadModelsWithCache returns models for anthropic" {
+@@ -5415,7 +5437,7 @@ test "fetchModels returns fallback for openai without key" {
+         std.testing.allocator.free(models);
+     }
+     try std.testing.expect(models.len >= 3);
+-    try std.testing.expectEqualStrings("gpt-5.2", models[0]);
++    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, models[0]);
+ }
+ 
+ test "fetchModels returns fallback for unknown provider" {
+@@ -5459,9 +5481,7 @@ test "staticNativeModelCatalogForProvider maps native model endpoints" {
+     try std.testing.expect(!atlas.needs_auth);
+     try std.testing.expect(atlas.parse_options.require_chat_modalities);
+ 
+-    const openai = staticNativeModelCatalogForProvider("openai") orelse return error.TestUnexpectedResult;
+-    try std.testing.expect(openai.needs_auth);
+-    try std.testing.expectEqualStrings("gpt-", openai.parse_options.prefix_filter.?);
++    try std.testing.expect(staticNativeModelCatalogForProvider("openai") == null);
+ }
+ 
+ test "parseModelsDevModelIds filters non-chat models and sorts them" {
+diff --git a/src/provider_probe.zig b/src/provider_probe.zig
+index 02b49c86..d867c2f3 100644
+--- a/src/provider_probe.zig
++++ b/src/provider_probe.zig
+@@ -40,7 +40,17 @@ fn isLocalEndpoint(url: []const u8) bool {
+ 
+ pub fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool {
+     return switch (providers.classifyProvider(provider_name)) {
+-        .ollama_provider, .claude_cli_provider, .codex_cli_provider, .gemini_cli_provider, .openai_codex_provider => false,
++        .ollama_provider,
++        .anthropic_provider,
++        .openai_provider,
++        .azure_openai_provider,
++        .gemini_provider,
++        .vertex_provider,
++        .claude_cli_provider,
++        .codex_cli_provider,
++        .gemini_cli_provider,
++        .openai_codex_provider,
++        => false,
+         .compatible_provider => blk: {
+             if (base_url) |configured| {
+                 break :blk !isLocalEndpoint(configured);
+@@ -406,7 +416,7 @@ test "providerRequiresApiKey marks local providers as keyless" {
+     try std.testing.expect(!providerRequiresApiKey("codex-cli", null));
+     try std.testing.expect(!providerRequiresApiKey("openai-codex", null));
+     try std.testing.expect(!providerRequiresApiKey("gemini-cli", null));
+-    try std.testing.expect(providerRequiresApiKey("openai", null));
++    try std.testing.expect(!providerRequiresApiKey("openai", null));
+     try std.testing.expect(!providerRequiresApiKey("lmstudio", null));
+     // Regression: local-network compatible endpoints should not require API keys.
+     try std.testing.expect(!providerRequiresApiKey("custom:http://127.0.0.1:8080/v1", null));
+diff --git a/src/providers/api_key.zig b/src/providers/api_key.zig
+index 3c64fd55..bea53740 100644
+--- a/src/providers/api_key.zig
++++ b/src/providers/api_key.zig
+@@ -291,12 +291,12 @@ pub fn tryLoadQwenCliToken(allocator: std.mem.Allocator) ?QwenCliCredentials {
+ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
+     const canonical = provider_names.canonicalProviderNameIgnoreCase(name);
+     const map = std.StaticStringMap([3][]const u8).initComptime(.{
+-        .{ "anthropic", .{ "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "" } },
++        .{ "anthropic", .{ "", "", "" } },
+         .{ "openrouter", .{ "OPENROUTER_API_KEY", "", "" } },
+-        .{ "openai", .{ "OPENAI_API_KEY", "", "" } },
+-        .{ "azure", .{ "AZURE_OPENAI_API_KEY", "", "" } },
+-        .{ "gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
+-        .{ "vertex", .{ "VERTEX_API_KEY", "VERTEX_OAUTH_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN" } },
++        .{ "openai", .{ "", "", "" } },
++        .{ "azure", .{ "", "", "" } },
++        .{ "gemini", .{ "", "", "" } },
++        .{ "vertex", .{ "", "", "" } },
+         .{ "groq", .{ "GROQ_API_KEY", "", "" } },
+         .{ "mistral", .{ "MISTRAL_API_KEY", "", "" } },
+         .{ "deepseek", .{ "DEEPSEEK_API_KEY", "", "" } },
+@@ -346,9 +346,9 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
+         .{ "ollama", .{ "API_KEY", "", "" } },
+         .{ "lmstudio", .{ "API_KEY", "", "" } },
+         .{ "lm-studio", .{ "API_KEY", "", "" } },
+-        .{ "claude-cli", .{ "ANTHROPIC_API_KEY", "", "" } },
+-        .{ "codex-cli", .{ "OPENAI_API_KEY", "", "" } },
+-        .{ "gemini-cli", .{ "GEMINI_API_KEY", "", "" } },
++        .{ "claude-cli", .{ "", "", "" } },
++        .{ "codex-cli", .{ "", "", "" } },
++        .{ "gemini-cli", .{ "", "", "" } },
+     });
+     return map.get(canonical) orelse .{ "", "", "" };
+ }
+@@ -392,9 +392,9 @@ test "astrai env candidate is ASTRAI_API_KEY" {
+     try std.testing.expectEqualStrings("ASTRAI_API_KEY", candidates[0]);
+ }
+ 
+-test "vertex env candidate is VERTEX_API_KEY" {
++test "vertex does not resolve direct API env candidates" {
+     const candidates = providerEnvCandidates("vertex");
+-    try std.testing.expectEqualStrings("VERTEX_API_KEY", candidates[0]);
++    try std.testing.expectEqualStrings("", candidates[0]);
+ }
+ 
+ test "qwen uses dashscope api key env candidate" {
+@@ -428,10 +428,10 @@ test "evolink env candidate is EVOLINK_API_KEY" {
+     try std.testing.expectEqualStrings("EVOLINK_API_KEY", candidates[0]);
+ }
+ 
+-test "azure aliases share Azure env candidate" {
+-    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure")[0]);
+-    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure-openai")[0]);
+-    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure_openai")[0]);
++test "azure aliases do not resolve direct API env candidates" {
++    try std.testing.expectEqualStrings("", providerEnvCandidates("azure")[0]);
++    try std.testing.expectEqualStrings("", providerEnvCandidates("azure-openai")[0]);
++    try std.testing.expectEqualStrings("", providerEnvCandidates("azure_openai")[0]);
+ }
+ 
+ test "xiaomi aliases share MIMO env candidate" {
+diff --git a/src/providers/factory.zig b/src/providers/factory.zig
+index 8cbd210b..d6c494f7 100644
+--- a/src/providers/factory.zig
++++ b/src/providers/factory.zig
+@@ -228,6 +228,20 @@ fn validatedBaseUrl(base_url: ?[]const u8) ?[]const u8 {
+     return null;
+ }
+ 
++fn forbiddenDirectProviderBaseUrl(base_url: []const u8) bool {
++    return std.mem.indexOf(u8, base_url, "api.openai.com") != null or
++        std.mem.indexOf(u8, base_url, "openai.azure.com") != null or
++        std.mem.indexOf(u8, base_url, "api.anthropic.com") != null or
++        std.mem.indexOf(u8, base_url, "generativelanguage.googleapis.com") != null or
++        std.mem.indexOf(u8, base_url, "aiplatform.googleapis.com") != null;
++}
++
++fn allowedCompatibleBaseUrl(base_url: ?[]const u8) ?[]const u8 {
++    const url = validatedBaseUrl(base_url) orelse return null;
++    if (forbiddenDirectProviderBaseUrl(url)) return null;
++    return url;
++}
++
+ fn normalizeAzureBaseUrlOwned(allocator: std.mem.Allocator, base_url: ?[]const u8) ![]u8 {
+     const raw = trimTrailingSlash(base_url orelse AZURE_DEFAULT_BASE_URL);
+ 
+@@ -290,14 +304,14 @@ pub fn classifyProvider(name: []const u8) ProviderKind {
+ pub fn detectProviderByApiKey(key: []const u8) ProviderKind {
+     if (key.len < 3) return .unknown;
+     if (std.mem.startsWith(u8, key, "sk-or-")) return .openrouter_provider;
+-    if (std.mem.startsWith(u8, key, "sk-ant-")) return .anthropic_provider;
+-    if (std.mem.startsWith(u8, key, "sk-")) return .openai_provider;
++    if (std.mem.startsWith(u8, key, "sk-ant-")) return .unknown;
++    if (std.mem.startsWith(u8, key, "sk-")) return .unknown;
+     if (std.mem.startsWith(u8, key, "gsk_")) return .compatible_provider;
+     if (std.mem.startsWith(u8, key, "xai-")) return .compatible_provider;
+     if (std.mem.startsWith(u8, key, "pplx-")) return .compatible_provider;
+     if (std.mem.startsWith(u8, key, "AKIA")) return .compatible_provider;
+-    if (std.mem.startsWith(u8, key, "AIza")) return .gemini_provider;
+-    if (std.mem.startsWith(u8, key, "ya29.")) return .vertex_provider;
++    if (std.mem.startsWith(u8, key, "AIza")) return .unknown;
++    if (std.mem.startsWith(u8, key, "ya29.")) return .unknown;
+     return .unknown;
+ }
+ 
+@@ -327,6 +341,7 @@ pub const ProviderHolder = union(enum) {
+     codex_cli: codex_cli.CodexCliProvider,
+     gemini_cli: gemini_cli.GeminiCliProvider,
+     openai_codex: openai_codex.OpenAiCodexProvider,
++    disabled_policy: DisabledPolicyProvider,
+ 
+     /// Obtain the vtable-based Provider interface from whichever variant is active.
+     pub fn provider(self: *ProviderHolder) Provider {
+@@ -342,6 +357,7 @@ pub const ProviderHolder = union(enum) {
+             .codex_cli => |*p| p.provider(),
+             .gemini_cli => |*p| p.provider(),
+             .openai_codex => |*p| p.provider(),
++            .disabled_policy => |*p| p.provider(),
+         };
+     }
+ 
+@@ -391,41 +407,9 @@ pub const ProviderHolder = union(enum) {
+     ) ProviderHolder {
+         const kind = classifyProvider(provider_name);
+         return switch (kind) {
+-            .anthropic_provider => .{ .anthropic = anthropic.AnthropicProvider.init(
+-                allocator,
+-                api_key,
+-                if (std.mem.startsWith(u8, provider_name, "anthropic-custom:"))
+-                    if (config_types.ProviderEntry.isValidBaseUrl(provider_name["anthropic-custom:".len..]))
+-                        provider_name["anthropic-custom:".len..]
+-                    else
+-                        validatedBaseUrl(base_url)
+-                else
+-                    validatedBaseUrl(base_url),
+-            ) },
+-            .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent, extra_body_params) },
+-            .azure_openai_provider => blk: {
+-                const azure_url = normalizeAzureBaseUrlOwned(allocator, validatedBaseUrl(base_url)) catch null;
+-                var prov = compatible.OpenAiCompatibleProvider.init(
+-                    allocator,
+-                    provider_name,
+-                    if (azure_url) |url| url else AZURE_DEFAULT_COMPAT_BASE_URL,
+-                    api_key,
+-                    .custom,
+-                    user_agent,
+-                );
+-                prov.owned_base_url = azure_url;
+-                prov.custom_header = "api-key";
+-                if (!native_tools) prov.native_tools = false;
+-                prov.api_mode = switch (api_mode) {
+-                    .responses => .responses,
+-                    else => .chat_completions,
+-                };
+-                if (max_streaming_prompt_bytes) |limit| prov.max_streaming_prompt_bytes = limit;
+-                prov.extra_body_params = extra_body_params;
+-                break :blk .{ .compatible = prov };
+-            },
+-            .gemini_provider => .{ .gemini = gemini.GeminiProvider.init(allocator, api_key) },
+-            .vertex_provider => .{ .vertex = vertex.VertexProvider.init(allocator, api_key, validatedBaseUrl(base_url)) },
++            .anthropic_provider => cliOrDisabled(allocator, .claude_cli_provider, "claude-cli"),
++            .openai_provider, .azure_openai_provider, .openai_codex_provider => cliOrDisabled(allocator, .codex_cli_provider, "codex-cli"),
++            .gemini_provider, .vertex_provider => cliOrDisabled(allocator, .gemini_cli_provider, "gemini-cli"),
+             .ollama_provider => blk: {
+                 var prov = ollama.OllamaProvider.init(allocator, validatedBaseUrl(base_url), api_key);
+                 prov.native_tools = native_tools;
+@@ -434,12 +418,16 @@ pub const ProviderHolder = union(enum) {
+             .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, extra_body_params) },
+             .compatible_provider => blk: {
+                 // Config base_url overrides built-in URL table and custom: prefix
+-                const url = validatedBaseUrl(base_url) orelse
+-                    if (std.mem.startsWith(u8, provider_name, "custom:") and
+-                        config_types.ProviderEntry.isValidBaseUrl(provider_name["custom:".len..]))
+-                        provider_name["custom:".len..]
+-                    else
+-                        compatibleProviderUrl(provider_name) orelse "https://openrouter.ai/api/v1";
++                const custom_prefix_url = if (std.mem.startsWith(u8, provider_name, "custom:") and
++                    config_types.ProviderEntry.isValidBaseUrl(provider_name["custom:".len..]) and
++                    !forbiddenDirectProviderBaseUrl(provider_name["custom:".len..]))
++                    provider_name["custom:".len..]
++                else
++                    null;
++                const url = allowedCompatibleBaseUrl(base_url) orelse
++                    custom_prefix_url orelse
++                    compatibleProviderUrl(provider_name) orelse
++                    return disabledProvider(provider_name);
+ 
+                 const cp = findCompatProvider(provider_name);
+ 
+@@ -478,22 +466,11 @@ pub const ProviderHolder = union(enum) {
+ 
+                 break :blk .{ .compatible = prov };
+             },
+-            .claude_cli_provider => if (claude_cli.ClaudeCliProvider.init(allocator, null)) |p|
+-                .{ .claude_cli = p }
+-            else |_|
+-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
+-            .codex_cli_provider => if (codex_cli.CodexCliProvider.init(allocator, null)) |p|
+-                .{ .codex_cli = p }
+-            else |_|
+-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
+-            .gemini_cli_provider => if (gemini_cli.GeminiCliProvider.init(allocator, null)) |p|
+-                .{ .gemini_cli = p }
+-            else |_|
+-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
+-            .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
+-            // Unknown provider: if base_url is configured, treat as OpenAI-compatible;
+-            // otherwise fall back to OpenRouter.
+-            .unknown => if (validatedBaseUrl(base_url)) |url| blk: {
++            .claude_cli_provider => cliOrDisabled(allocator, .claude_cli_provider, "claude-cli"),
++            .codex_cli_provider => cliOrDisabled(allocator, .codex_cli_provider, "codex-cli"),
++            .gemini_cli_provider => cliOrDisabled(allocator, .gemini_cli_provider, "gemini-cli"),
++            // Unknown provider: only explicit non-forbidden compatible base URLs are allowed.
++            .unknown => if (allowedCompatibleBaseUrl(base_url)) |url| blk: {
+                 var prov = compatible.OpenAiCompatibleProvider.init(
+                     allocator,
+                     provider_name,
+@@ -511,11 +488,88 @@ pub const ProviderHolder = union(enum) {
+                 if (chat_template_enable_thinking_param) prov.chat_template_enable_thinking_param = true;
+                 prov.extra_body_params = extra_body_params;
+                 break :blk .{ .compatible = prov };
+-            } else .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
++            } else disabledProvider(provider_name),
+         };
+     }
+ };
+ 
++const DisabledPolicyProvider = struct {
++    name: []const u8,
++
++    fn provider(self: *DisabledPolicyProvider) Provider {
++        return .{
++            .ptr = @ptrCast(self),
++            .vtable = &vtable,
++        };
++    }
++
++    const vtable = Provider.VTable{
++        .chatWithSystem = chatWithSystemImpl,
++        .chat = chatImpl,
++        .supportsNativeTools = supportsNativeToolsImpl,
++        .getName = getNameImpl,
++        .deinit = deinitImpl,
++        .supports_vision = supportsVisionImpl,
++    };
++
++    fn chatWithSystemImpl(
++        _: *anyopaque,
++        _: std.mem.Allocator,
++        _: ?[]const u8,
++        _: []const u8,
++        _: []const u8,
++        _: f64,
++    ) anyerror![]const u8 {
++        return error.ProviderDisabledByRuntimePolicy;
++    }
++
++    fn chatImpl(
++        _: *anyopaque,
++        _: std.mem.Allocator,
++        _: root.ChatRequest,
++        _: []const u8,
++        _: f64,
++    ) anyerror!root.ChatResponse {
++        return error.ProviderDisabledByRuntimePolicy;
++    }
++
++    fn supportsNativeToolsImpl(_: *anyopaque) bool {
++        return false;
++    }
++
++    fn supportsVisionImpl(_: *anyopaque) bool {
++        return false;
++    }
++
++    fn getNameImpl(_: *anyopaque) []const u8 {
++        return "disabled-runtime-policy";
++    }
++
++    fn deinitImpl(_: *anyopaque) void {}
++};
++
++fn disabledProvider(name: []const u8) ProviderHolder {
++    return .{ .disabled_policy = .{ .name = name } };
++}
++
++fn cliOrDisabled(allocator: std.mem.Allocator, kind: ProviderKind, disabled_name: []const u8) ProviderHolder {
++    return switch (kind) {
++        .claude_cli_provider => if (claude_cli.ClaudeCliProvider.init(allocator, null)) |p|
++            .{ .claude_cli = p }
++        else |_|
++            disabledProvider(disabled_name),
++        .codex_cli_provider => if (codex_cli.CodexCliProvider.init(allocator, null)) |p|
++            .{ .codex_cli = p }
++        else |_|
++            disabledProvider(disabled_name),
++        .gemini_cli_provider => if (gemini_cli.GeminiCliProvider.init(allocator, null)) |p|
++            .{ .gemini_cli = p }
++        else |_|
++            disabledProvider(disabled_name),
++        else => disabledProvider(disabled_name),
++    };
++}
++
+ // ════════════════════════════════════════════════════════════════════════════
+ // Tests
+ // ════════════════════════════════════════════════════════════════════════════
+@@ -541,10 +595,18 @@ const provider_holder_cases = [_]ProviderHolderCase{
+     .{ .name = "codex-cli", .expected_name_substr = "codex", .expected_tag = .codex_cli },
+     .{ .name = "gemini-cli", .expected_name_substr = "gemini", .expected_tag = .gemini_cli },
+     .{ .name = "openai-codex", .expected_name_substr = "openai", .expected_tag = .openai_codex },
++    .{ .name = "disabled", .expected_name_substr = "disabled", .expected_tag = .disabled_policy },
+ };
+ 
+ fn providerHolderForCase(allocator: std.mem.Allocator, c: ProviderHolderCase) ProviderHolder {
+     return switch (c.expected_tag) {
++        .openrouter => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, "sk-or-test", null) },
++        .anthropic => .{ .anthropic = anthropic.AnthropicProvider.init(allocator, "sk-ant-test", null) },
++        .openai => .{ .openai = openai.OpenAiProvider.init(allocator, "sk-test", null, null) },
++        .gemini => .{ .gemini = gemini.GeminiProvider.init(allocator, "AIza-test") },
++        .vertex => .{ .vertex = vertex.VertexProvider.init(allocator, "ya29.test", null) },
++        .ollama => .{ .ollama = ollama.OllamaProvider.init(allocator, null, null) },
++        .compatible => .{ .compatible = compatible.OpenAiCompatibleProvider.init(allocator, c.name, "https://api.example.com/v1", "test-key", .bearer, null) },
+         .claude_cli => .{ .claude_cli = .{
+             .allocator = allocator,
+             .model = "test-claude",
+@@ -557,17 +619,8 @@ fn providerHolderForCase(allocator: std.mem.Allocator, c: ProviderHolderCase) Pr
+             .allocator = allocator,
+             .model = "test-gemini",
+         } },
+-        else => ProviderHolder.fromConfig(
+-            allocator,
+-            c.name,
+-            "test-key",
+-            c.base_url,
+-            true,
+-            null,
+-            null,
+-            false,
+-            null,
+-        ),
++        .openai_codex => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
++        .disabled_policy => disabledProvider("disabled"),
+     };
+ }
+ 
+@@ -1092,12 +1145,11 @@ test "fromConfig threads extra_body_params to compatible provider" {
+     try std.testing.expectEqualStrings("{\"seed\":7}", h.compatible.extra_body_params.?);
+ }
+ 
+-test "fromConfig threads extra_body_params to openai provider" {
++test "fromConfig routes direct openai provider to allowed CLI path" {
+     const alloc = std.testing.allocator;
+     var h = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null, null, false, "{\"seed\":11}");
+     defer h.deinit();
+-    try std.testing.expect(h == .openai);
+-    try std.testing.expectEqualStrings("{\"seed\":11}", h.openai.extra_body_params.?);
++    try std.testing.expect(h == .codex_cli or h == .disabled_policy);
+ }
+ 
+ test "fromConfig threads extra_body_params to openrouter provider" {
+@@ -1113,11 +1165,11 @@ test "detectProviderByApiKey openrouter" {
+ }
+ 
+ test "detectProviderByApiKey anthropic" {
+-    try std.testing.expect(detectProviderByApiKey("sk-ant-api03-abc123") == .anthropic_provider);
++    try std.testing.expect(detectProviderByApiKey("sk-ant-api03-abc123") == .unknown);
+ }
+ 
+ test "detectProviderByApiKey openai" {
+-    try std.testing.expect(detectProviderByApiKey("sk-proj-abc123") == .openai_provider);
++    try std.testing.expect(detectProviderByApiKey("sk-proj-abc123") == .unknown);
+ }
+ 
+ test "detectProviderByApiKey groq" {
+@@ -1137,11 +1189,11 @@ test "detectProviderByApiKey aws" {
+ }
+ 
+ test "detectProviderByApiKey gemini" {
+-    try std.testing.expect(detectProviderByApiKey("AIzaSyAbc123") == .gemini_provider);
++    try std.testing.expect(detectProviderByApiKey("AIzaSyAbc123") == .unknown);
+ }
+ 
+ test "detectProviderByApiKey vertex oauth token" {
+-    try std.testing.expect(detectProviderByApiKey("ya29.a0AfH6SMD-abc123") == .vertex_provider);
++    try std.testing.expect(detectProviderByApiKey("ya29.a0AfH6SMD-abc123") == .unknown);
+ }
+ 
+ test "detectProviderByApiKey unknown" {
+@@ -1173,26 +1225,23 @@ test "ProviderHolder.fromConfig routes to correct variant" {
+     // anthropic
+     var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test", null, true, null, null, false, null);
+     defer h1.deinit();
+-    try std.testing.expect(h1 == .anthropic);
++    try std.testing.expect(h1 == .claude_cli or h1 == .disabled_policy);
+     // openai
+     var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null, null, false, null);
+     defer h2.deinit();
+-    try std.testing.expect(h2 == .openai);
++    try std.testing.expect(h2 == .codex_cli or h2 == .disabled_policy);
+     // azure openai
+     var h2a = ProviderHolder.fromConfig(alloc, "azure", "test-key", "https://test.openai.azure.com", true, null, null, false, null);
+     defer h2a.deinit();
+-    try std.testing.expect(h2a == .compatible);
+-    try std.testing.expectEqualStrings("https://test.openai.azure.com/openai/v1", h2a.compatible.base_url);
+-    try std.testing.expect(h2a.compatible.auth_style == .custom);
+-    try std.testing.expectEqualStrings("api-key", h2a.compatible.custom_header.?);
++    try std.testing.expect(h2a == .codex_cli or h2a == .disabled_policy);
+     // gemini
+     var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null, true, null, null, false, null);
+     defer h3.deinit();
+-    try std.testing.expect(h3 == .gemini);
++    try std.testing.expect(h3 == .gemini_cli or h3 == .disabled_policy);
+     // vertex
+     var h3b = ProviderHolder.fromConfig(alloc, "vertex", "ya29.token", "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models", true, null, null, false, null);
+     defer h3b.deinit();
+-    try std.testing.expect(h3b == .vertex);
++    try std.testing.expect(h3b == .gemini_cli or h3b == .disabled_policy);
+     // ollama
+     var h4 = ProviderHolder.fromConfig(alloc, "ollama", null, null, true, null, null, false, null);
+     defer h4.deinit();
+@@ -1226,15 +1275,15 @@ test "ProviderHolder.fromConfig routes to correct variant" {
+     // openai-codex
+     var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null, null, true, null, null, false, null);
+     defer h7.deinit();
+-    try std.testing.expect(h7 == .openai_codex);
+-    // unknown falls back to openrouter
++    try std.testing.expect(h7 == .codex_cli or h7 == .disabled_policy);
++    // unknown providers do not silently fall back to OpenRouter.
+     var h8 = ProviderHolder.fromConfig(alloc, "nonexistent", "key", null, true, null, null, false, null);
+     defer h8.deinit();
+-    try std.testing.expect(h8 == .openrouter);
++    try std.testing.expect(h8 == .disabled_policy);
+     // anthropic-custom prefix
+     var h9 = ProviderHolder.fromConfig(alloc, "anthropic-custom:https://my-api.example.com", "sk-test", null, true, null, null, false, null);
+     defer h9.deinit();
+-    try std.testing.expect(h9 == .anthropic);
++    try std.testing.expect(h9 == .claude_cli or h9 == .disabled_policy);
+ }
+ 
+ test "compat_providers table count" {
+@@ -1250,13 +1299,11 @@ test "fromConfig threads max_streaming_prompt_bytes to azure branch" {
+     // null → no limit
+     var h1 = ProviderHolder.fromConfig(alloc, "azure-openai", "key", "https://res.openai.azure.com", true, null, null, false, null);
+     defer h1.deinit();
+-    try std.testing.expect(h1 == .compatible);
+-    try std.testing.expectEqual(@as(?usize, null), h1.compatible.max_streaming_prompt_bytes);
++    try std.testing.expect(h1 == .codex_cli or h1 == .disabled_policy);
+     // non-null → limit applied
+     var h2 = ProviderHolder.fromConfig(alloc, "azure-openai", "key", "https://res.openai.azure.com", true, null, 65536, false, null);
+     defer h2.deinit();
+-    try std.testing.expect(h2 == .compatible);
+-    try std.testing.expectEqual(@as(?usize, 65536), h2.compatible.max_streaming_prompt_bytes);
++    try std.testing.expect(h2 == .codex_cli or h2 == .disabled_policy);
+ }
+ 
+ test "fromConfig threads max_streaming_prompt_bytes to unknown-with-base-url branch" {
+@@ -1287,8 +1334,7 @@ test "fromConfig threads max_streaming_prompt_bytes zero value" {
+     // Azure branch
+     var h2 = ProviderHolder.fromConfig(alloc, "azure", "key", "https://res.openai.azure.com", true, null, 0, false, null);
+     defer h2.deinit();
+-    try std.testing.expect(h2 == .compatible);
+-    try std.testing.expectEqual(@as(?usize, 0), h2.compatible.max_streaming_prompt_bytes);
++    try std.testing.expect(h2 == .codex_cli or h2 == .disabled_policy);
+     // Unknown-with-base-url branch
+     var h3 = ProviderHolder.fromConfig(alloc, "custom-llm", "key", "http://localhost:7777/v1", true, null, 0, false, null);
+     defer h3.deinit();
+diff --git a/src/providers/gemini_cli.zig b/src/providers/gemini_cli.zig
+index 11fdbac6..35bed85b 100644
+--- a/src/providers/gemini_cli.zig
++++ b/src/providers/gemini_cli.zig
+@@ -10,13 +10,12 @@ const ChatMessage = root.ChatMessage;
+ 
+ const log = std.log.scoped(.gemini_cli);
+ 
+-/// Provider that delegates to the `gemini` CLI (Google Gemini).
++/// Provider that delegates Gemini-family work to Antigravity (`agy`).
+ ///
+-/// Implements a Lazy Persistent Singleton:
+-/// 1. Spawns `gemini --experimental-acp` on first use.
+-/// 2. Performs a JSON-RPC 2.0 handshake to create a session.
+-/// 3. Keeps the process alive for subsequent requests.
+-/// 4. Communicates via JSON-RPC 2.0 over stdio.
++/// Antigravity is the approved local runtime path for Gemini models in this
++/// environment. The command currently opens/runs an Antigravity chat session;
++/// if the CLI does not emit a text answer on stdout, callers receive
++/// `NoResultInOutput` rather than falling back to a direct Google API.
+ pub const GeminiCliProvider = struct {
+     allocator: std.mem.Allocator,
+     model: []const u8,
+@@ -31,8 +30,9 @@ pub const GeminiCliProvider = struct {
+     read_offset: usize = 0,
+ 
+     const DEFAULT_MODEL = "gemini-2.0-flash";
+-    const CLI_NAME = "gemini";
++    const CLI_NAME = "agy";
+     const ACP_PROTOCOL_VERSION: u32 = 1;
++    const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+ 
+     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !GeminiCliProvider {
+         // Just verify CLI is in PATH, don't start it yet.
+@@ -310,93 +310,9 @@ pub const GeminiCliProvider = struct {
+     fn sendPrompt(self: *GeminiCliProvider, allocator: std.mem.Allocator, prompt: []const u8, model: []const u8) ![]const u8 {
+         self.mutex.lock();
+         defer self.mutex.unlock();
++        _ = model;
+ 
+-        try self.ensureStarted();
+-
+-        const id = self.next_id;
+-        self.next_id += 1;
+-
+-        const msg = try std.json.Stringify.valueAlloc(allocator, .{
+-            .jsonrpc = "2.0",
+-            .id = id,
+-            .method = "session/prompt",
+-            .params = .{
+-                .sessionId = self.session_id.?,
+-                .model = model,
+-                .prompt = &[_]struct { type: []const u8, text: []const u8 }{
+-                    .{ .type = "text", .text = prompt },
+-                },
+-            },
+-        }, .{});
+-        defer allocator.free(msg);
+-
+-        try self.sendJsonRpcLine(msg);
+-
+-        // Accumulate output
+-        var result_buf: std.ArrayListUnmanaged(u8) = .empty;
+-        defer result_buf.deinit(allocator);
+-
+-        while (true) {
+-            const line = try self.readLine(self.allocator);
+-            defer self.allocator.free(line);
+-
+-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+-                continue;
+-            };
+-            defer parsed.deinit();
+-
+-            if (parsed.value != .object) {
+-                continue;
+-            }
+-            const obj = parsed.value.object;
+-
+-            // session/update notifications
+-            if (obj.get("method")) |method| {
+-                if (method == .string and std.mem.eql(u8, method.string, "session/update")) {
+-                    const params = if (obj.get("params")) |p| if (p == .object) p.object else continue else continue;
+-                    const update = if (params.get("update")) |u| if (u == .object) u.object else continue else continue;
+-                    const content = if (update.get("content")) |c| if (c == .object) c.object else continue else continue;
+-                    if (content.get("text")) |text_val| {
+-                        if (text_val == .string) {
+-                            try result_buf.appendSlice(allocator, text_val.string);
+-                        }
+-                    }
+-                    continue;
+-                }
+-            }
+-
+-            // Final result response
+-            if (!responseIdMatches(obj.get("id"), id)) continue;
+-
+-            if (obj.get("result")) |res| {
+-                if (res == .object) {
+-                    if (res.object.get("content")) |c| {
+-                        if (c == .string) {
+-                            if (c.string.len > 0) {
+-                                result_buf.clearRetainingCapacity();
+-                                try result_buf.appendSlice(allocator, c.string);
+-                            }
+-                        }
+-                    }
+-                }
+-            } else if (obj.get("error")) |err_val| {
+-                log.err("Gemini ACP prompt failed with error: {any}", .{err_val});
+-
+-                // Record detailed error message if available
+-                if (err_val == .object) {
+-                    if (lookupErrorMessage(err_val.object)) |err_msg| {
+-                        root.setLastApiErrorDetail("gemini-cli", err_msg);
+-                    }
+-                }
+-
+-                return error.ApiError;
+-            }
+-
+-            break;
+-        }
+-
+-        if (result_buf.items.len == 0) return error.NoResultInOutput;
+-        return try result_buf.toOwnedSlice(allocator);
++        return runAntigravityChat(allocator, prompt);
+     }
+ 
+     fn lookupErrorMessage(obj: std.json.ObjectMap) ?[]const u8 {
+@@ -447,7 +363,7 @@ pub const GeminiCliProvider = struct {
+         }
+     }
+ 
+-    /// Fetch available model names by running `gemini -p \"/model\" -o stream-json`.
++    /// Fetch available model names through Antigravity when it emits stdout.
+     pub fn fetchModels(allocator: std.mem.Allocator) [][]const u8 {
+         if (builtin.is_test) return &.{};
+         return fetchModelsInternal(allocator) catch &.{};
+@@ -456,10 +372,9 @@ pub const GeminiCliProvider = struct {
+     fn fetchModelsInternal(allocator: std.mem.Allocator) ![][]const u8 {
+         const argv = &[_][]const u8{
+             CLI_NAME,
+-            "-p",
++            "chat",
++            "--mode=agent",
+             "/model",
+-            "-o",
+-            "stream-json",
+         };
+ 
+         var child = std_compat.process.Child.init(argv, allocator);
+@@ -490,6 +405,43 @@ pub const GeminiCliProvider = struct {
+     }
+ };
+ 
++fn runAntigravityChat(allocator: std.mem.Allocator, prompt: []const u8) ![]const u8 {
++    const argv = [_][]const u8{
++        GeminiCliProvider.CLI_NAME,
++        "chat",
++        "--mode=agent",
++        prompt,
++    };
++
++    var child = std_compat.process.Child.init(&argv, allocator);
++    child.stdin_behavior = .Close;
++    child.stdout_behavior = .Pipe;
++    child.stderr_behavior = .Ignore;
++
++    child.spawn() catch return error.CliNotFound;
++    const out = child.stdout.?.readToEndAlloc(allocator, GeminiCliProvider.MAX_OUTPUT_BYTES) catch |err| {
++        _ = child.wait() catch {};
++        return err;
++    };
++    errdefer allocator.free(out);
++
++    const term = child.wait() catch return error.CliProcessFailed;
++    switch (term) {
++        .exited => |code| {
++            if (code != 0) return error.CliProcessFailed;
++        },
++        else => return error.CliProcessFailed,
++    }
++
++    const trimmed = std.mem.trimEnd(u8, out, " \t\r\n");
++    if (trimmed.len == 0) return error.NoResultInOutput;
++    if (trimmed.len == out.len) return out;
++
++    const result = try allocator.dupe(u8, trimmed);
++    allocator.free(out);
++    return result;
++}
++
+ fn buildInitializeRequest(allocator: std.mem.Allocator, id: u32) ![]u8 {
+     var buf: std.ArrayListUnmanaged(u8) = .empty;
+     errdefer buf.deinit(allocator);
+diff --git a/src/tools/root.zig b/src/tools/root.zig
+index 6c759519..a94ba3a2 100644
+--- a/src/tools/root.zig
++++ b/src/tools/root.zig
+@@ -6,6 +6,7 @@
+ 
+ const std = @import("std");
+ const builtin = @import("builtin");
++const build_options = @import("build_options");
+ const memory_mod = @import("../memory/root.zig");
+ const Memory = memory_mod.Memory;
+ const bootstrap_mod = @import("../bootstrap/root.zig");
+@@ -127,7 +128,7 @@ pub const spi = @import("spi.zig");
+ pub const path_security = @import("path_security.zig");
+ pub const process_util = @import("process_util.zig");
+ pub const calculator = @import("calculator.zig");
+-pub const sqlite_query = @import("sqlite_query.zig");
++pub const sqlite_query = if (build_options.enable_sqlite) @import("sqlite_query.zig") else @import("sqlite_query_disabled.zig");
+ pub const anonymize_text = @import("anonymize_text.zig");
+ 
+ // ── Core types ──────────────────────────────────────────────────────
+diff --git a/src/voice.zig b/src/voice.zig
+index 7eaa0a58..f7e3b52b 100644
+--- a/src/voice.zig
++++ b/src/voice.zig
+@@ -1,4 +1,4 @@
+-//! Voice transcription via OpenAI-compatible STT APIs (Groq/OpenAI/Telnyx).
++//! Voice transcription via OpenAI-compatible STT APIs (Groq/Telnyx/custom).
+ //!
+ //! Reads an audio file, builds a multipart/form-data POST request,
+ //! and sends it to the configured transcription endpoint. Returns the
+@@ -82,10 +82,10 @@ pub const WhisperTranscriber = struct {
+ /// Resolve transcription endpoint for a given provider name.
+ pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]const u8) []const u8 {
+     if (explicit_endpoint) |ep| return ep;
+-    if (std.ascii.eqlIgnoreCase(provider, "openai")) return "https://api.openai.com/v1/audio/transcriptions";
+     if (std.ascii.eqlIgnoreCase(provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
+     if (std.ascii.eqlIgnoreCase(provider, "telnyx")) return "https://api.telnyx.com/v2/ai/audio/transcriptions";
+-    // For unknown providers, try OpenAI-compatible endpoint
++    // For unknown providers, try the Groq-compatible endpoint; direct OpenAI is
++    // disallowed by runtime policy.
+     return "https://api.groq.com/openai/v1/audio/transcriptions";
+ }
+ 
+@@ -124,6 +124,7 @@ fn isSafeTranscriptionEndpointUrl(url: []const u8) bool {
+     const trimmed = std.mem.trim(u8, url, " \t\r\n");
+     if (trimmed.len == 0 or trimmed.len != url.len) return false;
+     if (std.mem.indexOfAny(u8, trimmed, " \t\r\n?#") != null) return false;
++    if (isForbiddenDirectProviderEndpoint(trimmed)) return false;
+ 
+     const uri = std.Uri.parse(trimmed) catch return false;
+     const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+@@ -135,6 +136,13 @@ fn isSafeTranscriptionEndpointUrl(url: []const u8) bool {
+     return true;
+ }
+ 
++fn isForbiddenDirectProviderEndpoint(url: []const u8) bool {
++    return std.mem.indexOf(u8, url, "api.openai.com") != null or
++        std.mem.indexOf(u8, url, "api.anthropic.com") != null or
++        std.mem.indexOf(u8, url, "generativelanguage.googleapis.com") != null or
++        std.mem.indexOf(u8, url, "aiplatform.googleapis.com") != null;
++}
++
+ /// Transcribe an audio file using the Groq Whisper API.
+ ///
+ /// Reads the file at `file_path`, builds a multipart/form-data request,
+@@ -558,14 +566,14 @@ test "voice TranscribeOptions custom" {
+ }
+ 
+ test "voice resolveTranscriptionEndpoint is provider case insensitive" {
+-    try std.testing.expectEqualStrings(
+-        "https://api.openai.com/v1/audio/transcriptions",
+-        resolveTranscriptionEndpoint("OpenAI", null),
+-    );
+     try std.testing.expectEqualStrings(
+         "https://api.groq.com/openai/v1/audio/transcriptions",
+         resolveTranscriptionEndpoint("GROQ", null),
+     );
++    try std.testing.expectEqualStrings(
++        "https://api.telnyx.com/v2/ai/audio/transcriptions",
++        resolveTranscriptionEndpoint("TELNYX", null),
++    );
+ }
+ 
+ test "voice generateBoundary produces 32 hex chars" {
+@@ -752,6 +760,8 @@ test "voice transcription endpoint URL validation" {
+     try std.testing.expect(!isSafeTranscriptionEndpointUrl("http://api.example.com/v1/audio/transcriptions"));
+     try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions?access_token=test"));
+     try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions#frag"));
++    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.openai.com/v1/audio/transcriptions"));
++    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://generativelanguage.googleapis.com/v1beta/openai/audio/transcriptions"));
+ }
+ 
+ test "voice transcribeFile returns error for nonexistent file" {
+@@ -808,7 +818,7 @@ test "voice resolveTranscriptionEndpoint groq" {
+ 
+ test "voice resolveTranscriptionEndpoint openai" {
+     try std.testing.expectEqualStrings(
+-        "https://api.openai.com/v1/audio/transcriptions",
++        "https://api.groq.com/openai/v1/audio/transcriptions",
+         resolveTranscriptionEndpoint("openai", null),
+     );
+ }

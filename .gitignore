@@ -1,6 +1,7 @@
 zig-out/
 zig-cache/
 .zig-cache/
+.zig-global-cache/
 zig-pkg/
 *.db
 *.db-journal
@@ -14,15 +15,18 @@ zig-pkg/
 *.bak
 *.a
 reference/
+workspace/
 
 result
 .direnv/
 .worktrees
 config.signal.json
+config.json
 
 # IDE configurations
 .idea/
 .vscode/
+.history/
 .cursor/
 .trae/
 .codebuddy/
@@ -30,3 +34,11 @@ config.signal.json
 # Allow agent toolkit (override user-global ~/.config/git/ignore)
 !.claude/
 !.claude/**
+
+# Keep runtime/personal Claude state ignored even when toolkit files are tracked.
+*.db-shm
+*.db-wal
+.agents/
+.codex/
+.claude/logs/
+.claude/*.local.*

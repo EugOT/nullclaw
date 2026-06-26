@@ -45,6 +45,19 @@ fn hasNonEmptyCredential(value: ?[]const u8) bool {
     return std.mem.trim(u8, credential, " \t\r\n").len > 0;
 }
 
+fn providerKeyIsAllowedStartupCredential(provider_name: []const u8) bool {
+    return switch (providers.classifyProvider(provider_name)) {
+        .anthropic_provider,
+        .openai_provider,
+        .azure_openai_provider,
+        .gemini_provider,
+        .vertex_provider,
+        .openai_codex_provider,
+        => false,
+        else => true,
+    };
+}
+
 fn providerHasStartupCredentials(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -57,19 +70,13 @@ fn providerHasStartupCredentials(
     ) catch null;
     defer if (resolved_key) |key| allocator.free(key);
 
-    if (hasNonEmptyCredential(resolved_key)) return true;
+    if (providerKeyIsAllowedStartupCredential(provider_name) and hasNonEmptyCredential(resolved_key)) return true;
 
-    var holder = providers.ProviderHolder.fromConfigWithApiMode(
+    var holder = providers.holderFromConfig(
         allocator,
+        config,
         provider_name,
         null,
-        config.getProviderBaseUrl(provider_name),
-        config.getProviderNativeTools(provider_name),
-        config.getProviderUserAgent(provider_name),
-        config.getProviderApiMode(provider_name),
-        config.getProviderMaxStreamingPromptBytes(provider_name),
-        config.getProviderChatTemplateEnableThinkingParam(provider_name),
-        config.getProviderExtraBodyParams(provider_name),
     );
     defer holder.deinit();
 
@@ -756,6 +763,15 @@ fn handleTelegramInteractiveCallback(
     is_group: bool,
     message_sender_id: []const u8,
 ) bool {
+    // Mirror processTelegramMessage: keep callback-query processing visible
+    // during slow model calls from interactive Telegram buttons.
+    const typing_target = sender;
+    const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
+    defer {
+        tg_ptr.stopTyping(typing_target) catch {};
+        if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
+    }
+
     const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
 
     var response_owned = false;
@@ -771,6 +787,10 @@ fn handleTelegramInteractiveCallback(
                 break :blk reply;
             }
             return false;
+        }
+
+        if (runtime.session_mgr.routeInbound(session_key, content) == .skip) {
+            return true;
         }
 
         const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
@@ -976,8 +996,10 @@ fn processTelegramMessage(
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
 
+    if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
+
     tg_ptr.setTaskReaction(sender, message_id, .running);
-    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
+    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
         logAgentProcessingError(allocator, "Agent error", err);
         tg_ptr.setTaskReaction(sender, message_id, .failed);
         const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
@@ -1310,6 +1332,7 @@ pub const ChannelRuntime = struct {
             .max_actions_per_hour = config.autonomy.max_actions_per_hour,
             .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
             .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+            .block_medium_risk_commands = config.autonomy.block_medium_risk_commands,
             .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
             .tracker = policy_tracker,
         };
@@ -1417,6 +1440,64 @@ pub const ChannelRuntime = struct {
         alloc.destroy(self);
     }
 };
+
+// Polling subagent result delivery helpers.
+const SubagentResultDelivery = struct {
+    channel: []const u8,
+    account_id: []const u8,
+    send_ctx: *anyopaque,
+    send_fn: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+};
+
+/// Drain completed subagent results and deliver each one whose origin
+/// matches this polling channel account.
+/// In polling mode (`nullclaw channel start <channel>`) the subagent
+/// manager has no event bus, so `completeTask()` cannot publish outbound.
+/// Instead the result is parked on `TaskState` and collected here on the
+/// next polling tick.
+fn drainPollingSubagentResults(
+    allocator: std.mem.Allocator,
+    manager: ?*subagent_mod.SubagentManager,
+    delivery: SubagentResultDelivery,
+) void {
+    const mgr = manager orelse return;
+    const notices = mgr.takeCompletionNoticesForOrigin(allocator, delivery.channel, delivery.account_id) catch |err| {
+        log.warn("subagent notice drain failed: {}", .{err});
+        return;
+    };
+    defer subagent_mod.SubagentManager.freeCompletionNotices(allocator, notices);
+
+    for (notices) |notice| {
+        delivery.send_fn(delivery.send_ctx, notice.origin_chat_id, notice.content) catch |err| {
+            log.err("failed to deliver subagent result to {s} chat {s}: {}", .{ delivery.channel, notice.origin_chat_id, err });
+        };
+    }
+}
+
+fn sendTelegramSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const tg_ptr: *telegram.TelegramChannel = @ptrCast(@alignCast(ctx));
+    try tg_ptr.sendMessage(chat_id, content);
+}
+
+fn sendSignalSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const sg_ptr: *signal.SignalChannel = @ptrCast(@alignCast(ctx));
+    try sg_ptr.sendMessage(chat_id, content, &.{});
+}
+
+fn sendWeixinSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const wx_ptr: *weixin.WeixinChannel = @ptrCast(@alignCast(ctx));
+    try wx_ptr.sendMessage(chat_id, content);
+}
+
+fn sendMatrixSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const mx_ptr: *matrix.MatrixChannel = @ptrCast(@alignCast(ctx));
+    try mx_ptr.sendMessage(chat_id, content);
+}
+
+fn sendMaxSubagentResult(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+    const mx_ptr: *max_mod.MaxChannel = @ptrCast(@alignCast(ctx));
+    try mx_ptr.sendMessage(chat_id, content);
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // runTelegramLoop — polling thread function
@@ -1616,6 +1697,13 @@ pub fn runTelegramLoop(
                         break :parallel_attempt;
                     }
 
+                    if (active_worker_threads.get(session_key) != null and
+                        runtime.session_mgr.routeInbound(session_key, msg.content) == .skip)
+                    {
+                        handled_in_worker = true;
+                        break :parallel_attempt;
+                    }
+
                     // Preserve message order per session_key.
                     if (active_worker_threads.fetchRemove(session_key)) |entry| {
                         var idx: usize = 0;
@@ -1767,6 +1855,13 @@ pub fn runTelegramLoop(
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
 
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "telegram",
+            .account_id = tg_ptr.account_id,
+            .send_ctx = @ptrCast(tg_ptr),
+            .send_fn = sendTelegramSubagentResult,
+        });
+
         health.markComponentOk("telegram");
     }
 }
@@ -1881,6 +1976,8 @@ pub fn runSignalLoop(
                 break :blk route.session_key;
             };
 
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+
             const typing_target = msg.reply_target;
             if (typing_target) |target| sg_ptr.startTyping(target) catch {};
             defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
@@ -1930,6 +2027,13 @@ pub fn runSignalLoop(
             evict_counter = 0;
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
+
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "signal",
+            .account_id = sg_ptr.account_id,
+            .send_ctx = @ptrCast(sg_ptr),
+            .send_fn = sendSignalSubagentResult,
+        });
 
         health.markComponentOk("signal");
     }
@@ -1992,6 +2096,8 @@ pub fn runWeixinLoop(
                 break :blk route.session_key;
             };
 
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+
             const conversation_context = buildConversationContext(.{
                 .channel = "weixin",
                 .account_id = wx_ptr.config.account_id,
@@ -2028,6 +2134,13 @@ pub fn runWeixinLoop(
             evict_counter = 0;
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
+
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "weixin",
+            .account_id = wx_ptr.config.account_id,
+            .send_ctx = @ptrCast(wx_ptr),
+            .send_fn = sendWeixinSubagentResult,
+        });
 
         health.markComponentOk("weixin");
     }
@@ -2245,6 +2358,8 @@ pub fn runMatrixLoop(
                 break :blk route.session_key;
             };
 
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+
             const typing_target = msg.reply_target orelse msg.sender;
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
@@ -2252,7 +2367,7 @@ pub fn runMatrixLoop(
             const conversation_context = buildConversationContext(.{
                 .channel = "matrix",
                 .account_id = mx_ptr.account_id,
-                .delivery_chat_id = typing_target,
+                .delivery_chat_id = msg.reply_target orelse msg.sender,
                 .peer_id = if (msg.is_group) room_peer_id else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) room_peer_id else null,
@@ -2285,6 +2400,13 @@ pub fn runMatrixLoop(
             evict_counter = 0;
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
+
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "matrix",
+            .account_id = mx_ptr.account_id,
+            .send_ctx = @ptrCast(mx_ptr),
+            .send_fn = sendMatrixSubagentResult,
+        });
 
         health.markComponentOk("matrix");
     }
@@ -2391,6 +2513,8 @@ pub fn runMaxLoop(
                 break :blk route.session_key;
             };
 
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+
             mx_ptr.startTyping(reply_target) catch {};
             defer mx_ptr.stopTyping(reply_target) catch {};
 
@@ -2409,7 +2533,7 @@ pub fn runMaxLoop(
             };
             const sink = mx_ptr.makeSink(&stream_ctx);
 
-            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
+            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink, null) catch |err| {
                 logAgentProcessingError(allocator, "Max agent error", err);
                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
@@ -2442,6 +2566,13 @@ pub fn runMaxLoop(
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
 
+        drainPollingSubagentResults(allocator, runtime.subagent_manager, .{
+            .channel = "max",
+            .account_id = mx_ptr.account_id,
+            .send_ctx = @ptrCast(mx_ptr),
+            .send_fn = sendMaxSubagentResult,
+        });
+
         health.markComponentOk("max");
     }
 }
@@ -2471,6 +2602,82 @@ test "TelegramLoopState last_activity update" {
     state.last_activity.store(std_compat.time.timestamp(), .release);
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
+}
+
+test "polling subagent drain delivers only matching origin account" {
+    const FakeDelivery = struct {
+        count: usize = 0,
+        saw_expected_chat: bool = false,
+        saw_expected_content: bool = false,
+
+        fn send(ctx: *anyopaque, chat_id: []const u8, content: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.saw_expected_chat = std.mem.eql(u8, chat_id, "signal-chat");
+            self.saw_expected_content = std.mem.indexOf(u8, content, "signal-task") != null;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var mgr = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const signal_state = try allocator.create(subagent_mod.TaskState);
+    signal_state.* = .{
+        .status = .completed,
+        .label = try allocator.dupe(u8, "signal-task"),
+        .origin_channel = try allocator.dupe(u8, "signal"),
+        .origin_chat_id = try allocator.dupe(u8, "signal-chat"),
+        .origin_account_id = try allocator.dupe(u8, "signal-main"),
+        .session_key = try allocator.dupe(u8, "signal:signal-main:signal-chat"),
+        .result = try allocator.dupe(u8, "signal done"),
+        .started_at = std_compat.time.milliTimestamp(),
+        .completed_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(allocator, 1, signal_state);
+
+    const telegram_state = try allocator.create(subagent_mod.TaskState);
+    telegram_state.* = .{
+        .status = .completed,
+        .label = try allocator.dupe(u8, "telegram-task"),
+        .origin_channel = try allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try allocator.dupe(u8, "telegram-chat"),
+        .origin_account_id = try allocator.dupe(u8, "telegram-main"),
+        .session_key = try allocator.dupe(u8, "telegram:telegram-main:telegram-chat"),
+        .result = try allocator.dupe(u8, "telegram done"),
+        .started_at = std_compat.time.milliTimestamp(),
+        .completed_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(allocator, 2, telegram_state);
+
+    var delivery = FakeDelivery{};
+
+    // Regression: polling drains must not consume completed tasks for
+    // another channel/account before that channel loop can deliver them.
+    drainPollingSubagentResults(allocator, &mgr, .{
+        .channel = "signal",
+        .account_id = "signal-main",
+        .send_ctx = @ptrCast(&delivery),
+        .send_fn = FakeDelivery.send,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), delivery.count);
+    try std.testing.expect(delivery.saw_expected_chat);
+    try std.testing.expect(delivery.saw_expected_content);
+
+    const telegram_notices = try mgr.takeCompletionNoticesForOrigin(allocator, "telegram", "telegram-main");
+    defer subagent_mod.SubagentManager.freeCompletionNotices(allocator, telegram_notices);
+    try std.testing.expectEqual(@as(usize, 1), telegram_notices.len);
+    try std.testing.expectEqual(@as(u64, 2), telegram_notices[0].task_id);
+
+    const signal_notices = try mgr.takeCompletionNoticesForOrigin(allocator, "signal", "signal-main");
+    defer subagent_mod.SubagentManager.freeCompletionNotices(allocator, signal_notices);
+    try std.testing.expectEqual(@as(usize, 0), signal_notices.len);
 }
 
 test "shouldSuppressGroupReply suppresses only group replies with marker" {
@@ -2524,6 +2731,17 @@ test "channel runtime wires security policy into session manager and shell tool"
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
         .autonomy = .{
             .allowed_paths = &allowed_paths,
         },
@@ -2819,6 +3037,66 @@ test "telegramConversationContext keeps delivery target for callback-driven topi
     try std.testing.expectEqualStrings("-100123#topic:77", context.peer_id.?);
     try std.testing.expectEqualStrings("-100123#topic:77", context.group_id.?);
     try std.testing.expect(context.is_group.?);
+}
+
+test "telegram callback starts typing turn and cleans up on local slash miss" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer tg.channel().stop();
+    const before_draft_counter = tg.draft_id_counter.load(.monotonic);
+
+    // Regression: callback-query paths should mirror normal Telegram messages
+    // and start a typing/draft turn even when the callback returns locally.
+    const handled = handleTelegramInteractiveCallback(
+        allocator,
+        runtime,
+        &tg,
+        "telegram:default:direct:12345",
+        "/not-a-local-command",
+        "12345",
+        77,
+        false,
+        "user_a",
+    );
+
+    try std.testing.expect(!handled);
+    try std.testing.expectEqual(before_draft_counter + 1, tg.draft_id_counter.load(.monotonic));
+    try std.testing.expect(tg.typing_handles.get("12345") == null);
+    try std.testing.expect(tg.draft_buffers.get("12345") == null);
 }
 
 test "defaultAgentErrorMessage distinguishes timeout from generic network errors" {

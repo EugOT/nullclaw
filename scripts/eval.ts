@@ -19,7 +19,7 @@
  *   1 — structural failure; the specific missing file or parse error is printed
  */
 import { readdirSync, statSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { appendJsonl, repoRoot } from "./lib/runtime.ts";
 
 const TIER = "eval" as const;
@@ -87,14 +87,16 @@ async function checkStructure(root: string): Promise<CheckFailure[]> {
 
 	for (const domain of liveDomains) {
 		const domainDir = resolve(domainsRoot, domain);
-		const fileGlob = new Bun.Glob("*.zig");
+		// Recursive globs so nested fixtures are checked too (CodeRabbit
+		// finding). Pairs must live side by side in the same directory.
+		const fileGlob = new Bun.Glob("**/*.zig");
 		const zigFiles: string[] = [];
 		for (const f of fileGlob.scanSync({ cwd: domainDir, absolute: true })) {
 			zigFiles.push(f);
 		}
 		for (const zigFile of zigFiles) {
 			const base = basename(zigFile, ".zig");
-			const expect = resolve(domainDir, `${base}.expect.json`);
+			const expect = resolve(dirname(zigFile), `${base}.expect.json`);
 			if (!(await Bun.file(expect).exists())) {
 				failures.push({
 					file: zigFile,
@@ -105,13 +107,16 @@ async function checkStructure(root: string): Promise<CheckFailure[]> {
 			const parseError = await validateExpectJson(expect);
 			if (parseError) failures.push(parseError);
 		}
-		const expectGlob = new Bun.Glob("*.expect.json");
+		const expectGlob = new Bun.Glob("**/*.expect.json");
 		for (const expect of expectGlob.scanSync({
 			cwd: domainDir,
 			absolute: true,
 		})) {
+			const parseError = await validateExpectJson(expect);
+			if (parseError) failures.push(parseError);
+
 			const base = basename(expect, ".expect.json");
-			const zig = resolve(domainDir, `${base}.zig`);
+			const zig = resolve(dirname(expect), `${base}.zig`);
 			if (!(await Bun.file(zig).exists())) {
 				failures.push({ file: expect, reason: `missing pair ${base}.zig` });
 			}
@@ -164,7 +169,16 @@ async function checkStructure(root: string): Promise<CheckFailure[]> {
 async function main(): Promise<void> {
 	const startedAt = Date.now();
 	const root = repoRoot();
-	const check = process.argv.includes("--check");
+	const args = process.argv.slice(2);
+	const check = args.includes("--check");
+
+	// Unknown modes/flags must not silently report success (CodeRabbit
+	// finding): only `--check` and the bare default mode are supported.
+	const unknown = args.filter((a) => a !== "--check");
+	if (unknown.length > 0) {
+		console.error(`eval: unsupported argument(s): ${unknown.join(" ")}`);
+		await finish(1, startedAt);
+	}
 
 	if (!check) {
 		console.log("TODO: judge-backed eval execution pending v1");

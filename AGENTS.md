@@ -210,6 +210,45 @@ Apply these naming rules consistently:
 - Add/update tests for failure modes and boundaries.
 - Keep observability useful but non-sensitive (no secrets in logs or errors).
 
+### 7.6 Updating the Required Zig Version
+
+Whenever a documentation or code change indicates that the required Zig
+toolchain version is changing (for example: `README.md`, `AGENTS.md`,
+`CLAUDE.md`, `docs/**/installation.md`, `docs/**/development.md`,
+`docs/**/termux.md`, `flake.nix`, `Dockerfile`, `.github/workflows/**`, or any
+`zig version` / "Zig 0.16.0" string in the repo), the per-distro install
+guides must be updated in the same change so they keep matching the pinned
+version.
+
+Required steps:
+
+1. Identify the new pinned Zig version (e.g. `0.16.1`, `0.17.0`).
+2. Visit `https://ziglang.org/download/` and locate the section for that exact
+   version. Do not guess URLs — fetch them from the official download page so
+   the filename, archive layout, and presence of the build are confirmed.
+3. For every architecture referenced in the install guides (at minimum
+   `x86_64-linux`, plus any others already documented), copy the canonical
+   tarball URL and checksum from `ziglang.org/download/`.
+4. Update every `docs/**/zig-installation.md` file (currently
+   `docs/en/zig-installation.md` and `docs/zh/zig-installation.md`) so that
+   every URL, checksum, filename, and extracted directory name reflects the new
+   version. The version number must appear consistently in:
+   - the linked download URL
+   - the `wget` command
+   - the checksum verification command
+   - the `tar -xf` filename
+   - the `export PATH="$PWD/zig-...:$PATH"` directory name
+5. Keep all `docs/**/zig-installation.md` translations in sync — if the
+   English version changes, the Chinese version (and any future translations)
+   must be updated in the same commit.
+6. Cross-check that the version pin matches everywhere else it appears
+   (`AGENTS.md` §2.4, `CLAUDE.md` build commands, other `docs/**` pages,
+   `flake.nix`, `Dockerfile`, CI workflows). Mismatches are a hard fail.
+
+Do not bump the Zig version pin in one place without sweeping all of the
+above. A partial bump leaves users following copy-paste instructions that
+download a tarball that no longer matches the pinned toolchain.
+
 ## 8) Validation Matrix
 
 Required before any code commit:
@@ -312,7 +351,7 @@ When working in fast iterative mode:
 
 ## Quality Tools (Zig 0.16)
 
-This project adopts the chezmoi-managed `zig-qm-toolkit` (centralized at `~/.local/share/chezmoi/.chezmoitemplates/zig-qm-toolkit/`).
+This project adopts the in-repo `zig-qm-toolkit` integration under `.claude/` (skills, agents, hooks) and `scripts/` (verify pipeline, fitness checks).
 
 - **zls 0.16.0** — install via `mise install zls@0.16.0` and configure `.zls.json` with mise-resolved zig path
 - **ziglint** — invoked via Tier-1 PostToolUse hook; honest absence reporting if not on PATH
@@ -320,4 +359,4 @@ This project adopts the chezmoi-managed `zig-qm-toolkit` (centralized at `~/.loc
 - **4-tier verify pipeline** — `bun scripts/verify-fast.ts` (Tier 1, <2s), `verify-commit.ts` (Tier 2, ~30s), `verify-pr.ts` (Tier 3, ~10min), `verify-release.ts` (Tier 4, ~30min)
 - **6 eval domains** — idioms, allocator-discipline, error-sets, io-injection, build-system, fuzz-target
 
-Umbrella skill: @~/.agents/skills/zig-quality/SKILL.md
+Umbrella skill: @.claude/skills/zig-quality/SKILL.md

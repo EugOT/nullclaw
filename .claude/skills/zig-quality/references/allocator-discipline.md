@@ -63,8 +63,10 @@ pub fn init(gpa: std.mem.Allocator) Cache { ... }
 ### R5 — Never wrap `Allocator` in a mutex
 
 `std.heap.ThreadSafeAllocator` was removed in 0.16 and declared an
-anti-pattern. `ArenaAllocator` is already lock-free and thread-safe.
-If you need per-thread arenas, allocate them per thread.
+anti-pattern. `ArenaAllocator` is lock-free (no internal mutex) but is
+**not thread-safe** — its internal state is mutable and unsynchronized.
+Never share a single `ArenaAllocator` across threads. Allocate one arena
+per thread backed by a thread-safe parent (e.g. `page_allocator`).
 
 ### R6 — Tests enforce leak-free via `std.testing.allocator`
 

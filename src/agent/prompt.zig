@@ -212,6 +212,7 @@ pub const PromptContext = struct {
     bootstrap_provider: ?BootstrapProvider = null,
     identity_config: ?config_types.IdentityConfig = null,
     observer: ?observability.Observer = null,
+    native_tools_enabled: bool = false,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -405,6 +406,13 @@ pub fn buildSystemPrompt(
     try w.writeAll("- Example: `echo \"Time is up!\"`\n");
     try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
 
+    // Web Search guidance
+    try w.writeAll("## External Information and Web Search\n\n");
+    try w.writeAll("- If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n");
+    try w.writeAll("- Do not merely state that you can find the information; execute the tool call in the same turn.\n");
+    try w.writeAll("- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n");
+    try w.writeAll("- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n");
+
     // Skills section
     try appendSkillsSection(allocator, w, ctx.workspace_dir, ctx.observer);
 
@@ -421,7 +429,7 @@ pub fn buildSystemPrompt(
     });
 
     // Tool use protocol and available tools
-    try writeToolInstructionsSection(w, ctx.tools);
+    try writeToolInstructionsSection(w, ctx.tools, ctx);
 
     buf = buf_writer.toArrayList();
     return try buf.toOwnedSlice(allocator);
@@ -780,7 +788,7 @@ fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("- Example: `<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\"}]}</nc_choices>`\n\n");
 }
 
-fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
+fn writeToolInstructionsSection(w: anytype, tools: anytype, ctx: PromptContext) !void {
     try w.writeAll("\n## Tool Use Protocol\n\n");
     try w.writeAll("To use a tool, you MUST wrap a JSON object in <tool_call></tool_call> or [TOOL_CALL][/TOOL_CALL] tags.\n");
     try w.writeAll("The JSON object MUST contain exactly two fields: \"name\" (string) and \"arguments\" (object).\n\n");
@@ -802,11 +810,14 @@ fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
     try w.writeAll("### Available Tools\n\n");
 
     for (tools) |t| {
-        try w.print("**{s}**: {s}\nParameters: `{s}`\n\n", .{
+        try w.print("**{s}**: {s}", .{
             t.name(),
             t.description(),
-            t.parametersJson(),
         });
+        if (!ctx.native_tools_enabled) {
+            try w.print("\nParameters: `{s}`", .{t.parametersJson()});
+        }
+        try w.writeAll("\n\n");
     }
 }
 
@@ -817,7 +828,7 @@ pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]co
     errdefer buf.deinit(allocator);
     var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
     const w = &buf_writer.writer;
-    try writeToolInstructionsSection(w, tools);
+    try writeToolInstructionsSection(w, tools, .{ .workspace_dir = "", .model_name = "", .tools = &.{} });
     buf = buf_writer.toArrayList();
     return try buf.toOwnedSlice(allocator);
 }
@@ -1200,6 +1211,61 @@ test "buildToolInstructions includes protocol and tool metadata" {
     defer allocator.free(instructions);
 
     try std.testing.expect(std.mem.indexOf(u8, instructions, "## Tool Use Protocol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "**mock**: A mock tool") != null);
+}
+
+test "buildToolInstructions omits Parameters when native tools enabled" {
+    const allocator = std.testing.allocator;
+    const MockTool = struct {
+        fn name(_: @This()) []const u8 {
+            return "mock";
+        }
+        fn description(_: @This()) []const u8 {
+            return "A mock tool";
+        }
+        fn parametersJson(_: @This()) []const u8 {
+            return "{\"value\":\"string\"}";
+        }
+    };
+    const tools = [_]MockTool{.{}};
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try writeToolInstructionsSection(w, &tools, .{ .workspace_dir = "", .model_name = "", .tools = &.{}, .native_tools_enabled = true });
+    buf = buf_writer.toArrayList();
+    const instructions = try buf.toOwnedSlice(allocator);
+    defer allocator.free(instructions);
+
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "**mock**: A mock tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "Parameters:") == null);
+}
+
+test "buildToolInstructions includes Parameters when native tools disabled" {
+    const allocator = std.testing.allocator;
+    const MockTool = struct {
+        fn name(_: @This()) []const u8 {
+            return "mock";
+        }
+        fn description(_: @This()) []const u8 {
+            return "A mock tool";
+        }
+        fn parametersJson(_: @This()) []const u8 {
+            return "{\"value\":\"string\"}";
+        }
+    };
+    const tools = [_]MockTool{.{}};
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
+    try writeToolInstructionsSection(w, &tools, .{ .workspace_dir = "", .model_name = "", .tools = &.{}, .native_tools_enabled = false });
+    buf = buf_writer.toArrayList();
+    const instructions = try buf.toOwnedSlice(allocator);
+    defer allocator.free(instructions);
+
     try std.testing.expect(std.mem.indexOf(u8, instructions, "**mock**: A mock tool") != null);
     try std.testing.expect(std.mem.indexOf(u8, instructions, "Parameters: `{\"value\":\"string\"}`") != null);
 }

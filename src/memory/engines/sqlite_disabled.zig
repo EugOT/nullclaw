@@ -57,6 +57,14 @@ pub const c = struct {
         return SQLITE_DONE;
     }
 
+    pub fn sqlite3_reset(_: ?*sqlite3_stmt) c_int {
+        return SQLITE_ERROR;
+    }
+
+    pub fn sqlite3_clear_bindings(_: ?*sqlite3_stmt) c_int {
+        return SQLITE_ERROR;
+    }
+
     pub fn sqlite3_finalize(_: ?*sqlite3_stmt) c_int {
         return SQLITE_OK;
     }
