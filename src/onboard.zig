@@ -101,13 +101,13 @@ pub const ProviderInfo = struct {
 pub const known_providers = [_]ProviderInfo{
     // --- Tier 1: Major multi-provider gateways ---
     .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "OPENROUTER_API_KEY" },
-    .{ .key = "anthropic", .label = "Anthropic (Claude direct)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
-    .{ .key = "openai", .label = "OpenAI (GPT direct)", .default_model = "gpt-5.2", .env_var = "OPENAI_API_KEY" },
-    .{ .key = "azure", .label = "Azure OpenAI (GPT via Azure)", .default_model = "gpt-5.2-chat", .env_var = "AZURE_OPENAI_API_KEY" },
+    .{ .key = "anthropic", .label = "Claude direct API disabled; use claude-cli", .default_model = "claude-opus-4-6", .env_var = "" },
+    .{ .key = "openai", .label = "OpenAI direct API disabled; use codex-cli", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
+    .{ .key = "azure", .label = "Azure OpenAI direct API disabled; use codex-cli/private gateway", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
 
     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
-    .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
-    .{ .key = "vertex", .label = "Google Vertex AI (Gemini)", .default_model = "gemini-2.5-pro", .env_var = "VERTEX_API_KEY" },
+    .{ .key = "gemini", .label = "Gemini direct API disabled; use gemini-cli/Antigravity", .default_model = "gemini-2.5-pro", .env_var = "" },
+    .{ .key = "vertex", .label = "Vertex AI direct API disabled; use gemini-cli/Antigravity", .default_model = "gemini-2.5-pro", .env_var = "" },
     .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-chat", .env_var = "DEEPSEEK_API_KEY" },
     .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "llama-3.3-70b-versatile", .env_var = "GROQ_API_KEY" },
 
@@ -155,10 +155,10 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "lm-studio", .label = "LM Studio (local GUI)", .default_model = "local-model", .env_var = "API_KEY" },
 
     // --- Tier 10: CLI-based providers ---
-    .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
-    .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "OPENAI_API_KEY" },
+    .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "" },
+    .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
     .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT login)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
-    .{ .key = "gemini-cli", .label = "Gemini CLI (Google Gemini, local)", .default_model = "gemini-2.0-flash", .env_var = "GEMINI_API_KEY" },
+    .{ .key = "gemini-cli", .label = "Antigravity CLI (Gemini runtime, local)", .default_model = "gemini-2.0-flash", .env_var = "" },
 };
 
 /// Canonicalize provider name (handle aliases).
@@ -191,6 +191,11 @@ fn providerRequiresApiKeyForSetup(provider: []const u8, base_url: ?[]const u8) b
     if (std.mem.eql(u8, canonical, "ollama") or
         std.mem.eql(u8, canonical, "lm-studio") or
         std.mem.eql(u8, canonical, "lmstudio") or
+        std.mem.eql(u8, canonical, "anthropic") or
+        std.mem.eql(u8, canonical, "openai") or
+        std.mem.eql(u8, canonical, "azure") or
+        std.mem.eql(u8, canonical, "gemini") or
+        std.mem.eql(u8, canonical, "vertex") or
         std.mem.eql(u8, canonical, "claude-cli") or
         std.mem.eql(u8, canonical, "codex-cli") or
         std.mem.eql(u8, canonical, "gemini-cli") or
@@ -247,8 +252,8 @@ fn printProviderNextSteps(
     }
 
     if (std.mem.eql(u8, canonical, "gemini-cli")) {
-        try out.writeAll("    1. Authenticate:  gemini\n");
-        try out.writeAll("       Then choose:   Login with Google\n");
+        try out.writeAll("    1. Authenticate:  agy\n");
+        try out.writeAll("       Runtime:       Antigravity CLI\n");
         try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
         try out.writeAll("       Then type:         Hello!\n");
         try out.writeAll("    3. Gateway:       nullclaw gateway\n");
@@ -675,12 +680,6 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
 fn staticNativeModelCatalogForProvider(canonical: []const u8) ?NativeModelCatalog {
     if (std.mem.eql(u8, canonical, "openrouter")) {
         return .{ .url = "https://openrouter.ai/api/v1/models" };
-    } else if (std.mem.eql(u8, canonical, "openai")) {
-        return .{
-            .url = "https://api.openai.com/v1/models",
-            .needs_auth = true,
-            .parse_options = .{ .prefix_filter = "gpt-" },
-        };
     } else if (std.mem.eql(u8, canonical, "groq")) {
         return .{
             .url = "https://api.groq.com/openai/v1/models",
@@ -2723,7 +2722,6 @@ const ModelsCatalogProvider = struct {
 };
 
 const catalog_providers = [_]ModelsCatalogProvider{
-    .{ .name = "openai", .url = "https://api.openai.com/v1/models", .models_path = "data", .id_field = "id" },
     .{ .name = "openrouter", .url = "https://openrouter.ai/api/v1/models", .models_path = "data", .id_field = "id" },
 };
 
@@ -3518,8 +3516,8 @@ test "canonicalProviderName handles aliases" {
 
 test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("claude-opus-4-6", defaultModelForProvider("anthropic"));
-    try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
-    try std.testing.expectEqualStrings("gpt-5.2-chat", defaultModelForProvider("azure"));
+    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("openai"));
+    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("azure"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
     try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", defaultModelForProvider("nearai"));
     try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlas-cloud"));
@@ -3539,9 +3537,9 @@ test "defaultModelForProvider falls back for unknown" {
 
 test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", providerEnvVar("openrouter"));
-    try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
-    try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
-    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
+    try std.testing.expectEqualStrings("", providerEnvVar("anthropic"));
+    try std.testing.expectEqualStrings("", providerEnvVar("openai"));
+    try std.testing.expectEqualStrings("", providerEnvVar("azure"));
     try std.testing.expectEqualStrings("NEARAI_API_KEY", providerEnvVar("nearai"));
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas-cloud"));
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas"));
@@ -3575,7 +3573,7 @@ test "providerRequiresApiKeyForSetup marks local and OAuth providers as keyless"
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://100.64.0.1:8080/v1", "http://100.64.0.1:8080/v1"));
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://model.local:8080/v1", "http://model.local:8080/v1"));
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://[fd00::1]:8080/v1", "http://[fd00::1]:8080/v1"));
-    try std.testing.expect(providerRequiresApiKeyForSetup("openai", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("openai", null));
 }
 
 test "known_providers has entries" {
@@ -4458,25 +4456,25 @@ test "printProviderNextSteps keeps gemini-cli auth flow and interactive chat" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
-    try printProviderNextSteps(&aw.writer, "gemini-cli", "GEMINI_API_KEY", false, false);
+    try printProviderNextSteps(&aw.writer, "gemini-cli", "", false, false);
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Authenticate:  gemini") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Login with Google") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Authenticate:  agy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Antigravity") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
 }
 
 test "providerEnvVar gemini aliases" {
-    try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("gemini"));
-    try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google"));
-    try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google-gemini"));
+    try std.testing.expectEqualStrings("", providerEnvVar("gemini"));
+    try std.testing.expectEqualStrings("", providerEnvVar("google"));
+    try std.testing.expectEqualStrings("", providerEnvVar("google-gemini"));
 }
 
 test "providerEnvVar vertex aliases" {
-    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex"));
-    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex-ai"));
-    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("google-vertex"));
+    try std.testing.expectEqualStrings("", providerEnvVar("vertex"));
+    try std.testing.expectEqualStrings("", providerEnvVar("vertex-ai"));
+    try std.testing.expectEqualStrings("", providerEnvVar("google-vertex"));
 }
 
 test "providerEnvVar deepseek" {
@@ -4592,9 +4590,8 @@ test "autonomy_options has 4 entries" {
 }
 
 test "catalog_providers has entries" {
-    try std.testing.expect(catalog_providers.len >= 2);
-    try std.testing.expectEqualStrings("openai", catalog_providers[0].name);
-    try std.testing.expectEqualStrings("openrouter", catalog_providers[1].name);
+    try std.testing.expect(catalog_providers.len >= 1);
+    try std.testing.expectEqualStrings("openrouter", catalog_providers[0].name);
 }
 
 test "catalog_providers all have valid fields" {
@@ -5459,9 +5456,7 @@ test "staticNativeModelCatalogForProvider maps native model endpoints" {
     try std.testing.expect(!atlas.needs_auth);
     try std.testing.expect(atlas.parse_options.require_chat_modalities);
 
-    const openai = staticNativeModelCatalogForProvider("openai") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(openai.needs_auth);
-    try std.testing.expectEqualStrings("gpt-", openai.parse_options.prefix_filter.?);
+    try std.testing.expect(staticNativeModelCatalogForProvider("openai") == null);
 }
 
 test "parseModelsDevModelIds filters non-chat models and sorts them" {

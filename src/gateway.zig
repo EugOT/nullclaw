@@ -1104,13 +1104,11 @@ const MediaTranscriptionAccess = struct {
 };
 
 fn supportsAudioTranscriptionProvider(provider: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(provider, "openai") or
-        std.ascii.eqlIgnoreCase(provider, "groq") or
+    return std.ascii.eqlIgnoreCase(provider, "groq") or
         std.ascii.eqlIgnoreCase(provider, "telnyx");
 }
 
 fn defaultAudioTranscriptionModel(provider: []const u8) []const u8 {
-    if (std.ascii.eqlIgnoreCase(provider, "openai")) return "whisper-1";
     if (std.ascii.eqlIgnoreCase(provider, "telnyx")) return "distil-whisper/distil-large-v2";
     return "whisper-large-v3";
 }
@@ -6414,7 +6412,7 @@ test "media transcription rejects control characters in mime type" {
     try std.testing.expect(!isSafeMediaMimeType("audio/wav\r\nX-Test: injected"));
 }
 
-test "media transcription falls back to keyed provider" {
+test "media transcription does not fall back to direct openai keyed provider" {
     const entries = [_]config_types.ProviderEntry{
         .{ .name = "openai", .api_key = "sk-test" },
     };
@@ -6424,12 +6422,7 @@ test "media transcription falls back to keyed provider" {
     cfg.audio_media.model = "whisper-large-v3";
     cfg.providers = &entries;
 
-    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
-    defer access.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("openai", access.provider);
-    try std.testing.expectEqualStrings("sk-test", access.api_key);
-    try std.testing.expectEqualStrings("whisper-1", access.model);
-    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", access.endpoint);
+    try std.testing.expect(try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg) == null);
 }
 
 test "media transcription ignores unsupported configured provider without explicit endpoint" {
@@ -6443,11 +6436,7 @@ test "media transcription ignores unsupported configured provider without explic
     cfg.audio_media.model = "whisper-large-v3";
     cfg.providers = &entries;
 
-    const access = (try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg)) orelse return error.TestExpectedEqual;
-    defer access.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("openai", access.provider);
-    try std.testing.expectEqualStrings("sk-test", access.api_key);
-    try std.testing.expectEqualStrings("https://api.openai.com/v1/audio/transcriptions", access.endpoint);
+    try std.testing.expect(try resolveMediaTranscriptionAccess(std.testing.allocator, &cfg) == null);
 }
 
 test "media transcription allows custom configured provider with explicit endpoint" {

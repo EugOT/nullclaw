@@ -127,7 +127,10 @@ pub const spi = @import("spi.zig");
 pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
 pub const calculator = @import("calculator.zig");
-pub const sqlite_query = @import("sqlite_query.zig");
+pub const sqlite_query = if (@import("build_options").enable_sqlite)
+    @import("sqlite_query.zig")
+else
+    @import("sqlite_query_disabled.zig");
 pub const anonymize_text = @import("anonymize_text.zig");
 
 // ── Core types ──────────────────────────────────────────────────────

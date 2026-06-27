@@ -1240,6 +1240,7 @@ test "ChannelManager marks lark webhook receive_mode as webhook_only" {
 
 test "ChannelManager collects web channel from config" {
     if (!channel_catalog.isBuildEnabled(.web)) return;
+    if (!@import("build_options").enable_channel_web) return;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
