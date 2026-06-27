@@ -101,13 +101,13 @@ pub const ProviderInfo = struct {
 pub const known_providers = [_]ProviderInfo{
     // --- Tier 1: Major multi-provider gateways ---
     .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "OPENROUTER_API_KEY" },
-    .{ .key = "anthropic", .label = "Claude direct API disabled; use claude-cli", .default_model = "claude-opus-4-6", .env_var = "" },
+    .{ .key = "anthropic", .label = "Claude direct API disabled; use claude-cli", .default_model = "claude-opus-4-8", .env_var = "" },
     .{ .key = "openai", .label = "OpenAI direct API disabled; use codex-cli", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
     .{ .key = "azure", .label = "Azure OpenAI direct API disabled; use codex-cli/private gateway", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
 
     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
-    .{ .key = "gemini", .label = "Gemini direct API disabled; use gemini-cli/Antigravity", .default_model = "gemini-2.5-pro", .env_var = "" },
-    .{ .key = "vertex", .label = "Vertex AI direct API disabled; use gemini-cli/Antigravity", .default_model = "gemini-2.5-pro", .env_var = "" },
+    .{ .key = "gemini", .label = "Gemini direct API disabled; use Antigravity", .default_model = "gemini-3.5-flash", .env_var = "" },
+    .{ .key = "vertex", .label = "Vertex AI direct API disabled; use Antigravity", .default_model = "gemini-3.5-flash", .env_var = "" },
     .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-chat", .env_var = "DEEPSEEK_API_KEY" },
     .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "llama-3.3-70b-versatile", .env_var = "GROQ_API_KEY" },
 
@@ -142,7 +142,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "vercel-ai", .label = "Vercel AI Gateway", .default_model = "gpt-5.2", .env_var = "VERCEL_API_KEY" },
 
     // --- Tier 7: Enterprise clouds ---
-    .{ .key = "bedrock", .label = "Amazon Bedrock", .default_model = "anthropic.claude-opus-4-6", .env_var = "AWS_ACCESS_KEY_ID" },
+    .{ .key = "bedrock", .label = "Amazon Bedrock", .default_model = "anthropic.claude-opus-4-8", .env_var = "AWS_ACCESS_KEY_ID" },
     .{ .key = "qianfan", .label = "Qianfan (Baidu)", .default_model = "ernie-bot-5", .env_var = "QIANFAN_ACCESS_KEY" },
     .{ .key = "copilot", .label = "GitHub Copilot", .default_model = "gpt-5.2", .env_var = "GITHUB_TOKEN" },
 
@@ -155,10 +155,10 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "lm-studio", .label = "LM Studio (local GUI)", .default_model = "local-model", .env_var = "API_KEY" },
 
     // --- Tier 10: CLI-based providers ---
-    .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "" },
+    .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-8", .env_var = "" },
     .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
     .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT login)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
-    .{ .key = "gemini-cli", .label = "Antigravity CLI (Gemini runtime, local)", .default_model = "gemini-2.0-flash", .env_var = "" },
+    .{ .key = "gemini-cli", .label = "Antigravity CLI (Gemini runtime, local)", .default_model = "gemini-3.5-flash", .env_var = "" },
 };
 
 /// Canonicalize provider name (handle aliases).
@@ -344,9 +344,7 @@ pub const ModelsCacheEntry = struct {
 };
 
 const gemini_cli_fallback = [_][]const u8{
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash",
 };
 
 /// Hardcoded fallback models for each provider (used when API fetch fails).
@@ -398,14 +396,15 @@ fn providerDefaultFallback(provider: []const u8) ?[]const []const u8 {
 
 const openrouter_fallback = [_][]const u8{
     "anthropic/claude-sonnet-4.6",
-    "anthropic/claude-opus-4-6",
+    "anthropic/claude-opus-4-8",
     "anthropic/claude-haiku-4-5",
     "openai/gpt-5.2",
-    "google/gemini-2.5-pro",
+    "google/gemini-3.5-flash",
     "deepseek/deepseek-v3.2",
     "meta-llama/llama-4-70b-instruct",
 };
 const openai_fallback = [_][]const u8{
+    "gpt-5.5",
     "gpt-5.2",
     "gpt-4.5-preview",
     "gpt-4.1",
@@ -419,19 +418,15 @@ const groq_fallback = [_][]const u8{
     "gemma2-9b-it",
 };
 const anthropic_fallback = [_][]const u8{
-    "claude-opus-4-6",
+    "claude-opus-4-8",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
 };
 const gemini_fallback = [_][]const u8{
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash",
 };
 const vertex_fallback = [_][]const u8{
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash",
 };
 const deepseek_fallback = [_][]const u8{
     "deepseek-chat",
@@ -450,7 +445,7 @@ const ollama_fallback = [_][]const u8{
 };
 
 const claude_cli_fallback = [_][]const u8{
-    "claude-opus-4-6",
+    "claude-opus-4-8",
 };
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
@@ -3515,7 +3510,7 @@ test "canonicalProviderName handles aliases" {
 }
 
 test "defaultModelForProvider returns known models" {
-    try std.testing.expectEqualStrings("claude-opus-4-6", defaultModelForProvider("anthropic"));
+    try std.testing.expectEqualStrings("claude-opus-4-8", defaultModelForProvider("anthropic"));
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("openai"));
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("azure"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
@@ -4360,15 +4355,15 @@ test "resolveMemoryBackendForQuickSetup validates enabled, disabled and unknown 
 }
 
 test "defaultModelForProvider gemini via alias" {
-    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("google"));
-    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("google-gemini"));
-    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("gemini"));
+    try std.testing.expectEqualStrings("gemini-3.5-flash", defaultModelForProvider("google"));
+    try std.testing.expectEqualStrings("gemini-3.5-flash", defaultModelForProvider("google-gemini"));
+    try std.testing.expectEqualStrings("gemini-3.5-flash", defaultModelForProvider("gemini"));
 }
 
 test "defaultModelForProvider vertex aliases" {
-    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("vertex"));
-    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("vertex-ai"));
-    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("google-vertex"));
+    try std.testing.expectEqualStrings("gemini-3.5-flash", defaultModelForProvider("vertex"));
+    try std.testing.expectEqualStrings("gemini-3.5-flash", defaultModelForProvider("vertex-ai"));
+    try std.testing.expectEqualStrings("gemini-3.5-flash", defaultModelForProvider("google-vertex"));
 }
 
 test "defaultModelForProvider groq" {
@@ -4394,7 +4389,7 @@ test "printProviderNextSteps prefers interactive chat when api key is already se
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
-    try printProviderNextSteps(&aw.writer, "openai", "OPENAI_API_KEY", true, true);
+    try printProviderNextSteps(&aw.writer, "openrouter", "OPENROUTER_API_KEY", true, true);
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
@@ -4403,17 +4398,24 @@ test "printProviderNextSteps prefers interactive chat when api key is already se
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Status:            nullclaw status") != null);
 }
 
-test "printProviderNextSteps includes env hint before interactive chat" {
+test "printProviderNextSteps does not emit direct OpenAI API key setup" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
-    try printProviderNextSteps(&aw.writer, "openai", "OPENAI_API_KEY", true, false);
+    try printProviderNextSteps(
+        &aw.writer,
+        "openai",
+        providerEnvVar("openai"),
+        providerRequiresApiKeyForSetup("openai", null),
+        false,
+    );
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "export OPENAI_API_KEY=\"sk-...\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "export ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "sk-...") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Gateway:           nullclaw gateway") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Status:            nullclaw status") != null);
 }
 
 test "printProviderNextSteps warns about OpenRouter free-tier defaults" {
@@ -4444,7 +4446,7 @@ test "printProviderNextSteps keeps codex-cli auth flow and interactive chat" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
-    try printProviderNextSteps(&aw.writer, "codex-cli", "OPENAI_API_KEY", false, false);
+    try printProviderNextSteps(&aw.writer, "codex-cli", "", false, false);
 
     const rendered = aw.writer.buffer[0..aw.writer.end];
     try std.testing.expect(std.mem.indexOf(u8, rendered, "codex login") != null);
@@ -4744,19 +4746,19 @@ test "fallbackModelsForProvider returns models for known providers" {
 
     const anth_models = fallbackModelsForProvider("anthropic");
     try std.testing.expect(anth_models.len >= 3);
-    try std.testing.expectEqualStrings("claude-opus-4-6", anth_models[0]);
+    try std.testing.expectEqualStrings("claude-opus-4-8", anth_models[0]);
 
     const groq_models = fallbackModelsForProvider("groq");
     try std.testing.expect(groq_models.len >= 2);
 
     const gemini_models = fallbackModelsForProvider("gemini");
-    try std.testing.expect(gemini_models.len >= 2);
+    try std.testing.expect(gemini_models.len >= 1);
     const vertex_models = fallbackModelsForProvider("vertex");
-    try std.testing.expect(vertex_models.len >= 2);
+    try std.testing.expect(vertex_models.len >= 1);
 
     const claude_cli_models = fallbackModelsForProvider("claude-cli");
     try std.testing.expect(claude_cli_models.len >= 1);
-    try std.testing.expectEqualStrings("claude-opus-4-6", claude_cli_models[0]);
+    try std.testing.expectEqualStrings("claude-opus-4-8", claude_cli_models[0]);
 
     const codex_cli_models = fallbackModelsForProvider("codex-cli");
     try std.testing.expect(codex_cli_models.len >= 1);
@@ -4769,18 +4771,18 @@ test "fallbackModelsForProvider returns models for known providers" {
 
 test "fallbackModelsForProvider handles aliases" {
     const models = fallbackModelsForProvider("google");
-    try std.testing.expect(models.len >= 2);
-    try std.testing.expectEqualStrings("gemini-2.5-pro", models[0]);
+    try std.testing.expect(models.len >= 1);
+    try std.testing.expectEqualStrings("gemini-3.5-flash", models[0]);
 
     const vertex_models = fallbackModelsForProvider("vertex-ai");
-    try std.testing.expect(vertex_models.len >= 2);
-    try std.testing.expectEqualStrings("gemini-2.5-pro", vertex_models[0]);
+    try std.testing.expect(vertex_models.len >= 1);
+    try std.testing.expectEqualStrings("gemini-3.5-flash", vertex_models[0]);
 }
 
 test "fallbackModelsForProvider unknown returns anthropic fallback" {
     const models = fallbackModelsForProvider("some-unknown-provider");
     try std.testing.expect(models.len >= 3);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+    try std.testing.expectEqualStrings("claude-opus-4-8", models[0]);
 }
 
 test "fallbackModelsForProvider uses provider defaults for uncataloged providers" {
@@ -5210,7 +5212,7 @@ test "loadModelsWithCache falls back on fetch failure" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len >= 3);
-    try std.testing.expectEqualStrings("gpt-5.2", models[0]);
+    try std.testing.expectEqualStrings("gpt-5.5", models[0]);
 }
 
 test "loadModelsWithCache returns models for anthropic" {
@@ -5227,7 +5229,7 @@ test "loadModelsWithCache returns models for anthropic" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len == 3);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+    try std.testing.expectEqualStrings("claude-opus-4-8", models[0]);
 }
 
 test "fetchModelsFromApi returns hardcoded for anthropic" {
@@ -5237,7 +5239,7 @@ test "fetchModelsFromApi returns hardcoded for anthropic" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len == 3);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+    try std.testing.expectEqualStrings("claude-opus-4-8", models[0]);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", models[1]);
     try std.testing.expectEqualStrings("claude-haiku-4-5", models[2]);
 }
@@ -5381,7 +5383,7 @@ test "fetchModels returns models for anthropic (no network)" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len >= 3);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+    try std.testing.expectEqualStrings("claude-opus-4-8", models[0]);
 }
 
 test "fetchModels returns models for gemini (no network)" {
@@ -5390,8 +5392,8 @@ test "fetchModels returns models for gemini (no network)" {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
     }
-    try std.testing.expect(models.len >= 2);
-    try std.testing.expectEqualStrings("gemini-2.5-pro", models[0]);
+    try std.testing.expect(models.len >= 1);
+    try std.testing.expectEqualStrings("gemini-3.5-flash", models[0]);
 }
 
 test "fetchModels returns models for deepseek (no network)" {
@@ -5412,7 +5414,7 @@ test "fetchModels returns fallback for openai without key" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len >= 3);
-    try std.testing.expectEqualStrings("gpt-5.2", models[0]);
+    try std.testing.expectEqualStrings("gpt-5.5", models[0]);
 }
 
 test "fetchModels returns fallback for unknown provider" {
@@ -5422,7 +5424,7 @@ test "fetchModels returns fallback for unknown provider" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len >= 3);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+    try std.testing.expectEqualStrings("claude-opus-4-8", models[0]);
 }
 
 test "fetchModels handles google alias" {
@@ -5431,8 +5433,8 @@ test "fetchModels handles google alias" {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
     }
-    try std.testing.expect(models.len >= 2);
-    try std.testing.expectEqualStrings("gemini-2.5-pro", models[0]);
+    try std.testing.expect(models.len >= 1);
+    try std.testing.expectEqualStrings("gemini-3.5-flash", models[0]);
 }
 
 test "modelsDevProviderKey maps known providers" {
@@ -5471,7 +5473,7 @@ test "parseModelsDevModelIds filters non-chat models and sorts them" {
         \\        "family": "text-embedding",
         \\        "modalities": {"input": ["text"], "output": ["text"]}
         \\      },
-        \\      "claude-opus-4-6": {
+        \\      "claude-opus-4-8": {
         \\        "modalities": {"input": ["text"], "output": ["text"]}
         \\      },
         \\      "claude-audio-1": {
@@ -5490,7 +5492,7 @@ test "parseModelsDevModelIds filters non-chat models and sorts them" {
 
     try std.testing.expectEqual(@as(usize, 2), models.len);
     try std.testing.expectEqualStrings("claude-haiku-4-5", models[0]);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[1]);
+    try std.testing.expectEqualStrings("claude-opus-4-8", models[1]);
 }
 
 test "parseModelIds sorts alphabetically when no free suffix is present" {

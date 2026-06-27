@@ -18,7 +18,8 @@ pub const ClaudeCliProvider = struct {
     mutex: std_compat.sync.Mutex = .{},
     sessions: std.StringHashMapUnmanaged(SessionState) = .empty,
 
-    const DEFAULT_MODEL = "claude-opus-4-6";
+    const DEFAULT_MODEL = "claude-opus-4-8";
+    const DEFAULT_EFFORT = "xhigh";
     const CLI_NAME = "claude";
     const IDLE_TIMEOUT_NS: i128 = 30 * 60 * std.time.ns_per_s;
     const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -412,7 +413,7 @@ fn renderPromptMessages(allocator: std.mem.Allocator, messages: []const ChatMess
 }
 
 fn runClaudeCommand(allocator: std.mem.Allocator, opts: ClaudeCliProvider.ClaudeCommandOptions) !ClaudeCliProvider.ClaudeCommandResult {
-    var argv: [14][]const u8 = undefined;
+    var argv: [16][]const u8 = undefined;
     var argc: usize = 0;
 
     argv[argc] = ClaudeCliProvider.CLI_NAME;
@@ -428,6 +429,10 @@ fn runClaudeCommand(allocator: std.mem.Allocator, opts: ClaudeCliProvider.Claude
     argv[argc] = "--model";
     argc += 1;
     argv[argc] = opts.model;
+    argc += 1;
+    argv[argc] = "--effort";
+    argc += 1;
+    argv[argc] = ClaudeCliProvider.DEFAULT_EFFORT;
     argc += 1;
     if (opts.system_prompt) |system_prompt| {
         argv[argc] = "--system-prompt";
@@ -773,6 +778,7 @@ test "ClaudeCliProvider.init returns CliNotFound for missing binary" {
     try std.testing.expectError(error.CliNotFound, result);
 }
 
-test "ClaudeCliProvider default model is claude-opus-4-6" {
-    try std.testing.expectEqualStrings("claude-opus-4-6", ClaudeCliProvider.DEFAULT_MODEL);
+test "ClaudeCliProvider default model is claude-opus-4-8 with xhigh effort" {
+    try std.testing.expectEqualStrings("claude-opus-4-8", ClaudeCliProvider.DEFAULT_MODEL);
+    try std.testing.expectEqualStrings("xhigh", ClaudeCliProvider.DEFAULT_EFFORT);
 }

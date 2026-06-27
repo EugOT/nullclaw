@@ -27,7 +27,8 @@ pub const GeminiCliProvider = struct {
     read_buffer: std.ArrayListUnmanaged(u8) = .empty,
     read_offset: usize = 0,
 
-    const DEFAULT_MODEL = "gemini-2.0-flash";
+    const DEFAULT_MODEL = "gemini-3.5-flash";
+    const DEFAULT_REASONING = "high";
     const CLI_NAME = "agy";
     const ACP_PROTOCOL_VERSION: u32 = 1;
 
@@ -75,8 +76,7 @@ pub const GeminiCliProvider = struct {
             try allocator.dupe(u8, message);
         defer allocator.free(prompt);
 
-        _ = effective_model;
-        return runAntigravityChat(allocator, prompt);
+        return runAntigravityChat(allocator, prompt, effective_model);
     }
 
     fn chatImpl(
@@ -90,7 +90,7 @@ pub const GeminiCliProvider = struct {
         const effective_model = if (model.len > 0) model else self.model;
 
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
-        const content = try runAntigravityChat(allocator, prompt);
+        const content = try runAntigravityChat(allocator, prompt, effective_model);
         return ChatResponse{ .content = content, .model = try allocator.dupe(u8, effective_model) };
     }
 
@@ -106,11 +106,15 @@ pub const GeminiCliProvider = struct {
         return "antigravity-cli";
     }
 
-    fn runAntigravityChat(allocator: std.mem.Allocator, prompt: []const u8) ![]const u8 {
+    fn runAntigravityChat(allocator: std.mem.Allocator, prompt: []const u8, model: []const u8) ![]const u8 {
         const argv = [_][]const u8{
             CLI_NAME,
             "-p",
             prompt,
+            "--model",
+            model,
+            "--reasoning",
+            DEFAULT_REASONING,
         };
 
         var child = std_compat.process.Child.init(&argv, allocator);

@@ -280,6 +280,6 @@ test "extractLastUserMessage empty messages" {
     try std.testing.expect(extractLastUserMessage(&msgs) == null);
 }
 
-test "CodexCliProvider default model is gpt-5.4" {
+test "CodexCliProvider default model follows codex support default" {
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, CodexCliProvider.DEFAULT_MODEL);
 }
