@@ -18,6 +18,8 @@ pub const CodexCliProvider = struct {
     model: []const u8,
 
     pub const DEFAULT_MODEL = codex_support.DEFAULT_CODEX_MODEL;
+    pub const DEFAULT_REASONING = "medium";
+    const DEFAULT_REASONING_CONFIG = "model_reasoning_effort=\"" ++ DEFAULT_REASONING ++ "\"";
     const TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
 
     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !CodexCliProvider {
@@ -110,6 +112,8 @@ pub const CodexCliProvider = struct {
             "never",
             "-m",
             model,
+            "-c",
+            DEFAULT_REASONING_CONFIG,
             "-o",
             output_path,
             prompt,
@@ -282,4 +286,8 @@ test "extractLastUserMessage empty messages" {
 
 test "CodexCliProvider default model follows codex support default" {
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, CodexCliProvider.DEFAULT_MODEL);
+}
+
+test "CodexCliProvider default reasoning effort is medium" {
+    try std.testing.expectEqualStrings("medium", CodexCliProvider.DEFAULT_REASONING);
 }
