@@ -767,7 +767,7 @@ test "validateAntigravityPrintPrompt rejects oversized argv prompt" {
 test "expectSuccessfulAntigravityExit maps failures" {
     try expectSuccessfulAntigravityExit(.{ .exited = 0 });
     try std.testing.expectError(error.CliProcessFailed, expectSuccessfulAntigravityExit(.{ .exited = 1 }));
-    try std.testing.expectError(error.CliProcessFailed, expectSuccessfulAntigravityExit(.{ .signal = std.posix.SIG.KILL }));
+    try std.testing.expectError(error.CliProcessFailed, expectSuccessfulAntigravityExit(.{ .signal = std.posix.SIG.TERM }));
 }
 
 test "GeminiCliProvider fetchModels reports unsupported explicitly" {
