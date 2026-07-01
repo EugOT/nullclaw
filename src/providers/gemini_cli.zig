@@ -120,7 +120,7 @@ pub const GeminiCliProvider = struct {
         var child = std_compat.process.Child.init(&argv, allocator);
         child.stdin_behavior = .Close;
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
 
         child.spawn() catch return error.CliNotFound;
         const max_output: usize = 4 * 1024 * 1024;
@@ -129,8 +129,6 @@ pub const GeminiCliProvider = struct {
             return err;
         };
         errdefer allocator.free(stdout_result);
-        const stderr_result = child.stderr.?.readToEndAlloc(allocator, 64 * 1024) catch null;
-        defer if (stderr_result) |stderr| allocator.free(stderr);
 
         const term = try child.wait();
         switch (term) {
