@@ -287,9 +287,20 @@ fn baseUrlForbiddenByRuntimePolicy(url: []const u8) bool {
         "aiplatform.googleapis.com",
     };
     for (forbidden_hosts) |forbidden| {
-        if (std.ascii.eqlIgnoreCase(host, forbidden)) return true;
+        if (hostMatchesForbiddenRuntimeHost(host, forbidden)) return true;
     }
     return false;
+}
+
+fn hostMatchesForbiddenRuntimeHost(host: []const u8, forbidden: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(host, forbidden)) return true;
+    if (host.len <= forbidden.len) return false;
+    const boundary = host[host.len - forbidden.len - 1];
+    if (std.ascii.eqlIgnoreCase(forbidden, "aiplatform.googleapis.com") and boundary == '-') {
+        return std.ascii.eqlIgnoreCase(host[host.len - forbidden.len ..], forbidden);
+    }
+    if (boundary != '.') return false;
+    return std.ascii.eqlIgnoreCase(host[host.len - forbidden.len ..], forbidden);
 }
 
 fn runtimePolicyCompatibleBaseUrl(base_url: ?[]const u8) ?[]const u8 {
@@ -1363,9 +1374,17 @@ test "fromConfig blocks forbidden custom compatible base urls" {
     defer h3.deinit();
     try std.testing.expect(h3 == .disabled);
 
+    var h3b = ProviderHolder.fromConfig(alloc, "custom:https://us-central1-aiplatform.googleapis.com/v1", "key", null, true, null, null, false, null);
+    defer h3b.deinit();
+    try std.testing.expect(h3b == .disabled);
+
     var h4 = ProviderHolder.fromConfig(alloc, "custom:https://api.openai.com.evil.test/v1", "key", null, true, null, null, false, null);
     defer h4.deinit();
     try std.testing.expect(h4 == .compatible);
+
+    var h4b = ProviderHolder.fromConfig(alloc, "custom:https://evil-aiplatform.googleapis.com.attacker.test/v1", "key", null, true, null, null, false, null);
+    defer h4b.deinit();
+    try std.testing.expect(h4b == .compatible);
 
     var h5 = ProviderHolder.fromConfig(alloc, "groq", "key", "https://api.openai.com/v1", true, null, null, false, null);
     defer h5.deinit();

@@ -31,6 +31,7 @@ pub const GeminiCliProvider = struct {
     const DEFAULT_REASONING = "high";
     const CLI_NAME = "agy";
     const ACP_PROTOCOL_VERSION: u32 = 1;
+    const MAX_PRINT_PROMPT_BYTES: usize = 128 * 1024;
 
     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !GeminiCliProvider {
         // Just verify CLI is in PATH, don't start it yet.
@@ -91,7 +92,9 @@ pub const GeminiCliProvider = struct {
 
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
         const content = try runAntigravityChat(allocator, prompt, effective_model);
-        return ChatResponse{ .content = content, .model = try allocator.dupe(u8, effective_model) };
+        errdefer allocator.free(content);
+        const response_model = try allocator.dupe(u8, effective_model);
+        return ChatResponse{ .content = content, .model = response_model };
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -107,15 +110,8 @@ pub const GeminiCliProvider = struct {
     }
 
     fn runAntigravityChat(allocator: std.mem.Allocator, prompt: []const u8, model: []const u8) ![]const u8 {
-        const argv = [_][]const u8{
-            CLI_NAME,
-            "-p",
-            prompt,
-            "--model",
-            model,
-            "--reasoning",
-            DEFAULT_REASONING,
-        };
+        try validateAntigravityPrintPrompt(prompt);
+        const argv = buildAntigravityPrintArgv(prompt, model);
 
         var child = std_compat.process.Child.init(&argv, allocator);
         child.stdin_behavior = .Close;
@@ -125,19 +121,15 @@ pub const GeminiCliProvider = struct {
         child.spawn() catch return error.CliNotFound;
         const max_output: usize = 4 * 1024 * 1024;
         const stdout_result = child.stdout.?.readToEndAlloc(allocator, max_output) catch |err| {
+            _ = child.kill() catch {};
             _ = child.wait() catch {};
             return err;
         };
         errdefer allocator.free(stdout_result);
 
         const term = try child.wait();
-        switch (term) {
-            .exited => |code| {
-                if (code == 0) return stdout_result;
-                return error.CliProcessFailed;
-            },
-            else => return error.CliProcessFailed,
-        }
+        try expectSuccessfulAntigravityExit(term);
+        return stdout_result;
     }
 
     fn deinitImpl(ptr: *anyopaque) void {
@@ -480,9 +472,9 @@ pub const GeminiCliProvider = struct {
     }
 
     /// Antigravity does not expose a model list command compatible with Gemini CLI.
-    pub fn fetchModels(allocator: std.mem.Allocator) [][]const u8 {
+    pub fn fetchModels(allocator: std.mem.Allocator) ![][]const u8 {
         _ = allocator;
-        return &.{};
+        return error.NotSupported;
     }
 
     fn fetchModelsInternal(allocator: std.mem.Allocator) ![][]const u8 {
@@ -521,6 +513,36 @@ pub const GeminiCliProvider = struct {
         return error.CliProcessFailed;
     }
 };
+
+fn validateAntigravityPrintPrompt(prompt: []const u8) !void {
+    if (prompt.len > GeminiCliProvider.MAX_PRINT_PROMPT_BYTES) return error.PromptTooLarge;
+}
+
+fn buildAntigravityPrintArgv(prompt: []const u8, model: []const u8) [7][]const u8 {
+    return .{
+        GeminiCliProvider.CLI_NAME,
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--reasoning",
+        GeminiCliProvider.DEFAULT_REASONING,
+    };
+}
+
+fn expectSuccessfulAntigravityExit(term: std_compat.process.Child.Term) !void {
+    return switch (term) {
+        .exited => |code| if (code == 0) {} else error.CliProcessFailed,
+        else => error.CliProcessFailed,
+    };
+}
+
+fn argvIndexOf(argv: []const []const u8, needle: []const u8) ?usize {
+    for (argv, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, needle)) return index;
+    }
+    return null;
+}
 
 fn buildInitializeRequest(allocator: std.mem.Allocator, id: u32) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -718,6 +740,38 @@ test "extractLastUserMessage returns null for no user" {
 test "extractLastUserMessage empty messages" {
     const msgs = [_]ChatMessage{};
     try std.testing.expect(extractLastUserMessage(&msgs) == null);
+}
+
+test "buildAntigravityPrintArgv includes model and reasoning" {
+    const argv = buildAntigravityPrintArgv("hello", "gemini-3.5-flash");
+    try std.testing.expectEqualStrings("agy", argv[0]);
+    try std.testing.expectEqualStrings("-p", argv[1]);
+    try std.testing.expectEqualStrings("hello", argv[2]);
+    try std.testing.expectEqualStrings("--model", argv[3]);
+    try std.testing.expectEqualStrings("gemini-3.5-flash", argv[4]);
+    try std.testing.expectEqualStrings("--reasoning", argv[5]);
+    try std.testing.expectEqualStrings(GeminiCliProvider.DEFAULT_REASONING, argv[6]);
+}
+
+test "validateAntigravityPrintPrompt rejects oversized argv prompt" {
+    try validateAntigravityPrintPrompt("");
+    try validateAntigravityPrintPrompt("hello");
+
+    const oversized = try std.testing.allocator.alloc(u8, GeminiCliProvider.MAX_PRINT_PROMPT_BYTES + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+
+    try std.testing.expectError(error.PromptTooLarge, validateAntigravityPrintPrompt(oversized));
+}
+
+test "expectSuccessfulAntigravityExit maps failures" {
+    try expectSuccessfulAntigravityExit(.{ .exited = 0 });
+    try std.testing.expectError(error.CliProcessFailed, expectSuccessfulAntigravityExit(.{ .exited = 1 }));
+    try std.testing.expectError(error.CliProcessFailed, expectSuccessfulAntigravityExit(.{ .signal = std.posix.SIG.KILL }));
+}
+
+test "GeminiCliProvider fetchModels reports unsupported explicitly" {
+    try std.testing.expectError(error.NotSupported, GeminiCliProvider.fetchModels(std.testing.allocator));
 }
 
 test "GeminiCliProvider.lookupErrorMessage handles message and msg fields" {

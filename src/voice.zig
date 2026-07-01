@@ -760,6 +760,10 @@ test "voice transcriptionEndpointFromBaseUrl derives OpenAI-compatible paths" {
 test "voice transcription endpoint URL validation" {
     try std.testing.expect(isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions"));
     try std.testing.expect(isSafeTranscriptionEndpointUrl("http://localhost:9090/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.openai.com/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.anthropic.com/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://generativelanguage.googleapis.com/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://aiplatform.googleapis.com/v1/audio/transcriptions"));
     try std.testing.expect(!isSafeTranscriptionEndpointUrl("http://api.example.com/v1/audio/transcriptions"));
     try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions?access_token=test"));
     try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions#frag"));

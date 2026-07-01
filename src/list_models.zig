@@ -6,16 +6,10 @@ const std = @import("std");
 const std_compat = @import("compat");
 const onboard = @import("onboard.zig");
 const config_types = @import("config_types.zig");
-const provider_names = @import("provider_names.zig");
+const providers = @import("providers/root.zig");
 
 fn providerBlockedByRuntimePolicy(provider: []const u8) bool {
-    const canonical = provider_names.canonicalProviderName(provider);
-    return std.mem.eql(u8, canonical, "anthropic") or
-        std.mem.eql(u8, canonical, "openai") or
-        std.mem.eql(u8, canonical, "azure") or
-        std.mem.eql(u8, canonical, "gemini") or
-        std.mem.eql(u8, canonical, "vertex") or
-        std.mem.eql(u8, canonical, "openai-codex");
+    return !providers.providerKindAllowedByRuntimePolicy(providers.classifyProvider(provider));
 }
 
 fn resolveProviderKey(provider: []const u8, base_url: ?[]const u8) ?[]const u8 {

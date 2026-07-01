@@ -555,8 +555,13 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     // For the gemini CLI, prefer local discovery when available, then fall back
     // to the shared models.dev/static pipeline used by other providers.
     if (std.mem.eql(u8, canonical, "gemini-cli")) {
-        const dynamic = gemini_cli_mod.GeminiCliProvider.fetchModels(allocator);
-        if (dynamic.len > 0) return dynamic;
+        const dynamic = gemini_cli_mod.GeminiCliProvider.fetchModels(allocator) catch |err| switch (err) {
+            error.NotSupported => null,
+        };
+        if (dynamic) |models| {
+            if (models.len > 0) return models;
+            allocator.free(models);
+        }
     }
 
     if (fetchModelsFromNativeApi(allocator, canonical, api_key, base_url)) |maybe_models| {

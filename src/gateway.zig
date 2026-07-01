@@ -1104,8 +1104,7 @@ const MediaTranscriptionAccess = struct {
 };
 
 fn supportsAudioTranscriptionProvider(provider: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(provider, "groq") or
-        std.ascii.eqlIgnoreCase(provider, "telnyx");
+    return voice.supportsManagedTranscriptionProvider(provider);
 }
 
 fn defaultAudioTranscriptionModel(provider: []const u8) []const u8 {
@@ -5237,6 +5236,8 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 test "handleWhatsAppWebhookRoute rejects malformed JSON before sender extraction" {
+    if (!build_options.enable_channel_whatsapp) return error.SkipZigTest;
+
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();

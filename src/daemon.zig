@@ -9,6 +9,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
@@ -3101,6 +3102,8 @@ test "markInboundMessageRead dispatches through channel vtable" {
 }
 
 test "hasSupervisedChannels true for nostr" {
+    if (!build_options.enable_channel_nostr) return error.SkipZigTest;
+
     const config_types = @import("config_types.zig");
     var config = Config{
         .workspace_dir = "/tmp",

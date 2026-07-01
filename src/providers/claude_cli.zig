@@ -413,43 +413,9 @@ fn renderPromptMessages(allocator: std.mem.Allocator, messages: []const ChatMess
 }
 
 fn runClaudeCommand(allocator: std.mem.Allocator, opts: ClaudeCliProvider.ClaudeCommandOptions) !ClaudeCliProvider.ClaudeCommandResult {
-    var argv: [16][]const u8 = undefined;
-    var argc: usize = 0;
+    const command_argv = buildClaudeCommandArgv(opts);
 
-    argv[argc] = ClaudeCliProvider.CLI_NAME;
-    argc += 1;
-    argv[argc] = "-p";
-    argc += 1;
-    argv[argc] = opts.prompt;
-    argc += 1;
-    argv[argc] = "--output-format";
-    argc += 1;
-    argv[argc] = "stream-json";
-    argc += 1;
-    argv[argc] = "--model";
-    argc += 1;
-    argv[argc] = opts.model;
-    argc += 1;
-    argv[argc] = "--effort";
-    argc += 1;
-    argv[argc] = ClaudeCliProvider.DEFAULT_EFFORT;
-    argc += 1;
-    if (opts.system_prompt) |system_prompt| {
-        argv[argc] = "--system-prompt";
-        argc += 1;
-        argv[argc] = system_prompt;
-        argc += 1;
-    }
-    if (opts.resume_session_id) |session_id| {
-        argv[argc] = "--resume";
-        argc += 1;
-        argv[argc] = session_id;
-        argc += 1;
-    }
-    argv[argc] = "--verbose";
-    argc += 1;
-
-    var child = std_compat.process.Child.init(argv[0..argc], allocator);
+    var child = std_compat.process.Child.init(command_argv.argv[0..command_argv.len], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -470,6 +436,59 @@ fn runClaudeCommand(allocator: std.mem.Allocator, opts: ClaudeCliProvider.Claude
     }
 
     return parseStreamJson(allocator, stdout_result);
+}
+
+const ClaudeCommandArgv = struct {
+    argv: [16][]const u8,
+    len: usize,
+};
+
+fn buildClaudeCommandArgv(opts: ClaudeCliProvider.ClaudeCommandOptions) ClaudeCommandArgv {
+    var result: ClaudeCommandArgv = .{
+        .argv = undefined,
+        .len = 0,
+    };
+
+    result.argv[result.len] = ClaudeCliProvider.CLI_NAME;
+    result.len += 1;
+    result.argv[result.len] = "-p";
+    result.len += 1;
+    result.argv[result.len] = opts.prompt;
+    result.len += 1;
+    result.argv[result.len] = "--output-format";
+    result.len += 1;
+    result.argv[result.len] = "stream-json";
+    result.len += 1;
+    result.argv[result.len] = "--model";
+    result.len += 1;
+    result.argv[result.len] = opts.model;
+    result.len += 1;
+    result.argv[result.len] = "--effort";
+    result.len += 1;
+    result.argv[result.len] = ClaudeCliProvider.DEFAULT_EFFORT;
+    result.len += 1;
+    if (opts.system_prompt) |system_prompt| {
+        result.argv[result.len] = "--system-prompt";
+        result.len += 1;
+        result.argv[result.len] = system_prompt;
+        result.len += 1;
+    }
+    if (opts.resume_session_id) |session_id| {
+        result.argv[result.len] = "--resume";
+        result.len += 1;
+        result.argv[result.len] = session_id;
+        result.len += 1;
+    }
+    result.argv[result.len] = "--verbose";
+    result.len += 1;
+    return result;
+}
+
+fn argvIndexOf(argv: []const []const u8, needle: []const u8) ?usize {
+    for (argv, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, needle)) return index;
+    }
+    return null;
 }
 
 fn parseStreamJson(allocator: std.mem.Allocator, output: []const u8) !ClaudeCliProvider.ClaudeCommandResult {
@@ -781,4 +800,22 @@ test "ClaudeCliProvider.init returns CliNotFound for missing binary" {
 test "ClaudeCliProvider default model is claude-opus-4-8 with xhigh effort" {
     try std.testing.expectEqualStrings("claude-opus-4-8", ClaudeCliProvider.DEFAULT_MODEL);
     try std.testing.expectEqualStrings("xhigh", ClaudeCliProvider.DEFAULT_EFFORT);
+}
+
+test "buildClaudeCommandArgv includes xhigh effort" {
+    const argv = buildClaudeCommandArgv(.{
+        .prompt = "hello",
+        .model = "claude-opus-4-8",
+        .system_prompt = "system",
+        .resume_session_id = "session-1",
+    });
+    const args = argv.argv[0..argv.len];
+
+    try std.testing.expectEqualStrings("claude", args[0]);
+    try std.testing.expectEqualStrings("-p", args[1]);
+    try std.testing.expectEqualStrings("hello", args[2]);
+    try std.testing.expect(argvIndexOf(args, "--effort") != null);
+    const effort_index = argvIndexOf(args, "--effort").?;
+    try std.testing.expectEqualStrings(ClaudeCliProvider.DEFAULT_EFFORT, args[effort_index + 1]);
+    try std.testing.expect(argvIndexOf(args, "--verbose") != null);
 }

@@ -45,19 +45,6 @@ fn hasNonEmptyCredential(value: ?[]const u8) bool {
     return std.mem.trim(u8, credential, " \t\r\n").len > 0;
 }
 
-fn providerKeyIsAllowedStartupCredential(provider_name: []const u8) bool {
-    return switch (providers.classifyProvider(provider_name)) {
-        .anthropic_provider,
-        .openai_provider,
-        .azure_openai_provider,
-        .gemini_provider,
-        .vertex_provider,
-        .openai_codex_provider,
-        => false,
-        else => true,
-    };
-}
-
 fn providerHasStartupCredentials(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -72,7 +59,7 @@ fn providerHasStartupCredentials(
     ) catch null;
     defer if (resolved_key) |key| allocator.free(key);
 
-    if (providerKeyIsAllowedStartupCredential(provider_name) and hasNonEmptyCredential(resolved_key)) return true;
+    if (hasNonEmptyCredential(resolved_key)) return true;
 
     var holder = providers.holderFromConfig(
         allocator,
@@ -85,9 +72,6 @@ fn providerHasStartupCredentials(
     return switch (holder) {
         .ollama => true,
         .claude_cli, .codex_cli, .gemini_cli => true,
-        .openai_codex => |provider| provider.access_token != null,
-        .gemini => |provider| provider.auth != null,
-        .vertex => |provider| provider.auth != null and provider.base != null,
         .compatible => !provider_probe.providerRequiresApiKey(provider_name, config.getProviderBaseUrl(provider_name)),
         else => false,
     };
