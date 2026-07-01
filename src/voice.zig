@@ -84,8 +84,13 @@ pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]
     if (explicit_endpoint) |ep| return ep;
     if (std.ascii.eqlIgnoreCase(provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
     if (std.ascii.eqlIgnoreCase(provider, "telnyx")) return "https://api.telnyx.com/v2/ai/audio/transcriptions";
-    // For unknown providers, try OpenAI-compatible endpoint
-    return "https://api.groq.com/openai/v1/audio/transcriptions";
+    return "";
+}
+
+/// True when a named provider can be used without an explicit audio endpoint.
+pub fn supportsManagedTranscriptionProvider(provider: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(provider, "groq") or
+        std.ascii.eqlIgnoreCase(provider, "telnyx");
 }
 
 fn trimTrailingSlash(s: []const u8) []const u8 {
@@ -565,7 +570,7 @@ test "voice TranscribeOptions custom" {
 
 test "voice resolveTranscriptionEndpoint is provider case insensitive" {
     try std.testing.expectEqualStrings(
-        "https://api.groq.com/openai/v1/audio/transcriptions",
+        "",
         resolveTranscriptionEndpoint("OpenAI", null),
     );
     try std.testing.expectEqualStrings(
@@ -814,7 +819,7 @@ test "voice resolveTranscriptionEndpoint groq" {
 
 test "voice resolveTranscriptionEndpoint openai" {
     try std.testing.expectEqualStrings(
-        "https://api.groq.com/openai/v1/audio/transcriptions",
+        "",
         resolveTranscriptionEndpoint("openai", null),
     );
 }
@@ -826,10 +831,9 @@ test "voice resolveTranscriptionEndpoint explicit" {
     );
 }
 
-test "voice resolveTranscriptionEndpoint unknown falls back to groq" {
-    // Unknown providers fall back to the Groq-compatible endpoint
+test "voice resolveTranscriptionEndpoint unknown fails closed" {
     try std.testing.expectEqualStrings(
-        "https://api.groq.com/openai/v1/audio/transcriptions",
+        "",
         resolveTranscriptionEndpoint("some-unknown-provider", null),
     );
 }
@@ -839,4 +843,12 @@ test "voice resolveTranscriptionEndpoint telnyx" {
         "https://api.telnyx.com/v2/ai/audio/transcriptions",
         resolveTranscriptionEndpoint("telnyx", null),
     );
+}
+
+test "voice supportsManagedTranscriptionProvider only allows managed STT providers" {
+    try std.testing.expect(supportsManagedTranscriptionProvider("groq"));
+    try std.testing.expect(supportsManagedTranscriptionProvider("GROQ"));
+    try std.testing.expect(supportsManagedTranscriptionProvider("telnyx"));
+    try std.testing.expect(!supportsManagedTranscriptionProvider("openai"));
+    try std.testing.expect(!supportsManagedTranscriptionProvider("some-unknown-provider"));
 }

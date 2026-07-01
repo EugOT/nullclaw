@@ -1524,17 +1524,22 @@ pub fn runTelegramLoop(
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
     if (config.getProviderKey(trans.provider)) |key| {
-        const wt = allocator.create(voice.WhisperTranscriber) catch {
-            log.warn("Failed to allocate WhisperTranscriber", .{});
-            return;
-        };
-        wt.* = .{
-            .endpoint = voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
-            .api_key = key,
-            .model = trans.model,
-            .language = trans.language,
-        };
-        tg_ptr.transcriber = wt.transcriber();
+        const endpoint = voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url);
+        if (endpoint.len == 0 and !voice.supportsManagedTranscriptionProvider(trans.provider)) {
+            log.warn("Skipping unsupported direct audio transcription provider '{s}'; configure a managed provider or explicit safe endpoint.", .{trans.provider});
+        } else {
+            const wt = allocator.create(voice.WhisperTranscriber) catch {
+                log.warn("Failed to allocate WhisperTranscriber", .{});
+                return;
+            };
+            wt.* = .{
+                .endpoint = endpoint,
+                .api_key = key,
+                .model = trans.model,
+                .language = trans.language,
+            };
+            tg_ptr.transcriber = wt.transcriber();
+        }
     }
     defer if (tg_ptr.transcriber) |t| {
         allocator.destroy(@as(*voice.WhisperTranscriber, @ptrCast(@alignCast(t.ptr))));
