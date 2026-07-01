@@ -298,6 +298,11 @@ fn runtimePolicyCompatibleBaseUrl(base_url: ?[]const u8) ?[]const u8 {
     return url;
 }
 
+fn runtimePolicyRejectsBaseUrl(base_url: ?[]const u8) bool {
+    const url = validatedBaseUrl(base_url) orelse return false;
+    return baseUrlForbiddenByRuntimePolicy(url);
+}
+
 fn normalizeAzureBaseUrlOwned(allocator: std.mem.Allocator, base_url: ?[]const u8) ![]u8 {
     const raw = trimTrailingSlash(base_url orelse AZURE_DEFAULT_BASE_URL);
 
@@ -494,9 +499,10 @@ pub const ProviderHolder = union(enum) {
 
                 if (custom_url) |url| {
                     if (baseUrlForbiddenByRuntimePolicy(url)) {
-                        break :blk .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) };
+                        break :blk disabledProvider(provider_name);
                     }
                 }
+                if (runtimePolicyRejectsBaseUrl(base_url)) break :blk disabledProvider(provider_name);
 
                 // Config base_url overrides built-in URL table and custom: prefix
                 const url = runtimePolicyCompatibleBaseUrl(base_url) orelse
@@ -554,7 +560,9 @@ pub const ProviderHolder = union(enum) {
             .openai_codex_provider => codexCliOrDisabled(allocator),
             // Unknown provider: if base_url is configured, treat as OpenAI-compatible;
             // otherwise fall back to OpenRouter.
-            .unknown => if (runtimePolicyCompatibleBaseUrl(base_url)) |url| blk: {
+            .unknown => if (runtimePolicyRejectsBaseUrl(base_url))
+                disabledProvider(provider_name)
+            else if (runtimePolicyCompatibleBaseUrl(base_url)) |url| blk: {
                 var prov = compatible.OpenAiCompatibleProvider.init(
                     allocator,
                     provider_name,
@@ -1345,19 +1353,23 @@ test "fromConfig blocks forbidden custom compatible base urls" {
 
     var h1 = ProviderHolder.fromConfig(alloc, "custom:https://api.openai.com/v1", "key", null, true, null, null, false, null);
     defer h1.deinit();
-    try std.testing.expect(h1 == .openrouter);
+    try std.testing.expect(h1 == .disabled);
 
     var h2 = ProviderHolder.fromConfig(alloc, "unknown-openai", "key", "https://api.openai.com/v1", true, null, null, false, null);
     defer h2.deinit();
-    try std.testing.expect(h2 == .openrouter);
+    try std.testing.expect(h2 == .disabled);
 
     var h3 = ProviderHolder.fromConfig(alloc, "unknown-claude", "key", "https://api.anthropic.com/v1", true, null, null, false, null);
     defer h3.deinit();
-    try std.testing.expect(h3 == .openrouter);
+    try std.testing.expect(h3 == .disabled);
 
     var h4 = ProviderHolder.fromConfig(alloc, "custom:https://api.openai.com.evil.test/v1", "key", null, true, null, null, false, null);
     defer h4.deinit();
     try std.testing.expect(h4 == .compatible);
+
+    var h5 = ProviderHolder.fromConfig(alloc, "groq", "key", "https://api.openai.com/v1", true, null, null, false, null);
+    defer h5.deinit();
+    try std.testing.expect(h5 == .disabled);
 }
 
 test "fromConfig threads max_streaming_prompt_bytes to unknown-with-base-url branch" {
