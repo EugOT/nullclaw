@@ -21,11 +21,13 @@ const MaxTokensEntry = struct {
 const MODEL_MAX_TOKENS = [_]MaxTokensEntry{
     .{ .key = "gpt-4", .tokens = 4_096 },
     .{ .key = "gpt-4-32k", .tokens = 4_096 },
+    .{ .key = "claude-opus-4-8", .tokens = 8192 },
     .{ .key = "claude-opus-4-6", .tokens = 8192 },
     .{ .key = "claude-opus-4.6", .tokens = 8192 },
     .{ .key = "claude-sonnet-4-6", .tokens = 8192 },
     .{ .key = "claude-sonnet-4.6", .tokens = 8192 },
     .{ .key = "claude-haiku-4-5", .tokens = 8192 },
+    .{ .key = "gpt-5.5", .tokens = 8192 },
     .{ .key = "gpt-5.2", .tokens = 8192 },
     .{ .key = "gpt-5.2-codex", .tokens = 8192 },
     .{ .key = "gpt-4.5-preview", .tokens = 8192 },
@@ -34,6 +36,7 @@ const MODEL_MAX_TOKENS = [_]MaxTokensEntry{
     .{ .key = "gpt-4o", .tokens = 8192 },
     .{ .key = "gpt-4o-mini", .tokens = 8192 },
     .{ .key = "o3-mini", .tokens = 8192 },
+    .{ .key = "gemini-3.5-flash", .tokens = 8192 },
     .{ .key = "gemini-2.5-pro", .tokens = 8192 },
     .{ .key = "gemini-2.5-flash", .tokens = 8192 },
     .{ .key = "gemini-2.0-flash", .tokens = 8192 },
@@ -213,10 +216,19 @@ test "resolveMaxTokens honors explicit override first" {
 test "lookupModelMaxTokens resolves model and nested provider refs" {
     try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4"));
     try std.testing.expectEqual(@as(?u32, 4_096), lookupModelMaxTokens("openai/gpt-4-32k"));
+    try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("claude-opus-4-8"));
+    try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("gpt-5.5"));
+    try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("gemini-3.5-flash"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4.1-mini"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4-turbo"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openrouter/anthropic/claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u32, 32_768), lookupModelMaxTokens("qianfan/custom-model"));
+}
+
+test "MODEL_MAX_TOKENS includes exact runtime default rows" {
+    try std.testing.expectEqual(@as(?u32, 8192), lookupTable(&MODEL_MAX_TOKENS, "claude-opus-4-8"));
+    try std.testing.expectEqual(@as(?u32, 8192), lookupTable(&MODEL_MAX_TOKENS, "gpt-5.5"));
+    try std.testing.expectEqual(@as(?u32, 8192), lookupTable(&MODEL_MAX_TOKENS, "gemini-3.5-flash"));
 }
 
 test "lookupModelMaxTokens handles custom url refs with nested provider budgets" {

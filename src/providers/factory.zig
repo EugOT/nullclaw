@@ -12,6 +12,7 @@ const compatible = @import("compatible.zig");
 const claude_cli = @import("claude_cli.zig");
 const codex_cli = @import("codex_cli.zig");
 const gemini_cli = @import("gemini_cli.zig");
+const disabled = @import("disabled.zig");
 const openai_codex = @import("openai_codex.zig");
 const provider_names = @import("../provider_names.zig");
 
@@ -213,6 +214,35 @@ fn findCompatProvider(name: []const u8) ?CompatProvider {
 
 const AZURE_DEFAULT_BASE_URL = "https://your-resource.openai.azure.com";
 const AZURE_DEFAULT_COMPAT_BASE_URL = "https://your-resource.openai.azure.com/openai/v1";
+const DIRECT_PROVIDER_POLICY_MSG = "direct provider API runtime disabled by policy; use Claude Code CLI, Codex CLI/app/ACP, or Antigravity";
+
+fn disabledProvider(name: []const u8) ProviderHolder {
+    return .{ .disabled = disabled.DisabledProvider.init(name, DIRECT_PROVIDER_POLICY_MSG) };
+}
+
+fn claudeCliOrDisabled(allocator: std.mem.Allocator) ProviderHolder {
+    if (claude_cli.ClaudeCliProvider.init(allocator, null)) |p| {
+        return .{ .claude_cli = p };
+    } else |_| {
+        return disabledProvider("claude-cli");
+    }
+}
+
+fn codexCliOrDisabled(allocator: std.mem.Allocator) ProviderHolder {
+    if (codex_cli.CodexCliProvider.init(allocator, null)) |p| {
+        return .{ .codex_cli = p };
+    } else |_| {
+        return disabledProvider("codex-cli");
+    }
+}
+
+fn geminiCliOrDisabled(allocator: std.mem.Allocator) ProviderHolder {
+    if (gemini_cli.GeminiCliProvider.init(allocator, null)) |p| {
+        return .{ .gemini_cli = p };
+    } else |_| {
+        return disabledProvider("gemini-cli");
+    }
+}
 
 fn trimTrailingSlash(s: []const u8) []const u8 {
     if (s.len > 0 and s[s.len - 1] == '/') {
@@ -226,6 +256,62 @@ fn validatedBaseUrl(base_url: ?[]const u8) ?[]const u8 {
         if (config_types.ProviderEntry.isValidBaseUrl(url)) return url;
     }
     return null;
+}
+
+fn hostFromBaseUrl(url: []const u8) ?[]const u8 {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
+    var authority = url[scheme_end + "://".len ..];
+    const authority_end = std.mem.indexOfAny(u8, authority, "/?#") orelse authority.len;
+    authority = authority[0..authority_end];
+
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |userinfo_end| {
+        authority = authority[userinfo_end + 1 ..];
+    }
+
+    if (authority.len == 0) return null;
+    if (authority[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
+        return authority[1..end];
+    }
+
+    const port_start = std.mem.indexOfScalar(u8, authority, ':') orelse authority.len;
+    return authority[0..port_start];
+}
+
+fn baseUrlForbiddenByRuntimePolicy(url: []const u8) bool {
+    const host = hostFromBaseUrl(url) orelse return false;
+    const forbidden_hosts = [_][]const u8{
+        "api.openai.com",
+        "api.anthropic.com",
+        "generativelanguage.googleapis.com",
+        "aiplatform.googleapis.com",
+    };
+    for (forbidden_hosts) |forbidden| {
+        if (hostMatchesForbiddenRuntimeHost(host, forbidden)) return true;
+    }
+    return false;
+}
+
+fn hostMatchesForbiddenRuntimeHost(host: []const u8, forbidden: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(host, forbidden)) return true;
+    if (host.len <= forbidden.len) return false;
+    const boundary = host[host.len - forbidden.len - 1];
+    if (std.ascii.eqlIgnoreCase(forbidden, "aiplatform.googleapis.com") and boundary == '-') {
+        return std.ascii.eqlIgnoreCase(host[host.len - forbidden.len ..], forbidden);
+    }
+    if (boundary != '.') return false;
+    return std.ascii.eqlIgnoreCase(host[host.len - forbidden.len ..], forbidden);
+}
+
+fn runtimePolicyCompatibleBaseUrl(base_url: ?[]const u8) ?[]const u8 {
+    const url = validatedBaseUrl(base_url) orelse return null;
+    if (baseUrlForbiddenByRuntimePolicy(url)) return null;
+    return url;
+}
+
+fn runtimePolicyRejectsBaseUrl(base_url: ?[]const u8) bool {
+    const url = validatedBaseUrl(base_url) orelse return false;
+    return baseUrlForbiddenByRuntimePolicy(url);
 }
 
 fn normalizeAzureBaseUrlOwned(allocator: std.mem.Allocator, base_url: ?[]const u8) ![]u8 {
@@ -286,6 +372,19 @@ pub fn classifyProvider(name: []const u8) ProviderKind {
     return .unknown;
 }
 
+pub fn providerKindAllowedByRuntimePolicy(kind: ProviderKind) bool {
+    return switch (kind) {
+        .anthropic_provider,
+        .openai_provider,
+        .azure_openai_provider,
+        .gemini_provider,
+        .vertex_provider,
+        .openai_codex_provider,
+        => false,
+        else => true,
+    };
+}
+
 /// Auto-detect provider kind from an API key prefix.
 pub fn detectProviderByApiKey(key: []const u8) ProviderKind {
     if (key.len < 3) return .unknown;
@@ -326,6 +425,7 @@ pub const ProviderHolder = union(enum) {
     claude_cli: claude_cli.ClaudeCliProvider,
     codex_cli: codex_cli.CodexCliProvider,
     gemini_cli: gemini_cli.GeminiCliProvider,
+    disabled: disabled.DisabledProvider,
     openai_codex: openai_codex.OpenAiCodexProvider,
 
     /// Obtain the vtable-based Provider interface from whichever variant is active.
@@ -341,6 +441,7 @@ pub const ProviderHolder = union(enum) {
             .claude_cli => |*p| p.provider(),
             .codex_cli => |*p| p.provider(),
             .gemini_cli => |*p| p.provider(),
+            .disabled => |*p| p.provider(),
             .openai_codex => |*p| p.provider(),
         };
     }
@@ -391,41 +492,9 @@ pub const ProviderHolder = union(enum) {
     ) ProviderHolder {
         const kind = classifyProvider(provider_name);
         return switch (kind) {
-            .anthropic_provider => .{ .anthropic = anthropic.AnthropicProvider.init(
-                allocator,
-                api_key,
-                if (std.mem.startsWith(u8, provider_name, "anthropic-custom:"))
-                    if (config_types.ProviderEntry.isValidBaseUrl(provider_name["anthropic-custom:".len..]))
-                        provider_name["anthropic-custom:".len..]
-                    else
-                        validatedBaseUrl(base_url)
-                else
-                    validatedBaseUrl(base_url),
-            ) },
-            .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent, extra_body_params) },
-            .azure_openai_provider => blk: {
-                const azure_url = normalizeAzureBaseUrlOwned(allocator, validatedBaseUrl(base_url)) catch null;
-                var prov = compatible.OpenAiCompatibleProvider.init(
-                    allocator,
-                    provider_name,
-                    if (azure_url) |url| url else AZURE_DEFAULT_COMPAT_BASE_URL,
-                    api_key,
-                    .custom,
-                    user_agent,
-                );
-                prov.owned_base_url = azure_url;
-                prov.custom_header = "api-key";
-                if (!native_tools) prov.native_tools = false;
-                prov.api_mode = switch (api_mode) {
-                    .responses => .responses,
-                    else => .chat_completions,
-                };
-                if (max_streaming_prompt_bytes) |limit| prov.max_streaming_prompt_bytes = limit;
-                prov.extra_body_params = extra_body_params;
-                break :blk .{ .compatible = prov };
-            },
-            .gemini_provider => .{ .gemini = gemini.GeminiProvider.init(allocator, api_key) },
-            .vertex_provider => .{ .vertex = vertex.VertexProvider.init(allocator, api_key, validatedBaseUrl(base_url)) },
+            .anthropic_provider => claudeCliOrDisabled(allocator),
+            .openai_provider, .azure_openai_provider => codexCliOrDisabled(allocator),
+            .gemini_provider, .vertex_provider => geminiCliOrDisabled(allocator),
             .ollama_provider => blk: {
                 var prov = ollama.OllamaProvider.init(allocator, validatedBaseUrl(base_url), api_key);
                 prov.native_tools = native_tools;
@@ -433,13 +502,22 @@ pub const ProviderHolder = union(enum) {
             },
             .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, extra_body_params) },
             .compatible_provider => blk: {
+                const custom_url: ?[]const u8 = if (std.mem.startsWith(u8, provider_name, "custom:") and
+                    config_types.ProviderEntry.isValidBaseUrl(provider_name["custom:".len..]))
+                    provider_name["custom:".len..]
+                else
+                    null;
+
+                if (custom_url) |url| {
+                    if (baseUrlForbiddenByRuntimePolicy(url)) {
+                        break :blk disabledProvider(provider_name);
+                    }
+                }
+                if (runtimePolicyRejectsBaseUrl(base_url)) break :blk disabledProvider(provider_name);
+
                 // Config base_url overrides built-in URL table and custom: prefix
-                const url = validatedBaseUrl(base_url) orelse
-                    if (std.mem.startsWith(u8, provider_name, "custom:") and
-                        config_types.ProviderEntry.isValidBaseUrl(provider_name["custom:".len..]))
-                        provider_name["custom:".len..]
-                    else
-                        compatibleProviderUrl(provider_name) orelse "https://openrouter.ai/api/v1";
+                const url = runtimePolicyCompatibleBaseUrl(base_url) orelse
+                    if (custom_url) |custom| custom else compatibleProviderUrl(provider_name) orelse "https://openrouter.ai/api/v1";
 
                 const cp = findCompatProvider(provider_name);
 
@@ -481,19 +559,21 @@ pub const ProviderHolder = union(enum) {
             .claude_cli_provider => if (claude_cli.ClaudeCliProvider.init(allocator, null)) |p|
                 .{ .claude_cli = p }
             else |_|
-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
+                disabledProvider("claude-cli"),
             .codex_cli_provider => if (codex_cli.CodexCliProvider.init(allocator, null)) |p|
                 .{ .codex_cli = p }
             else |_|
-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
+                disabledProvider("codex-cli"),
             .gemini_cli_provider => if (gemini_cli.GeminiCliProvider.init(allocator, null)) |p|
                 .{ .gemini_cli = p }
             else |_|
-                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, null) },
-            .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
+                disabledProvider("gemini-cli"),
+            .openai_codex_provider => codexCliOrDisabled(allocator),
             // Unknown provider: if base_url is configured, treat as OpenAI-compatible;
             // otherwise fall back to OpenRouter.
-            .unknown => if (validatedBaseUrl(base_url)) |url| blk: {
+            .unknown => if (runtimePolicyRejectsBaseUrl(base_url))
+                disabledProvider(provider_name)
+            else if (runtimePolicyCompatibleBaseUrl(base_url)) |url| blk: {
                 var prov = compatible.OpenAiCompatibleProvider.init(
                     allocator,
                     provider_name,
@@ -531,20 +611,32 @@ const ProviderHolderCase = struct {
 
 const provider_holder_cases = [_]ProviderHolderCase{
     .{ .name = "openrouter", .expected_name_substr = "openrouter", .expected_tag = .openrouter },
-    .{ .name = "anthropic", .expected_name_substr = "anthropic", .expected_tag = .anthropic },
-    .{ .name = "openai", .expected_name_substr = "openai", .expected_tag = .openai },
-    .{ .name = "gemini", .expected_name_substr = "gemini", .expected_tag = .gemini },
-    .{ .name = "vertex", .expected_name_substr = "vertex", .expected_tag = .vertex },
+    .{ .name = "direct-anthropic", .expected_name_substr = "anthropic", .expected_tag = .anthropic },
+    .{ .name = "direct-openai", .expected_name_substr = "openai", .expected_tag = .openai },
+    .{ .name = "direct-gemini", .expected_name_substr = "gemini", .expected_tag = .gemini },
+    .{ .name = "direct-vertex", .expected_name_substr = "vertex", .expected_tag = .vertex },
     .{ .name = "ollama", .expected_name_substr = "ollama", .expected_tag = .ollama },
     .{ .name = "groq", .expected_name_substr = "groq", .expected_tag = .compatible },
     .{ .name = "claude-cli", .expected_name_substr = "claude", .expected_tag = .claude_cli },
     .{ .name = "codex-cli", .expected_name_substr = "codex", .expected_tag = .codex_cli },
-    .{ .name = "gemini-cli", .expected_name_substr = "gemini", .expected_tag = .gemini_cli },
-    .{ .name = "openai-codex", .expected_name_substr = "openai", .expected_tag = .openai_codex },
+    .{ .name = "gemini-cli", .expected_name_substr = "antigravity", .expected_tag = .gemini_cli },
+    .{ .name = "disabled", .expected_name_substr = "disabled", .expected_tag = .disabled },
+    .{ .name = "direct-openai-codex", .expected_name_substr = "codex", .expected_tag = .openai_codex },
 };
 
 fn providerHolderForCase(allocator: std.mem.Allocator, c: ProviderHolderCase) ProviderHolder {
     return switch (c.expected_tag) {
+        .anthropic => .{ .anthropic = anthropic.AnthropicProvider.init(allocator, "test-key", "https://anthropic.invalid") },
+        .openai => .{ .openai = openai.OpenAiProvider.init(allocator, "test-key", null, null) },
+        .gemini => .{ .gemini = gemini.GeminiProvider.init(allocator, "test-key") },
+        .vertex => .{ .vertex = vertex.VertexProvider.init(allocator, "test-key", "https://vertex.invalid") },
+        .openai_codex => .{ .openai_codex = .{
+            .allocator = allocator,
+            .access_token = null,
+            .refresh_token = null,
+            .account_id = null,
+            .expires_at = 0,
+        } },
         .claude_cli => .{ .claude_cli = .{
             .allocator = allocator,
             .model = "test-claude",
@@ -557,6 +649,7 @@ fn providerHolderForCase(allocator: std.mem.Allocator, c: ProviderHolderCase) Pr
             .allocator = allocator,
             .model = "test-gemini",
         } },
+        .disabled => disabledProvider("disabled"),
         else => ProviderHolder.fromConfig(
             allocator,
             c.name,
@@ -598,6 +691,23 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("openai-codex") == .openai_codex_provider);
     try std.testing.expect(classifyProvider("gemini-cli") == .gemini_cli_provider);
     try std.testing.expect(classifyProvider("nonexistent") == .unknown);
+}
+
+test "providerKindAllowedByRuntimePolicy blocks direct API providers" {
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.anthropic_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.openai_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.azure_openai_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.gemini_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.vertex_provider));
+    try std.testing.expect(!providerKindAllowedByRuntimePolicy(.openai_codex_provider));
+
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.claude_cli_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.codex_cli_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.gemini_cli_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.ollama_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.compatible_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.openrouter_provider));
+    try std.testing.expect(providerKindAllowedByRuntimePolicy(.unknown));
 }
 
 test "classifyProvider new providers" {
@@ -1092,12 +1202,11 @@ test "fromConfig threads extra_body_params to compatible provider" {
     try std.testing.expectEqualStrings("{\"seed\":7}", h.compatible.extra_body_params.?);
 }
 
-test "fromConfig threads extra_body_params to openai provider" {
+test "fromConfig disables direct openai provider instead of threading extra_body_params" {
     const alloc = std.testing.allocator;
     var h = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null, null, false, "{\"seed\":11}");
     defer h.deinit();
-    try std.testing.expect(h == .openai);
-    try std.testing.expectEqualStrings("{\"seed\":11}", h.openai.extra_body_params.?);
+    try std.testing.expect(h == .codex_cli or h == .disabled);
 }
 
 test "fromConfig threads extra_body_params to openrouter provider" {
@@ -1173,26 +1282,23 @@ test "ProviderHolder.fromConfig routes to correct variant" {
     // anthropic
     var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test", null, true, null, null, false, null);
     defer h1.deinit();
-    try std.testing.expect(h1 == .anthropic);
+    try std.testing.expect(h1 == .claude_cli or h1 == .disabled);
     // openai
     var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null, null, false, null);
     defer h2.deinit();
-    try std.testing.expect(h2 == .openai);
+    try std.testing.expect(h2 == .codex_cli or h2 == .disabled);
     // azure openai
     var h2a = ProviderHolder.fromConfig(alloc, "azure", "test-key", "https://test.openai.azure.com", true, null, null, false, null);
     defer h2a.deinit();
-    try std.testing.expect(h2a == .compatible);
-    try std.testing.expectEqualStrings("https://test.openai.azure.com/openai/v1", h2a.compatible.base_url);
-    try std.testing.expect(h2a.compatible.auth_style == .custom);
-    try std.testing.expectEqualStrings("api-key", h2a.compatible.custom_header.?);
+    try std.testing.expect(h2a == .codex_cli or h2a == .disabled);
     // gemini
     var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null, true, null, null, false, null);
     defer h3.deinit();
-    try std.testing.expect(h3 == .gemini);
+    try std.testing.expect(h3 == .gemini_cli or h3 == .disabled);
     // vertex
-    var h3b = ProviderHolder.fromConfig(alloc, "vertex", "ya29.token", "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models", true, null, null, false, null);
+    var h3b = ProviderHolder.fromConfig(alloc, "vertex", "ya29.token", "https://vertex.invalid/v1/projects/p/locations/global/publishers/google/models", true, null, null, false, null);
     defer h3b.deinit();
-    try std.testing.expect(h3b == .vertex);
+    try std.testing.expect(h3b == .gemini_cli or h3b == .disabled);
     // ollama
     var h4 = ProviderHolder.fromConfig(alloc, "ollama", null, null, true, null, null, false, null);
     defer h4.deinit();
@@ -1226,7 +1332,7 @@ test "ProviderHolder.fromConfig routes to correct variant" {
     // openai-codex
     var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null, null, true, null, null, false, null);
     defer h7.deinit();
-    try std.testing.expect(h7 == .openai_codex);
+    try std.testing.expect(h7 == .codex_cli or h7 == .disabled);
     // unknown falls back to openrouter
     var h8 = ProviderHolder.fromConfig(alloc, "nonexistent", "key", null, true, null, null, false, null);
     defer h8.deinit();
@@ -1234,7 +1340,7 @@ test "ProviderHolder.fromConfig routes to correct variant" {
     // anthropic-custom prefix
     var h9 = ProviderHolder.fromConfig(alloc, "anthropic-custom:https://my-api.example.com", "sk-test", null, true, null, null, false, null);
     defer h9.deinit();
-    try std.testing.expect(h9 == .anthropic);
+    try std.testing.expect(h9 == .claude_cli or h9 == .disabled);
 }
 
 test "compat_providers table count" {
@@ -1242,21 +1348,47 @@ test "compat_providers table count" {
     try std.testing.expect(compat_providers.len >= 92);
 }
 
-test "fromConfig threads max_streaming_prompt_bytes to azure branch" {
-    // GAP-13: The azure branch (azure_openai_provider) must thread the limit
-    // through to the underlying compatible provider just like the compatible_provider
-    // branch does.
+test "fromConfig disables direct azure branch" {
     const alloc = std.testing.allocator;
-    // null → no limit
     var h1 = ProviderHolder.fromConfig(alloc, "azure-openai", "key", "https://res.openai.azure.com", true, null, null, false, null);
     defer h1.deinit();
-    try std.testing.expect(h1 == .compatible);
-    try std.testing.expectEqual(@as(?usize, null), h1.compatible.max_streaming_prompt_bytes);
-    // non-null → limit applied
+    try std.testing.expect(h1 == .codex_cli or h1 == .disabled);
+
     var h2 = ProviderHolder.fromConfig(alloc, "azure-openai", "key", "https://res.openai.azure.com", true, null, 65536, false, null);
     defer h2.deinit();
-    try std.testing.expect(h2 == .compatible);
-    try std.testing.expectEqual(@as(?usize, 65536), h2.compatible.max_streaming_prompt_bytes);
+    try std.testing.expect(h2 == .codex_cli or h2 == .disabled);
+}
+
+test "fromConfig blocks forbidden custom compatible base urls" {
+    const alloc = std.testing.allocator;
+
+    var h1 = ProviderHolder.fromConfig(alloc, "custom:https://api.openai.com/v1", "key", null, true, null, null, false, null);
+    defer h1.deinit();
+    try std.testing.expect(h1 == .disabled);
+
+    var h2 = ProviderHolder.fromConfig(alloc, "unknown-openai", "key", "https://api.openai.com/v1", true, null, null, false, null);
+    defer h2.deinit();
+    try std.testing.expect(h2 == .disabled);
+
+    var h3 = ProviderHolder.fromConfig(alloc, "unknown-claude", "key", "https://api.anthropic.com/v1", true, null, null, false, null);
+    defer h3.deinit();
+    try std.testing.expect(h3 == .disabled);
+
+    var h3b = ProviderHolder.fromConfig(alloc, "custom:https://us-central1-aiplatform.googleapis.com/v1", "key", null, true, null, null, false, null);
+    defer h3b.deinit();
+    try std.testing.expect(h3b == .disabled);
+
+    var h4 = ProviderHolder.fromConfig(alloc, "custom:https://api.openai.com.evil.test/v1", "key", null, true, null, null, false, null);
+    defer h4.deinit();
+    try std.testing.expect(h4 == .compatible);
+
+    var h4b = ProviderHolder.fromConfig(alloc, "custom:https://evil-aiplatform.googleapis.com.attacker.test/v1", "key", null, true, null, null, false, null);
+    defer h4b.deinit();
+    try std.testing.expect(h4b == .compatible);
+
+    var h5 = ProviderHolder.fromConfig(alloc, "groq", "key", "https://api.openai.com/v1", true, null, null, false, null);
+    defer h5.deinit();
+    try std.testing.expect(h5 == .disabled);
 }
 
 test "fromConfig threads max_streaming_prompt_bytes to unknown-with-base-url branch" {
@@ -1284,11 +1416,10 @@ test "fromConfig threads max_streaming_prompt_bytes zero value" {
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expectEqual(@as(?usize, 0), h.compatible.max_streaming_prompt_bytes);
-    // Azure branch
+    // Direct Azure branch is policy-disabled and must not instantiate a direct compatible client.
     var h2 = ProviderHolder.fromConfig(alloc, "azure", "key", "https://res.openai.azure.com", true, null, 0, false, null);
     defer h2.deinit();
-    try std.testing.expect(h2 == .compatible);
-    try std.testing.expectEqual(@as(?usize, 0), h2.compatible.max_streaming_prompt_bytes);
+    try std.testing.expect(h2 == .codex_cli or h2 == .disabled);
     // Unknown-with-base-url branch
     var h3 = ProviderHolder.fromConfig(alloc, "custom-llm", "key", "http://localhost:7777/v1", true, null, 0, false, null);
     defer h3.deinit();

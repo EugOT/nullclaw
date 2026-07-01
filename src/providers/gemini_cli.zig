@@ -10,13 +10,10 @@ const ChatMessage = root.ChatMessage;
 
 const log = std.log.scoped(.gemini_cli);
 
-/// Provider that delegates to the `gemini` CLI (Google Gemini).
+/// Provider that delegates Gemini-family requests to Antigravity CLI.
 ///
-/// Implements a Lazy Persistent Singleton:
-/// 1. Spawns `gemini --experimental-acp` on first use.
-/// 2. Performs a JSON-RPC 2.0 handshake to create a session.
-/// 3. Keeps the process alive for subsequent requests.
-/// 4. Communicates via JSON-RPC 2.0 over stdio.
+/// Direct Gemini API and the standalone Gemini CLI are disabled by policy.
+/// Antigravity is the approved runtime path for Gemini-family models.
 pub const GeminiCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -30,9 +27,11 @@ pub const GeminiCliProvider = struct {
     read_buffer: std.ArrayListUnmanaged(u8) = .empty,
     read_offset: usize = 0,
 
-    const DEFAULT_MODEL = "gemini-2.0-flash";
-    const CLI_NAME = "gemini";
+    const DEFAULT_MODEL = "gemini-3.5-flash";
+    const DEFAULT_REASONING = "high";
+    const CLI_NAME = "agy";
     const ACP_PROTOCOL_VERSION: u32 = 1;
+    const MAX_PRINT_PROMPT_BYTES: usize = 128 * 1024;
 
     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !GeminiCliProvider {
         // Just verify CLI is in PATH, don't start it yet.
@@ -78,7 +77,7 @@ pub const GeminiCliProvider = struct {
             try allocator.dupe(u8, message);
         defer allocator.free(prompt);
 
-        return self.sendPrompt(allocator, prompt, effective_model);
+        return runAntigravityChat(allocator, prompt, effective_model);
     }
 
     fn chatImpl(
@@ -92,8 +91,10 @@ pub const GeminiCliProvider = struct {
         const effective_model = if (model.len > 0) model else self.model;
 
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
-        const content = try self.sendPrompt(allocator, prompt, effective_model);
-        return ChatResponse{ .content = content, .model = try allocator.dupe(u8, effective_model) };
+        const content = try runAntigravityChat(allocator, prompt, effective_model);
+        errdefer allocator.free(content);
+        const response_model = try allocator.dupe(u8, effective_model);
+        return ChatResponse{ .content = content, .model = response_model };
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -105,7 +106,30 @@ pub const GeminiCliProvider = struct {
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
-        return "gemini-cli";
+        return "antigravity-cli";
+    }
+
+    fn runAntigravityChat(allocator: std.mem.Allocator, prompt: []const u8, model: []const u8) ![]const u8 {
+        try validateAntigravityPrintPrompt(prompt);
+        const argv = buildAntigravityPrintArgv(prompt, model);
+
+        var child = std_compat.process.Child.init(&argv, allocator);
+        child.stdin_behavior = .Close;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+
+        child.spawn() catch return error.CliNotFound;
+        const max_output: usize = 4 * 1024 * 1024;
+        const stdout_result = child.stdout.?.readToEndAlloc(allocator, max_output) catch |err| {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return err;
+        };
+        errdefer allocator.free(stdout_result);
+
+        const term = try child.wait();
+        try expectSuccessfulAntigravityExit(term);
+        return stdout_result;
     }
 
     fn deinitImpl(ptr: *anyopaque) void {
@@ -156,7 +180,7 @@ pub const GeminiCliProvider = struct {
         self.read_offset = 0;
     }
 
-    /// Ensure the gemini agent process is running and a session is created.
+    /// Legacy Gemini-CLI ACP implementation retained only for inactive tests.
     fn ensureStarted(self: *GeminiCliProvider) !void {
         if (self.child != null and self.session_id != null) return;
         log.debug("starting process...", .{});
@@ -172,7 +196,7 @@ pub const GeminiCliProvider = struct {
         try argv_list.append(self.allocator, try self.allocator.dupe(u8, CLI_NAME));
         try argv_list.append(self.allocator, try self.allocator.dupe(u8, "--experimental-acp"));
         try argv_list.append(self.allocator, try self.allocator.dupe(u8, "--approval-mode"));
-        // NOTE: "yolo" mode is used here to allow the gemini-cli agent to perform
+        // NOTE: "yolo" mode was used here to allow the legacy Gemini CLI agent to perform
         // its internal tool calls (like reading workspace context) without
         // interactive approval, which is required for non-interactive ACP sessions.
         // Higher-level security is enforced by nullclaw's own tool approval logic.
@@ -385,7 +409,7 @@ pub const GeminiCliProvider = struct {
                 // Record detailed error message if available
                 if (err_val == .object) {
                     if (lookupErrorMessage(err_val.object)) |err_msg| {
-                        root.setLastApiErrorDetail("gemini-cli", err_msg);
+                        root.setLastApiErrorDetail("antigravity-cli", err_msg);
                     }
                 }
 
@@ -447,10 +471,10 @@ pub const GeminiCliProvider = struct {
         }
     }
 
-    /// Fetch available model names by running `gemini -p \"/model\" -o stream-json`.
-    pub fn fetchModels(allocator: std.mem.Allocator) [][]const u8 {
-        if (builtin.is_test) return &.{};
-        return fetchModelsInternal(allocator) catch &.{};
+    /// Antigravity does not expose a model list command compatible with Gemini CLI.
+    pub fn fetchModels(allocator: std.mem.Allocator) ![][]const u8 {
+        _ = allocator;
+        return error.NotSupported;
     }
 
     fn fetchModelsInternal(allocator: std.mem.Allocator) ![][]const u8 {
@@ -489,6 +513,36 @@ pub const GeminiCliProvider = struct {
         return error.CliProcessFailed;
     }
 };
+
+fn validateAntigravityPrintPrompt(prompt: []const u8) !void {
+    if (prompt.len > GeminiCliProvider.MAX_PRINT_PROMPT_BYTES) return error.PromptTooLarge;
+}
+
+fn buildAntigravityPrintArgv(prompt: []const u8, model: []const u8) [7][]const u8 {
+    return .{
+        GeminiCliProvider.CLI_NAME,
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--reasoning",
+        GeminiCliProvider.DEFAULT_REASONING,
+    };
+}
+
+fn expectSuccessfulAntigravityExit(term: std_compat.process.Child.Term) !void {
+    return switch (term) {
+        .exited => |code| if (code == 0) {} else error.CliProcessFailed,
+        else => error.CliProcessFailed,
+    };
+}
+
+fn argvIndexOf(argv: []const []const u8, needle: []const u8) ?usize {
+    for (argv, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, needle)) return index;
+    }
+    return null;
+}
 
 fn buildInitializeRequest(allocator: std.mem.Allocator, id: u32) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -556,7 +610,7 @@ fn recordJsonRpcError(prefix: []const u8, line: []const u8, err_val: ?std.json.V
         }
         if (err_obj == .object) {
             if (GeminiCliProvider.lookupErrorMessage(err_obj.object)) |message| {
-                root.setLastApiErrorDetail("gemini-cli", message);
+                root.setLastApiErrorDetail("antigravity-cli", message);
             }
         }
     } else {
@@ -643,16 +697,16 @@ fn extractLastUserMessage(messages: []const ChatMessage) ?[]const u8 {
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "GeminiCliProvider.getNameImpl returns gemini-cli" {
+test "GeminiCliProvider.getNameImpl returns antigravity-cli" {
     const vt = GeminiCliProvider.vtable;
     var dummy: u8 = 0;
-    try std.testing.expectEqualStrings("gemini-cli", vt.getName(@ptrCast(&dummy)));
+    try std.testing.expectEqualStrings("antigravity-cli", vt.getName(@ptrCast(&dummy)));
 }
 
 test "GeminiCliProvider vtable has correct function pointers" {
     const vt = GeminiCliProvider.vtable;
     var dummy: u8 = 0;
-    try std.testing.expectEqualStrings("gemini-cli", vt.getName(@ptrCast(&dummy)));
+    try std.testing.expectEqualStrings("antigravity-cli", vt.getName(@ptrCast(&dummy)));
     try std.testing.expect(!vt.supportsNativeTools(@ptrCast(&dummy)));
     try std.testing.expect(vt.supports_vision != null);
     try std.testing.expect(!vt.supports_vision.?(@ptrCast(&dummy)));
@@ -688,6 +742,38 @@ test "extractLastUserMessage empty messages" {
     try std.testing.expect(extractLastUserMessage(&msgs) == null);
 }
 
+test "buildAntigravityPrintArgv includes model and reasoning" {
+    const argv = buildAntigravityPrintArgv("hello", "gemini-3.5-flash");
+    try std.testing.expectEqualStrings("agy", argv[0]);
+    try std.testing.expectEqualStrings("-p", argv[1]);
+    try std.testing.expectEqualStrings("hello", argv[2]);
+    try std.testing.expectEqualStrings("--model", argv[3]);
+    try std.testing.expectEqualStrings("gemini-3.5-flash", argv[4]);
+    try std.testing.expectEqualStrings("--reasoning", argv[5]);
+    try std.testing.expectEqualStrings(GeminiCliProvider.DEFAULT_REASONING, argv[6]);
+}
+
+test "validateAntigravityPrintPrompt rejects oversized argv prompt" {
+    try validateAntigravityPrintPrompt("");
+    try validateAntigravityPrintPrompt("hello");
+
+    const oversized = try std.testing.allocator.alloc(u8, GeminiCliProvider.MAX_PRINT_PROMPT_BYTES + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+
+    try std.testing.expectError(error.PromptTooLarge, validateAntigravityPrintPrompt(oversized));
+}
+
+test "expectSuccessfulAntigravityExit maps failures" {
+    try expectSuccessfulAntigravityExit(.{ .exited = 0 });
+    try std.testing.expectError(error.CliProcessFailed, expectSuccessfulAntigravityExit(.{ .exited = 1 }));
+    try std.testing.expectError(error.CliProcessFailed, expectSuccessfulAntigravityExit(.{ .signal = std.posix.SIG.TERM }));
+}
+
+test "GeminiCliProvider fetchModels reports unsupported explicitly" {
+    try std.testing.expectError(error.NotSupported, GeminiCliProvider.fetchModels(std.testing.allocator));
+}
+
 test "GeminiCliProvider.lookupErrorMessage handles message and msg fields" {
     const message_body = "{\"message\":\"request failed\"}";
     const parsed_message = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, message_body, .{});
@@ -712,7 +798,7 @@ test "recordJsonRpcError stores message and msg detail" {
 
     const message_snapshot = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
     defer std.testing.allocator.free(message_snapshot);
-    try std.testing.expectEqualStrings("gemini-cli: request failed", message_snapshot);
+    try std.testing.expectEqualStrings("antigravity-cli: request failed", message_snapshot);
 
     root.clearLastApiErrorDetail();
 
@@ -724,7 +810,7 @@ test "recordJsonRpcError stores message and msg detail" {
 
     const msg_snapshot = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
     defer std.testing.allocator.free(msg_snapshot);
-    try std.testing.expectEqualStrings("gemini-cli: handshake failed", msg_snapshot);
+    try std.testing.expectEqualStrings("antigravity-cli: handshake failed", msg_snapshot);
 }
 
 test "checkCliVersion returns CliNotFound for missing binary" {
@@ -787,7 +873,7 @@ test "cleanupStartupFailure clears provider state" {
     defer provider.read_buffer.deinit(std.testing.allocator);
 
     provider.child_argv = try std.testing.allocator.alloc([]const u8, 2);
-    provider.child_argv.?[0] = try std.testing.allocator.dupe(u8, "gemini");
+    provider.child_argv.?[0] = try std.testing.allocator.dupe(u8, "agy");
     provider.child_argv.?[1] = try std.testing.allocator.dupe(u8, "--experimental-acp");
     provider.session_id = try std.testing.allocator.dupe(u8, "session-123");
     try provider.read_buffer.appendSlice(std.testing.allocator, "partial");
@@ -816,7 +902,7 @@ test "cleanupStartupFailure clears provider state before child allocation" {
     defer provider.read_buffer.deinit(std.testing.allocator);
 
     provider.child_argv = try std.testing.allocator.alloc([]const u8, 2);
-    provider.child_argv.?[0] = try std.testing.allocator.dupe(u8, "gemini");
+    provider.child_argv.?[0] = try std.testing.allocator.dupe(u8, "agy");
     provider.child_argv.?[1] = try std.testing.allocator.dupe(u8, "--experimental-acp");
     provider.session_id = try std.testing.allocator.dupe(u8, "session-123");
     try provider.read_buffer.appendSlice(std.testing.allocator, "partial");

@@ -18,6 +18,8 @@ pub const CodexCliProvider = struct {
     model: []const u8,
 
     pub const DEFAULT_MODEL = codex_support.DEFAULT_CODEX_MODEL;
+    pub const DEFAULT_REASONING = "medium";
+    const DEFAULT_REASONING_CONFIG = "model_reasoning_effort=\"" ++ DEFAULT_REASONING ++ "\"";
     const TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
 
     pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !CodexCliProvider {
@@ -102,18 +104,7 @@ pub const CodexCliProvider = struct {
             allocator.free(output_path);
         }
 
-        const argv = [_][]const u8{
-            cli_path,
-            "exec",
-            "--skip-git-repo-check",
-            "--color",
-            "never",
-            "-m",
-            model,
-            "-o",
-            output_path,
-            prompt,
-        };
+        const argv = buildCodexExecArgv(cli_path, model, output_path, prompt);
 
         var child = std_compat.process.Child.init(&argv, allocator);
         child.stdin_behavior = .Ignore;
@@ -164,6 +155,30 @@ pub const CodexCliProvider = struct {
 fn checkCliAvailable(allocator: std.mem.Allocator) !void {
     const cli_path = codex_support.resolveCodexCommand(allocator) orelse return error.CliNotFound;
     allocator.free(cli_path);
+}
+
+fn buildCodexExecArgv(cli_path: []const u8, model: []const u8, output_path: []const u8, prompt: []const u8) [12][]const u8 {
+    return .{
+        cli_path,
+        "exec",
+        "--skip-git-repo-check",
+        "--color",
+        "never",
+        "-m",
+        model,
+        "-c",
+        CodexCliProvider.DEFAULT_REASONING_CONFIG,
+        "-o",
+        output_path,
+        prompt,
+    };
+}
+
+fn argvIndexOf(argv: []const []const u8, needle: []const u8) ?usize {
+    for (argv, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, needle)) return index;
+    }
+    return null;
 }
 
 /// Run `codex --version` and verify exit code 0.
@@ -280,6 +295,20 @@ test "extractLastUserMessage empty messages" {
     try std.testing.expect(extractLastUserMessage(&msgs) == null);
 }
 
-test "CodexCliProvider default model is gpt-5.4" {
+test "CodexCliProvider default model follows codex support default" {
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, CodexCliProvider.DEFAULT_MODEL);
+}
+
+test "CodexCliProvider default reasoning effort is medium" {
+    try std.testing.expectEqualStrings("medium", CodexCliProvider.DEFAULT_REASONING);
+}
+
+test "buildCodexExecArgv includes reasoning config" {
+    const argv = buildCodexExecArgv("codex", "gpt-5.5", "/tmp/out", "hello");
+    try std.testing.expectEqualStrings("codex", argv[0]);
+    try std.testing.expectEqualStrings("exec", argv[1]);
+    try std.testing.expect(argvIndexOf(argv[0..], "-c") != null);
+    const config_index = argvIndexOf(argv[0..], "-c").?;
+    try std.testing.expectEqualStrings(CodexCliProvider.DEFAULT_REASONING_CONFIG, argv[config_index + 1]);
+    try std.testing.expectEqualStrings("hello", argv[argv.len - 1]);
 }

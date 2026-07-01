@@ -6,8 +6,14 @@ const std = @import("std");
 const std_compat = @import("compat");
 const onboard = @import("onboard.zig");
 const config_types = @import("config_types.zig");
+const providers = @import("providers/root.zig");
+
+fn providerBlockedByRuntimePolicy(provider: []const u8) bool {
+    return !providers.providerKindAllowedByRuntimePolicy(providers.classifyProvider(provider));
+}
 
 fn resolveProviderKey(provider: []const u8, base_url: ?[]const u8) ?[]const u8 {
+    if (providerBlockedByRuntimePolicy(provider)) return null;
     if (onboard.resolveProviderForQuickSetup(provider)) |info| return info.key;
     if (base_url != null) return provider;
     return null;
@@ -87,7 +93,13 @@ test "run requires --provider flag" {
 test "resolveProviderKey accepts unknown provider only with base_url" {
     try std.testing.expect(resolveProviderKey("my-gateway", null) == null);
     try std.testing.expectEqualStrings("my-gateway", resolveProviderKey("my-gateway", "https://gateway.example.com/v1").?);
-    try std.testing.expectEqualStrings("openai", resolveProviderKey("openai", null).?);
+    try std.testing.expect(resolveProviderKey("openai", null) == null);
+    try std.testing.expect(resolveProviderKey("openai", "https://gateway.example.com/v1") == null);
+    try std.testing.expect(resolveProviderKey("gemini", null) == null);
+    try std.testing.expect(resolveProviderKey("vertex", null) == null);
+    try std.testing.expect(resolveProviderKey("openai-codex", null) == null);
+    try std.testing.expectEqualStrings("groq", resolveProviderKey("groq", null).?);
+    try std.testing.expectEqualStrings("gemini-cli", resolveProviderKey("gemini-cli", null).?);
 }
 
 test "isValidBaseUrlArg matches provider base_url validation" {

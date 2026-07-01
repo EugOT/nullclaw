@@ -1,4 +1,4 @@
-//! Voice transcription via OpenAI-compatible STT APIs (Groq/OpenAI/Telnyx).
+//! Voice transcription via approved OpenAI-compatible STT APIs (Groq/Telnyx/custom).
 //!
 //! Reads an audio file, builds a multipart/form-data POST request,
 //! and sends it to the configured transcription endpoint. Returns the
@@ -82,11 +82,15 @@ pub const WhisperTranscriber = struct {
 /// Resolve transcription endpoint for a given provider name.
 pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]const u8) []const u8 {
     if (explicit_endpoint) |ep| return ep;
-    if (std.ascii.eqlIgnoreCase(provider, "openai")) return "https://api.openai.com/v1/audio/transcriptions";
     if (std.ascii.eqlIgnoreCase(provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
     if (std.ascii.eqlIgnoreCase(provider, "telnyx")) return "https://api.telnyx.com/v2/ai/audio/transcriptions";
-    // For unknown providers, try OpenAI-compatible endpoint
-    return "https://api.groq.com/openai/v1/audio/transcriptions";
+    return "";
+}
+
+/// True when a named provider can be used without an explicit audio endpoint.
+pub fn supportsManagedTranscriptionProvider(provider: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(provider, "groq") or
+        std.ascii.eqlIgnoreCase(provider, "telnyx");
 }
 
 fn trimTrailingSlash(s: []const u8) []const u8 {
@@ -131,6 +135,13 @@ fn isSafeTranscriptionEndpointUrl(url: []const u8) bool {
     if (!is_https and !is_http) return false;
 
     const host = net_security.extractHost(trimmed) orelse return false;
+    if (std.ascii.eqlIgnoreCase(host, "api.openai.com") or
+        std.ascii.eqlIgnoreCase(host, "api.anthropic.com") or
+        std.ascii.eqlIgnoreCase(host, "generativelanguage.googleapis.com") or
+        std.ascii.eqlIgnoreCase(host, "aiplatform.googleapis.com"))
+    {
+        return false;
+    }
     if (is_http and !net_security.isLocalHost(host)) return false;
     return true;
 }
@@ -559,7 +570,7 @@ test "voice TranscribeOptions custom" {
 
 test "voice resolveTranscriptionEndpoint is provider case insensitive" {
     try std.testing.expectEqualStrings(
-        "https://api.openai.com/v1/audio/transcriptions",
+        "",
         resolveTranscriptionEndpoint("OpenAI", null),
     );
     try std.testing.expectEqualStrings(
@@ -749,6 +760,10 @@ test "voice transcriptionEndpointFromBaseUrl derives OpenAI-compatible paths" {
 test "voice transcription endpoint URL validation" {
     try std.testing.expect(isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions"));
     try std.testing.expect(isSafeTranscriptionEndpointUrl("http://localhost:9090/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.openai.com/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.anthropic.com/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://generativelanguage.googleapis.com/v1/audio/transcriptions"));
+    try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://aiplatform.googleapis.com/v1/audio/transcriptions"));
     try std.testing.expect(!isSafeTranscriptionEndpointUrl("http://api.example.com/v1/audio/transcriptions"));
     try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions?access_token=test"));
     try std.testing.expect(!isSafeTranscriptionEndpointUrl("https://api.example.com/v1/audio/transcriptions#frag"));
@@ -808,7 +823,7 @@ test "voice resolveTranscriptionEndpoint groq" {
 
 test "voice resolveTranscriptionEndpoint openai" {
     try std.testing.expectEqualStrings(
-        "https://api.openai.com/v1/audio/transcriptions",
+        "",
         resolveTranscriptionEndpoint("openai", null),
     );
 }
@@ -820,10 +835,9 @@ test "voice resolveTranscriptionEndpoint explicit" {
     );
 }
 
-test "voice resolveTranscriptionEndpoint unknown falls back to groq" {
-    // Unknown providers fall back to the Groq-compatible endpoint
+test "voice resolveTranscriptionEndpoint unknown fails closed" {
     try std.testing.expectEqualStrings(
-        "https://api.groq.com/openai/v1/audio/transcriptions",
+        "",
         resolveTranscriptionEndpoint("some-unknown-provider", null),
     );
 }
@@ -833,4 +847,12 @@ test "voice resolveTranscriptionEndpoint telnyx" {
         "https://api.telnyx.com/v2/ai/audio/transcriptions",
         resolveTranscriptionEndpoint("telnyx", null),
     );
+}
+
+test "voice supportsManagedTranscriptionProvider only allows managed STT providers" {
+    try std.testing.expect(supportsManagedTranscriptionProvider("groq"));
+    try std.testing.expect(supportsManagedTranscriptionProvider("GROQ"));
+    try std.testing.expect(supportsManagedTranscriptionProvider("telnyx"));
+    try std.testing.expect(!supportsManagedTranscriptionProvider("openai"));
+    try std.testing.expect(!supportsManagedTranscriptionProvider("some-unknown-provider"));
 }

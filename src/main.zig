@@ -6419,13 +6419,13 @@ test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled
 
 test "hasStartupProviderCredentials accepts configured primary key" {
     const providers_cfg = [_]yc.config.ProviderEntry{
-        .{ .name = "anthropic", .api_key = "sk-test" },
+        .{ .name = "groq", .api_key = "gsk-test" },
     };
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
-        .default_provider = "anthropic",
-        .default_model = "anthropic/claude-3-7-sonnet",
+        .default_provider = "groq",
+        .default_model = "groq/llama-3.3-70b-versatile",
         .allocator = std.testing.allocator,
         .providers = &providers_cfg,
     };
@@ -6445,19 +6445,7 @@ test "hasStartupProviderCredentials accepts local compatible provider without ap
     try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
 }
 
-test "hasStartupProviderCredentials accepts gemini oauth env token" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
-
-    const env_name = try std.testing.allocator.dupeZ(u8, "GEMINI_OAUTH_TOKEN");
-    defer std.testing.allocator.free(env_name);
-    const env_value = try std.testing.allocator.dupeZ(u8, "ya29.test-oauth-token");
-    defer std.testing.allocator.free(env_value);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, env_value.ptr, 1));
-    defer _ = c.unsetenv(env_name.ptr);
-
+test "hasStartupProviderCredentials rejects direct gemini runtime" {
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
@@ -6466,10 +6454,23 @@ test "hasStartupProviderCredentials accepts gemini oauth env token" {
         .allocator = std.testing.allocator,
     };
 
-    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+    try std.testing.expect(!yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
 }
 
 test "hasStartupProviderCredentials accepts reliability fallback credentials" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "groq",
+        .default_model = "groq/llama-3.3-70b-versatile",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.api_keys = &.{"rotating-key"};
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials rejects direct provider fallback credentials" {
     var cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
@@ -6479,19 +6480,19 @@ test "hasStartupProviderCredentials accepts reliability fallback credentials" {
     };
     cfg.reliability.api_keys = &.{"rotating-key"};
 
-    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+    try std.testing.expect(!yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
 }
 
 test "hasStartupProviderCredentials rejects blank configured key" {
     // Regression: blank API keys must not bypass channel startup credential checks.
     const providers_cfg = [_]yc.config.ProviderEntry{
-        .{ .name = "anthropic", .api_key = "   " },
+        .{ .name = "groq", .api_key = "   " },
     };
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
-        .default_provider = "anthropic",
-        .default_model = "anthropic/claude-3-7-sonnet",
+        .default_provider = "groq",
+        .default_model = "groq/llama-3.3-70b-versatile",
         .allocator = std.testing.allocator,
         .providers = &providers_cfg,
     };
@@ -6504,8 +6505,8 @@ test "hasStartupProviderCredentials rejects missing provider and fallback creden
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
-        .default_provider = "anthropic",
-        .default_model = "anthropic/claude-3-7-sonnet",
+        .default_provider = "groq",
+        .default_model = "groq/llama-3.3-70b-versatile",
         .allocator = std.testing.allocator,
     };
 

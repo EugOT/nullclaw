@@ -21,17 +21,20 @@ const ContextWindowEntry = struct {
 const MODEL_WINDOWS = [_]ContextWindowEntry{
     .{ .key = "gpt-4", .tokens = 8_192 },
     .{ .key = "gpt-4-32k", .tokens = 32_768 },
+    .{ .key = "claude-opus-4-8", .tokens = 200_000 },
     .{ .key = "claude-opus-4-6", .tokens = 200_000 },
     .{ .key = "claude-opus-4.6", .tokens = 200_000 },
     .{ .key = "claude-sonnet-4-6", .tokens = 200_000 },
     .{ .key = "claude-sonnet-4.6", .tokens = 200_000 },
     .{ .key = "claude-haiku-4-5", .tokens = 200_000 },
+    .{ .key = "gpt-5.5", .tokens = 128_000 },
     .{ .key = "gpt-5.2", .tokens = 128_000 },
     .{ .key = "gpt-5.2-codex", .tokens = 128_000 },
     .{ .key = "gpt-4.5-preview", .tokens = 128_000 },
     .{ .key = "gpt-4.1", .tokens = 128_000 },
     .{ .key = "gpt-4.1-mini", .tokens = 128_000 },
     .{ .key = "o3-mini", .tokens = 128_000 },
+    .{ .key = "gemini-3.5-flash", .tokens = 200_000 },
     .{ .key = "gemini-2.5-pro", .tokens = 200_000 },
     .{ .key = "gemini-2.5-flash", .tokens = 200_000 },
     .{ .key = "gemini-2.0-flash", .tokens = 200_000 },
@@ -203,10 +206,19 @@ test "resolveContextTokens honors explicit override first" {
 test "lookupContextTokens resolves known model ids" {
     try std.testing.expectEqual(@as(?u64, 8_192), lookupContextTokens("openai/gpt-4"));
     try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("openai/gpt-4-32k"));
+    try std.testing.expectEqual(@as(?u64, 200_000), lookupContextTokens("claude-opus-4-8"));
+    try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("gpt-5.5"));
+    try std.testing.expectEqual(@as(?u64, 200_000), lookupContextTokens("gemini-3.5-flash"));
     try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("openai/gpt-4.1-mini"));
     try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("openai/gpt-4-turbo"));
     try std.testing.expectEqual(@as(?u64, 200_000), lookupContextTokens("claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("mixtral-8x7b-32768"));
+}
+
+test "MODEL_WINDOWS includes exact runtime default rows" {
+    try std.testing.expectEqual(@as(?u64, 200_000), lookupTable(&MODEL_WINDOWS, "claude-opus-4-8"));
+    try std.testing.expectEqual(@as(?u64, 128_000), lookupTable(&MODEL_WINDOWS, "gpt-5.5"));
+    try std.testing.expectEqual(@as(?u64, 200_000), lookupTable(&MODEL_WINDOWS, "gemini-3.5-flash"));
 }
 
 test "lookupContextTokens keeps legacy and turbo gpt-4 variants distinct" {

@@ -10,6 +10,7 @@ pub const ProbeResult = struct {
 };
 
 pub const codex_model_fallbacks = [_][]const u8{
+    "gpt-5.5",
     "gpt-5.4",
     "gpt-5.3-codex",
     "gpt-5.3-codex-spark",
@@ -353,6 +354,7 @@ test "parseCodexModelsFromBytes parses visible model slugs" {
     const models = try parseCodexModelsFromBytes(allocator,
         \\{
         \\  "models": [
+        \\    { "slug": "gpt-5.5", "visibility": "list" },
         \\    { "slug": "gpt-5.4", "visibility": "list" },
         \\    { "slug": "gpt-5.3-codex", "visibility": "hidden" },
         \\    { "slug": "gpt-5.2-codex", "visibility": "list" },
@@ -362,9 +364,10 @@ test "parseCodexModelsFromBytes parses visible model slugs" {
     );
     defer freeOwnedStrings(allocator, models);
 
-    try std.testing.expectEqual(@as(usize, 2), models.len);
-    try std.testing.expectEqualStrings("gpt-5.4", models[0]);
-    try std.testing.expectEqualStrings("gpt-5.2-codex", models[1]);
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expectEqualStrings("gpt-5.5", models[0]);
+    try std.testing.expectEqualStrings("gpt-5.4", models[1]);
+    try std.testing.expectEqualStrings("gpt-5.2-codex", models[2]);
 }
 
 test "parseCodexCliTokenFromBytes accepts access token" {
