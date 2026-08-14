@@ -1,4 +1,4 @@
-//! Voice transcription via OpenAI-compatible STT APIs (Groq/OpenAI/Telnyx).
+//! Voice transcription via approved OpenAI-compatible STT APIs (Groq/Telnyx/custom).
 //!
 //! Reads an audio file, builds a multipart/form-data POST request,
 //! and sends it to the configured transcription endpoint. Returns the
@@ -82,7 +82,6 @@ pub const WhisperTranscriber = struct {
 /// Resolve transcription endpoint for a given provider name.
 pub fn resolveTranscriptionEndpoint(provider: []const u8, explicit_endpoint: ?[]const u8) []const u8 {
     if (explicit_endpoint) |ep| return ep;
-    if (std.ascii.eqlIgnoreCase(provider, "openai")) return "https://api.openai.com/v1/audio/transcriptions";
     if (std.ascii.eqlIgnoreCase(provider, "groq")) return "https://api.groq.com/openai/v1/audio/transcriptions";
     if (std.ascii.eqlIgnoreCase(provider, "telnyx")) return "https://api.telnyx.com/v2/ai/audio/transcriptions";
     // For unknown providers, try OpenAI-compatible endpoint
@@ -131,6 +130,13 @@ fn isSafeTranscriptionEndpointUrl(url: []const u8) bool {
     if (!is_https and !is_http) return false;
 
     const host = net_security.extractHost(trimmed) orelse return false;
+    if (std.ascii.eqlIgnoreCase(host, "api.openai.com") or
+        std.ascii.eqlIgnoreCase(host, "api.anthropic.com") or
+        std.ascii.eqlIgnoreCase(host, "generativelanguage.googleapis.com") or
+        std.ascii.eqlIgnoreCase(host, "aiplatform.googleapis.com"))
+    {
+        return false;
+    }
     if (is_http and !net_security.isLocalHost(host)) return false;
     return true;
 }
@@ -559,7 +565,7 @@ test "voice TranscribeOptions custom" {
 
 test "voice resolveTranscriptionEndpoint is provider case insensitive" {
     try std.testing.expectEqualStrings(
-        "https://api.openai.com/v1/audio/transcriptions",
+        "https://api.groq.com/openai/v1/audio/transcriptions",
         resolveTranscriptionEndpoint("OpenAI", null),
     );
     try std.testing.expectEqualStrings(
@@ -808,7 +814,7 @@ test "voice resolveTranscriptionEndpoint groq" {
 
 test "voice resolveTranscriptionEndpoint openai" {
     try std.testing.expectEqualStrings(
-        "https://api.openai.com/v1/audio/transcriptions",
+        "https://api.groq.com/openai/v1/audio/transcriptions",
         resolveTranscriptionEndpoint("openai", null),
     );
 }
